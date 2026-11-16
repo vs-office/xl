@@ -32,7 +32,7 @@ Press `F5` in VS Code to start an Extension Development Host.
 
 ## Types
 
-TypeScript is strict. `any`, non-null assertions and `@ts-ignore` are lint errors, so external data (webview messages, settings, file contents) is typed `unknown` and narrowed at the boundary with type guards. See `docs/TS_MIGRATION.md` for the migration status.
+TypeScript is strict. `any`, non-null assertions and `@ts-ignore` are lint errors, so external data (webview messages, settings, file contents) is typed `unknown` and narrowed at the boundary with type guards.
 
 ## Layout
 
