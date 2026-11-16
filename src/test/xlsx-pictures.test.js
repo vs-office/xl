@@ -1,7 +1,8 @@
 'use strict';
+const webview = require('./helpers/webview.js');
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const OX = { ...require('../webview/core/xlsx-reader.js'), ...require('../webview/core/xlsx-writer.js') };
+const OX = { ...webview('core/xlsx-reader'), ...webview('core/xlsx-writer') };
 const F = require('./helpers/xlsx-fixtures.js');
 
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';

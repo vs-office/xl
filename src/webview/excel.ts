@@ -1,43 +1,274 @@
-import { Shell } from './core/app-shell.js';
-import { XlsxProvider } from './core/xlsx-provider.js';
-import { readXlsx } from './core/xlsx-reader.js';
+import { Shell } from './core/app-shell.ts';
+import type { ShellEditSource, ShellViewState, ShellViewStateInput } from './core/app-shell.ts';
+import type * as EditNamespace from './edit.ts';
+import type { Calc, CalcResult, CellPos } from './core/calc.ts';
+import type { GridEdit, GridLinkEvent } from './core/grid.ts';
+import { XlsxProvider } from './core/xlsx-provider.ts';
+import type { EditCell, EditError, PendingEdit, SlotCell } from './core/xlsx-provider.ts';
+import { readXlsx } from './core/xlsx-reader.ts';
+import type { CellStyle, Hyperlink, Sheet, Workbook } from './core/xlsx-reader.ts';
 
-let sendMessage;
+/** The options object the extension host passes to the page (counterpart of the host's ExcelOptions). */
+export interface ExcelOptions {
+    customEditor: boolean;
+    uri: string;
+    scriptUri: string;
+    directUrl: string | undefined;
+    previewUri: string;
+    /** the host's persisted state; untrusted, validated before use */
+    state: unknown;
+}
 
-export function initPage(options, ignoreState) {
+/** Per-sheet view states (zoom, scroll, active cell) keyed by sheet index. */
+export type ExcelViews = Record<string, ShellViewStateInput>;
+
+/** The page state persisted through vscode.setState and sent to the host with `save`. */
+export interface ExcelPageState {
+    version: string;
+    uri: string;
+    sheet: number;
+    views: ExcelViews;
+}
+
+/** The state restored from vscode.getState() / options.state once validated. */
+export interface ExcelSavedState {
+    version: string;
+    sheet?: number | undefined;
+    views?: ExcelViews | undefined;
+}
+
+// ---- host -> page messages ----
+/** The host asks the page to (re)load the workbook; `content` is the file's bytes (see load). */
+export interface ExcelRefreshMessage {
+    refresh: true;
+    content?: unknown;
+}
+/** The host asks for the current file bytes (a save / backup); answered with an ExcelResponseMessage. */
+export interface ExcelGetDataMessage {
+    type: 'getData';
+    requestId: number;
+}
+export interface ExcelUndoMessage {
+    undo: true;
+}
+export interface ExcelRedoMessage {
+    redo: true;
+}
+/** Legacy form of a reload: file bytes without a type. */
+export interface ExcelContentMessage {
+    content: unknown;
+    type?: undefined;
+}
+export type ExcelHostMessage =
+    ExcelRefreshMessage | ExcelGetDataMessage | ExcelUndoMessage | ExcelRedoMessage | ExcelContentMessage;
+
+// ---- page -> host messages ----
+export interface ExcelRefreshRequest {
+    refresh: true;
+}
+export interface ExcelSaveMessage {
+    save: true;
+    state: ExcelPageState;
+}
+export interface ExcelOpenLinkMessage {
+    openLink: string;
+}
+export interface ExcelErrorMessage {
+    error: string;
+}
+export interface ExcelChangedMessage {
+    changed: true;
+    reason: 'Paste' | 'Edit';
+}
+export interface ExcelDataResponse {
+    response: true;
+    requestId: number;
+    body: Uint8Array | null;
+}
+export interface ExcelErrorResponse {
+    response: true;
+    requestId: number;
+    error: string;
+}
+export type ExcelResponseMessage = ExcelDataResponse | ExcelErrorResponse;
+export type ExcelPageMessage =
+    | ExcelRefreshRequest
+    | ExcelSaveMessage
+    | ExcelOpenLinkMessage
+    | ExcelErrorMessage
+    | ExcelChangedMessage
+    | ExcelResponseMessage;
+
+/** The page API the host messages drive (window.oxExcel). */
+export interface ExcelApi {
+    load(content: unknown): void;
+    undo(): void;
+    redo(): void;
+    getBytes(): Uint8Array | null;
+    getBytesAsync(): Promise<Uint8Array | null>;
+    /** performance.now() at page start */
+    t0?: number | undefined;
+}
+
+declare global {
+    interface Window {
+        oxExcel?: ExcelApi | undefined;
+    }
+}
+
+/** The lazily loaded editing chunk (formula engine and writer). */
+export type ExcelEditModule = typeof EditNamespace;
+
+/** One edited cell of an undo transaction; `si` is set when the cell is on another sheet than the transaction's. */
+export interface UndoItem {
+    si?: number | undefined;
+    r: number;
+    c: number;
+    before: SlotCell | null | undefined;
+    after: SlotCell | null | undefined;
+}
+export interface UndoTransaction {
+    si: number;
+    items: UndoItem[];
+}
+
+type Dict = Record<string, unknown>;
+
+function isDict(v: unknown): v is Dict {
+    return typeof v === 'object' && v !== null;
+}
+
+function isNumberList(v: unknown): v is ArrayLike<number> {
+    return isDict(v) && typeof v.length === 'number';
+}
+
+function toBytes(raw: unknown): Uint8Array {
+    if (raw instanceof Uint8Array) return raw;
+    if (raw instanceof ArrayBuffer) return new Uint8Array(raw);
+    if (isNumberList(raw)) return new Uint8Array(raw);
+    return new Uint8Array(0);
+}
+
+/** The message text of an error-like value, else the value as text. */
+function errText(err: unknown): string {
+    if (isDict(err)) {
+        const m = err.message;
+        if (typeof m === 'string' && m) return m;
+    }
+    return String(err);
+}
+
+function parseViewState(v: unknown): ShellViewStateInput | null {
+    if (!isDict(v)) return null;
+    const out: ShellViewStateInput = {};
+    if (typeof v.zoom === 'number') out.zoom = v.zoom;
+    const sc = v.scroll;
+    if (isDict(sc)) {
+        const scroll: { top?: number; left?: number } = {};
+        if (typeof sc.top === 'number') scroll.top = sc.top;
+        if (typeof sc.left === 'number') scroll.left = sc.left;
+        out.scroll = scroll;
+    }
+    const a = v.active;
+    if (isDict(a) && typeof a.r === 'number' && typeof a.c === 'number') out.active = { r: a.r, c: a.c };
+    return out;
+}
+
+/** Validates a persisted page state of the current version; null for anything else. */
+export function parseSavedState(s: unknown, version: string): ExcelSavedState | null {
+    if (!isDict(s) || s.version !== version) return null;
+    const out: ExcelSavedState = { version };
+    if (typeof s.sheet === 'number') out.sheet = s.sheet;
+    if (isDict(s.views)) {
+        const views: ExcelViews = {};
+        for (const k of Object.keys(s.views)) {
+            const vs = parseViewState(s.views[k]);
+            if (vs) views[k] = vs;
+        }
+        out.views = views;
+    }
+    return out;
+}
+
+export function isRefreshMessage(d: unknown): d is ExcelRefreshMessage {
+    return isDict(d) && !!d.refresh;
+}
+export function isGetDataMessage(d: unknown): d is ExcelGetDataMessage {
+    return isDict(d) && d.type === 'getData' && typeof d.requestId === 'number';
+}
+export function isUndoMessage(d: unknown): d is ExcelUndoMessage {
+    return isDict(d) && !!d.undo;
+}
+export function isRedoMessage(d: unknown): d is ExcelRedoMessage {
+    return isDict(d) && !!d.redo;
+}
+export function isContentMessage(d: unknown): d is ExcelContentMessage {
+    return isDict(d) && !!d.content && !d.type;
+}
+/** Narrows the untyped `event.data` of a window message to a host message. */
+export function isExcelHostMessage(d: unknown): d is ExcelHostMessage {
+    return isRefreshMessage(d) || isGetDataMessage(d) || isUndoMessage(d) || isRedoMessage(d) || isContentMessage(d);
+}
+
+let sendMessage: (m: ExcelPageMessage) => void = () => undefined;
+
+export function initPage(options: ExcelOptions, ignoreState?: boolean): void {
     const vscode = acquireVsCodeApi();
     // the lazily loaded editing chunk is fetched next to the page script
     if (typeof __webpack_public_path__ !== 'undefined' && options.scriptUri)
         __webpack_public_path__ = options.scriptUri + '/';
     const STATE_VERSION = '6';
     const readOnly = !options.customEditor;
-    sendMessage = function (m) {
+    sendMessage = function (m: ExcelPageMessage) {
         vscode.postMessage(m);
     };
 
     const app = document.getElementById('app');
-    let wb = null,
-        bytes = null,
+    let wb: Workbook | null = null,
+        bytes: Uint8Array | null = null,
         active = 0;
-    let calc = null;
-    let edit = null; // editing chunk namespace once loaded: { Calc, patchXlsx, validateFormula }
-    const providers = new Map();
-    const views = {};
-    let undoStack = [],
-        redoStack = [],
+    let calc: Calc | null = null;
+    let edit: ExcelEditModule | null = null; // editing chunk namespace once loaded: { Calc, patchXlsx, validateFormula }
+    const providers = new Map<number, XlsxProvider>();
+    // a sheet whose load was cancelled keeps its first rows, read only
+    const cancelledPartial = new WeakSet<XlsxProvider>();
+    const views: ExcelViews = {};
+    let undoStack: UndoTransaction[] = [],
+        redoStack: UndoTransaction[] = [],
         undoCells = 0;
-    let shell = null,
-        loadCtl = null,
-        cancelBtn = null;
+    let shell: Shell | null = null,
+        loadCtl: AbortController | null = null,
+        cancelBtn: HTMLButtonElement | null = null;
+    // repositions the floating sheet pictures (installed by createShell)
+    let layoutPics: () => void = () => undefined;
 
-    const saved = (function () {
+    function requireShell(): Shell {
+        if (!shell) throw new TypeError('The grid shell is not created yet');
+        return shell;
+    }
+    function requireWb(): Workbook {
+        if (!wb) throw new TypeError('No workbook is loaded');
+        return wb;
+    }
+    function requireEdit(): ExcelEditModule {
+        if (!edit) throw new TypeError('The editing module is not loaded');
+        return edit;
+    }
+    // the provider shown by the shell; the page only ever mounts XlsxProviders
+    function shownProvider(): XlsxProvider | null {
+        const p = requireShell().provider;
+        return p instanceof XlsxProvider ? p : null;
+    }
+
+    const saved: ExcelSavedState | null = (function () {
         if (ignoreState) return null;
-        const s = vscode.getState() || options.state;
-        return s && s.version === STATE_VERSION ? s : null;
+        return parseSavedState(vscode.getState() || options.state, STATE_VERSION);
     })();
 
-    function measure(text, style) {
-        const c = measure.ctx || (measure.ctx = document.createElement('canvas').getContext('2d'));
+    let measureCtx: CanvasRenderingContext2D | null = null;
+    function measure(text: string, style: CellStyle | null): number {
+        const c = measureCtx || (measureCtx = document.createElement('canvas').getContext('2d'));
+        if (!c) throw new TypeError('Cannot get a 2D canvas context');
         c.font =
             (style && style.b ? 'bold ' : '') +
             (style && style.size ? (style.size * 4) / 3 : 13) +
@@ -46,42 +277,46 @@ export function initPage(options, ignoreState) {
         return c.measureText(text).width;
     }
 
-    function createShell() {
-        shell = new Shell(app, {
+    function createShell(): void {
+        if (!app) throw new TypeError('The page has no #app element');
+        const sh = (shell = new Shell(app, {
             readOnly: readOnly,
             tabs: true,
             headerRows: function () {
-                return shell && shell.provider ? shell.provider.frozenRows || 1 : 0;
+                const p = shell && shell.provider;
+                return p instanceof XlsxProvider ? p.frozenRows || 1 : 0;
             },
             onEdit: applyEdits,
-            onViewState: function (vs) {
+            onViewState: function (vs: ShellViewState) {
                 views[active] = vs;
-                const state = { version: STATE_VERSION, uri: options.uri, sheet: active, views: views };
+                const state: ExcelPageState = { version: STATE_VERSION, uri: options.uri, sheet: active, views: views };
                 vscode.setState(state);
                 vscode.postMessage({ save: true, state: state });
             },
             onLink: onLink
-        });
+        }));
         const picLayer = document.createElement('div');
         picLayer.className = 'ox-pics';
-        shell.grid.el.appendChild(picLayer);
+        sh.grid.el.appendChild(picLayer);
         // floating sheet pictures (drawing anchors): read-only overlay positioned over the canvas
-        shell._pics = null;
-        shell.layoutPics = function () {
-            const g = shell.grid,
-                p = shell.provider;
+        layoutPics = function () {
+            const g = sh.grid,
+                p = sh.provider instanceof XlsxProvider ? sh.provider : null;
             const pics = (p && p.sheet && p.sheet.pictures) || [];
-            while (picLayer.children.length > pics.length) picLayer.removeChild(picLayer.lastChild);
+            while (picLayer.children.length > pics.length && picLayer.lastChild)
+                picLayer.removeChild(picLayer.lastChild);
             if (!pics.length) return;
             const W = g.el.clientWidth,
                 H = g.el.clientHeight,
                 z = g.getZoom();
             for (let i = 0; i < pics.length; i++) {
                 const q = pics[i];
-                let img = picLayer.children[i];
-                if (!img || img.tagName !== 'IMG') {
+                const child = picLayer.children[i];
+                let img: HTMLImageElement;
+                if (child instanceof HTMLImageElement) img = child;
+                else {
                     img = document.createElement('img');
-                    if (picLayer.children[i]) picLayer.replaceChild(img, picLayer.children[i]);
+                    if (child) picLayer.replaceChild(img, child);
                     else picLayer.appendChild(img);
                 }
                 if (img.getAttribute('src') !== q.url) img.setAttribute('src', q.url);
@@ -95,21 +330,21 @@ export function initPage(options, ignoreState) {
                 img.style.display = L + Wd < 0 || T + Ht < 0 || L > W || T > H ? 'none' : '';
             }
         };
-        shell.grid.scroller.addEventListener(
+        sh.grid.scroller.addEventListener(
             'scroll',
             function () {
-                shell.layoutPics();
+                layoutPics();
             },
             { passive: true }
         );
-        shell.grid.on('zoom', function () {
-            shell.layoutPics();
+        sh.grid.on('zoom', function () {
+            layoutPics();
         });
-        shell.grid.on('resizeCol', function () {
-            shell.layoutPics();
+        sh.grid.on('resizeCol', function () {
+            layoutPics();
         });
-        shell.grid.on('resizeRow', function () {
-            shell.layoutPics();
+        sh.grid.on('resizeRow', function () {
+            layoutPics();
         });
         document.addEventListener('keydown', function (e) {
             if (
@@ -130,17 +365,19 @@ export function initPage(options, ignoreState) {
         });
     }
 
-    function onLink(e) {
+    function onLink(e: GridLinkEvent): void {
         if (!e || !wb) return;
-        const p = shell.provider;
-        const link = (p && p.sheet && p.sheet.hyperlinks && p.sheet.hyperlinks.get(e.sr + ',' + e.c)) || {};
+        const p = shownProvider();
+        const link: Hyperlink = (p && p.sheet && p.sheet.hyperlinks && p.sheet.hyperlinks.get(e.sr + ',' + e.c)) || {};
         const url = e.url || link.url,
             loc = e.location || link.location;
         if (url) sendMessage({ openLink: url });
         else if (loc) goLocation(loc);
     }
 
-    function goLocation(loc) {
+    function goLocation(loc: string): void {
+        const shell = requireShell(),
+            wb = requireWb();
         const m = /^(?:'((?:[^']|'')+)'|([^!']+))!(.+)$/.exec(String(loc).trim());
         let ref = String(loc).trim(),
             idx = active;
@@ -160,15 +397,17 @@ export function initPage(options, ignoreState) {
         if (!shell._goto(ref)) shell.setMessage('Cannot follow link: ' + loc);
     }
 
-    function visibleSheets() {
-        const out = [];
-        wb.sheets.forEach(function (s) {
+    function visibleSheets(): number[] {
+        const out: number[] = [];
+        requireWb().sheets.forEach(function (s) {
             if (s.state === 'visible') out.push(s.index);
         });
         return out.length ? out : [0];
     }
 
-    function renderTabs() {
+    function renderTabs(): void {
+        const shell = requireShell(),
+            wb = requireWb();
         shell.tabs.textContent = '';
         visibleSheets().forEach(function (i) {
             const info = wb.sheets[i];
@@ -183,8 +422,8 @@ export function initPage(options, ignoreState) {
         });
     }
 
-    function newProvider(sheet) {
-        return new XlsxProvider(wb, sheet, {
+    function newProvider(sheet: Sheet): XlsxProvider {
+        return new XlsxProvider(requireWb(), sheet, {
             measure: measure,
             validateFormula: function (f) {
                 return edit ? edit.validateFormula(f) : null;
@@ -192,17 +431,15 @@ export function initPage(options, ignoreState) {
         });
     }
 
-    function loadError(i, err) {
-        const msg =
-            'Cannot load sheet "' +
-            (wb.sheets[i] ? wb.sheets[i].name : i) +
-            '": ' +
-            (err && err.message ? err.message : err);
-        shell.setMessage(msg);
+    function loadError(i: number, err: unknown): void {
+        const wb = requireWb();
+        const msg = 'Cannot load sheet "' + (wb.sheets[i] ? wb.sheets[i].name : i) + '": ' + errText(err);
+        requireShell().setMessage(msg);
         sendMessage({ error: 'xl: ' + msg });
     }
 
-    function setCancel(fn) {
+    function setCancel(fn: (() => void) | null): void {
+        const shell = requireShell();
         if (!cancelBtn) {
             cancelBtn = document.createElement('button');
             cancelBtn.className = 'ox-tab';
@@ -214,16 +451,19 @@ export function initPage(options, ignoreState) {
         cancelBtn.style.display = fn ? '' : 'none';
     }
 
-    function mount(p, i, viewState, loading) {
+    function mount(p: XlsxProvider, i: number, viewState?: ShellViewStateInput, loading?: boolean): void {
+        const shell = requireShell();
         shell.setProvider(p);
         if (!loading) shell.setMessage('Ready');
         shell.applyViewState(viewState || views[i] || null);
-        shell.layoutPics();
+        layoutPics();
         shell.grid.focus();
     }
 
     // streams the sheet in; the first rows are shown as soon as they are parsed, the rest keeps loading in time slices
-    function showSheet(i, viewState) {
+    function showSheet(i: number, viewState?: ShellViewStateInput): void {
+        const shell = requireShell(),
+            wb = requireWb();
         if (loadCtl) {
             loadCtl.abort();
             loadCtl = null;
@@ -239,14 +479,14 @@ export function initPage(options, ignoreState) {
         }
         const ctl = new AbortController(),
             name = wb.sheets[i].name;
-        let p = null,
+        let p: XlsxProvider | null = null,
             lastInv = 0;
         loadCtl = ctl;
         shell.setMessage('Loading ' + name + '... 0%');
         setCancel(function () {
             ctl.abort();
             if (p) {
-                p.cancelledPartial = true;
+                cancelledPartial.add(p);
                 shell.setMessage(
                     'Loading cancelled: showing the first ' + p.sheet.rowCount.toLocaleString() + ' rows (read only)'
                 );
@@ -294,17 +534,20 @@ export function initPage(options, ignoreState) {
                 setCancel(null);
                 if (!p) p = newProvider(sh);
                 providers.set(i, p);
-                if (!readOnly) setTimeout(() => ensureEdit().catch(() => undefined), 0);
+                if (!readOnly)
+                    setTimeout(() => {
+                        void ensureEdit().catch(() => undefined);
+                    }, 0);
                 if (shell.provider === p) {
                     shell.grid.invalidate();
-                    shell.layoutPics();
+                    layoutPics();
                     if (shell.view && (shell.view.sort || shell.view.filters.size)) shell.recomputeView();
                     shell._updateAll();
                     shell.setMessage(sh.warning ? sh.warning : 'Ready');
                 } else mount(p, i, viewState);
             })
-            .catch(function (err) {
-                if (err && err.name === 'AbortError') return;
+            .catch(function (err: unknown) {
+                if (isDict(err) && err.name === 'AbortError') return;
                 if (loadCtl === ctl) {
                     loadCtl = null;
                     setCancel(null);
@@ -313,16 +556,17 @@ export function initPage(options, ignoreState) {
             });
     }
 
-    function load(content) {
-        const raw = content && content.data !== undefined ? content.data : content;
+    function load(content: unknown): void {
+        const shell = requireShell();
+        const raw = isDict(content) && content.data !== undefined ? content.data : content;
         const reloading = !!wb;
         // parse first: a file that fails to open must not wipe the workbook (and unsaved edits) on screen
-        let nb, nbytes;
+        let nb: Workbook, nbytes: Uint8Array;
         try {
-            nbytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+            nbytes = toBytes(raw);
             nb = readXlsx(nbytes);
         } catch (err) {
-            const why = err && err.message ? err.message : String(err);
+            const why = errText(err);
             shell.setMessage(
                 (reloading ? 'Cannot reload file (keeping the previous content): ' : 'Cannot open file: ') + why
             );
@@ -331,7 +575,7 @@ export function initPage(options, ignoreState) {
         }
         console.log(
             '[xl] workbook parsed ' +
-                Math.round(performance.now() - window.oxExcel.t0) +
+                Math.round(performance.now() - (window.oxExcel?.t0 ?? NaN)) +
                 ' ms after start, ' +
                 nbytes.length +
                 ' bytes'
@@ -348,11 +592,12 @@ export function initPage(options, ignoreState) {
         undoStack = [];
         redoStack = [];
         undoCells = 0;
-        let idx = 0;
+        let idx: number;
         const vis = visibleSheets();
         if (saved && saved.views)
             Object.keys(saved.views).forEach(function (k) {
-                if (!views[k]) views[k] = saved.views[k];
+                const sv = saved.views?.[k];
+                if (!views[k] && sv) views[k] = sv;
             });
         // On a host refresh keep the sheet the user is on; the saved state only decides the first load.
         if (reloading && vis.indexOf(active) >= 0) idx = active;
@@ -365,23 +610,24 @@ export function initPage(options, ignoreState) {
         }
     }
 
-    function providerFor(si) {
+    function providerFor(si: number): XlsxProvider {
         let q = providers.get(si);
         if (!q) {
-            q = newProvider(wb.loadSheet(si));
+            q = newProvider(requireWb().loadSheet(si));
             providers.set(si, q);
         }
         return q;
     }
 
-    function getCalc() {
+    function getCalc(ed: ExcelEditModule): Calc {
         if (calc) return calc;
-        calc = new edit.Calc({
+        const wb = requireWb();
+        calc = new ed.Calc({
             sheetNames: wb.sheets.map(function (x) {
                 return x.name;
             }),
             date1904: wb.date1904,
-            sheetIndexByName: function (n) {
+            sheetIndexByName: function (n: string) {
                 const l = String(n).toLowerCase();
                 for (let i = 0; i < wb.sheets.length; i++) if (wb.sheets[i].name.toLowerCase() === l) return i;
                 return -1;
@@ -402,7 +648,7 @@ export function initPage(options, ignoreState) {
         return calc;
     }
 
-    function inArrayFormula(q, r, c) {
+    function inArrayFormula(q: XlsxProvider, r: number, c: number): boolean {
         const arr = q.sheet && q.sheet.arrays;
         if (!arr) return false;
         for (let i = 0; i < arr.length; i++) {
@@ -413,19 +659,23 @@ export function initPage(options, ignoreState) {
     }
 
     // writes a calculated value into the cell, keeping its formula and style; recorded in the undo transaction
-    function putCalculated(q, si, r, c, res, items, seen) {
+    function putCalculated(
+        q: XlsxProvider,
+        si: number,
+        r: number,
+        c: number,
+        res: CalcResult,
+        items: UndoItem[],
+        seen: Map<string, UndoItem>
+    ): boolean {
         const cell = q.cellAt(r, c);
         if (!cell || !cell.f || inArrayFormula(q, r, c)) return false;
-        let t = res.t,
-            v = res.v;
-        if (t === 'e' && v === '#CIRC!') {
-            t = 'n';
-            v = 0;
-        }
-        if (cell.t === t && cell.v === v) return false;
+        let out: CalcResult = res;
+        if (res.t === 'e' && res.v === '#CIRC!') out = { t: 'n', v: 0 };
+        if (cell.t === out.t && cell.v === out.v) return false;
         const key = si + ':' + r + ':' + c;
         let it = seen.get(key);
-        const before = q.setCell(r, c, { t: t, v: v, f: cell.f, s: cell.s });
+        const before = q.setCell(r, c, calculatedCell(out, cell.f, cell.s));
         const after = q.overlay.has(r * 16384 + c) ? q.overlay.get(r * 16384 + c) : undefined;
         if (it) it.after = after;
         else {
@@ -436,19 +686,33 @@ export function initPage(options, ignoreState) {
         return true;
     }
 
+    // the cell written for a calculated value: the result plus the cell's formula and style
+    function calculatedCell(res: CalcResult, f: string, s: number): EditCell {
+        switch (res.t) {
+            case 'n':
+                return { t: 'n', v: res.v, f: f, s: s };
+            case 's':
+                return { t: 's', v: res.v, f: f, s: s };
+            case 'b':
+                return { t: 'b', v: res.v, f: f, s: s };
+            case 'e':
+                return { t: 'e', v: res.v, f: f, s: s };
+        }
+    }
+
     // result cells inside array formulas are not recomputed (the engine cannot spill); these are reported to the user
     let staleArrays = 0;
-    function noteArray(q, r, c) {
+    function noteArray(q: XlsxProvider, r: number, c: number): void {
         if (inArrayFormula(q, r, c)) staleArrays++;
     }
 
-    function recalculate(q, si, items) {
+    function recalculate(q: XlsxProvider, si: number, items: UndoItem[]): number {
         if (!edit) return 0;
         let n = 0;
         staleArrays = 0;
         try {
-            const engine = getCalc();
-            const seen = new Map();
+            const engine = getCalc(edit);
+            const seen = new Map<string, UndoItem>();
             items.forEach(function (it) {
                 seen.set(si + ':' + it.r + ':' + it.c, it);
             });
@@ -459,7 +723,7 @@ export function initPage(options, ignoreState) {
                     if (putCalculated(q, si, it.r, it.c, res, items, seen)) n++;
                 }
             });
-            let changed = items.map(function (it) {
+            let changed: CellPos[] = items.map(function (it) {
                 return { sheet: it.si !== undefined ? it.si : si, r: it.r, c: it.c };
             });
             for (let round = 0; round < 40 && changed.length; round++) {
@@ -472,7 +736,7 @@ export function initPage(options, ignoreState) {
                 changed = res.partial && res.pending ? res.pending : [];
             }
         } catch (err) {
-            shell.setMessage('Formulas were not recalculated: ' + (err && err.message ? err.message : err));
+            requireShell().setMessage('Formulas were not recalculated: ' + errText(err));
             calc = null;
             return -1;
         }
@@ -480,14 +744,14 @@ export function initPage(options, ignoreState) {
     }
 
     // the formula engine and the writer are a separate chunk, fetched once editing is possible
-    let editReady = null;
-    function hasEditModule() {
+    let editReady: Promise<void> | null = null;
+    function hasEditModule(): boolean {
         return edit !== null;
     }
-    function ensureEdit() {
+    function ensureEdit(): Promise<void> {
         if (edit) return Promise.resolve();
         if (!editReady)
-            editReady = import(/* webpackChunkName: "excel-edit" */ './edit.js').then(
+            editReady = import(/* webpackChunkName: "excel-edit" */ './edit.ts').then(
                 function (m) {
                     edit = m;
                 },
@@ -499,8 +763,9 @@ export function initPage(options, ignoreState) {
         return editReady;
     }
 
-    function applyEdits(edits, source) {
+    function applyEdits(edits: GridEdit[], source: ShellEditSource): void {
         if (readOnly || !wb) return;
+        const shell = requireShell();
         if (!hasEditModule()) {
             shell.setMessage('Loading editor...');
             ensureEdit().then(
@@ -508,36 +773,37 @@ export function initPage(options, ignoreState) {
                     applyEdits(edits, source);
                 },
                 function (err) {
-                    shell.setMessage('Edit failed: ' + (err && err.message ? err.message : err));
+                    shell.setMessage('Edit failed: ' + errText(err));
                     shell.grid.refresh();
                 }
             );
             return;
         }
-        const p = shell.provider,
+        const p = shownProvider(),
             si = active,
-            items = [];
+            items: UndoItem[] = [];
+        if (!p) throw new TypeError('No sheet is shown');
         if (p.sheet && p.sheet.partial) {
             shell.setMessage(
-                p.cancelledPartial
+                cancelledPartial.has(p)
                     ? 'Loading was cancelled: this sheet is read only. Switch sheets and back to load it again.'
                     : 'The sheet is still loading: wait for it to finish before editing.'
             );
             shell.grid.refresh();
             return;
         }
-        let firstError = null,
+        let firstError: string | null = null,
             rejected = 0;
         for (const e of edits) {
             if (p.getRaw(e.r, e.c) === e.text) continue;
-            let cell = p.editFromText(e.r, e.c, e.text);
+            let cell: EditCell | EditError | null | undefined = p.editFromText(e.r, e.c, e.text);
             if (cell === undefined) continue;
-            if (cell && cell.error) {
+            if (cell && 'error' in cell) {
                 rejected++;
                 if (!firstError) firstError = cell.error;
                 continue;
             }
-            if (cell.cleared) cell = null;
+            if (cell && cell.cleared) cell = null;
             const before = p.setCell(e.r, e.c, cell);
             items.push({
                 r: e.r,
@@ -555,8 +821,10 @@ export function initPage(options, ignoreState) {
         const recalced = recalculate(p, si, items);
         undoStack.push({ si: si, items: items });
         undoCells += items.length;
-        while (undoStack.length > 1 && (undoStack.length > 2000 || undoCells > 500000))
-            undoCells -= undoStack.shift().items.length;
+        while (undoStack.length > 1 && (undoStack.length > 2000 || undoCells > 500000)) {
+            const oldest = undoStack.shift();
+            if (oldest) undoCells -= oldest.items.length;
+        }
         redoStack = [];
         shell.grid.invalidate();
         shell.grid.refresh();
@@ -570,7 +838,8 @@ export function initPage(options, ignoreState) {
         sendMessage({ changed: true, reason: source === 'paste' ? 'Paste' : 'Edit' });
     }
 
-    function undo() {
+    function undo(): void {
+        const shell = requireShell();
         const tx = undoStack.pop();
         if (!tx) return;
         undoCells -= tx.items.length;
@@ -585,7 +854,8 @@ export function initPage(options, ignoreState) {
         shell._updateAll();
     }
 
-    function redo() {
+    function redo(): void {
+        const shell = requireShell();
         const tx = redoStack.pop();
         if (!tx) return;
         if (tx.si !== active) showSheet(tx.si);
@@ -597,22 +867,23 @@ export function initPage(options, ignoreState) {
         shell._updateAll();
     }
 
-    function getBytes() {
-        const edits = [];
+    function getBytes(): Uint8Array | null {
+        const edits: PendingEdit[] = [];
         providers.forEach(function (p, si) {
             if (p.dirty) Array.prototype.push.apply(edits, p.pendingEdits(si));
         });
         if (!edits.length) return bytes;
         try {
-            return edit.patchXlsx(bytes, edits);
+            if (!bytes) throw new Error('originalBytes must be a Uint8Array');
+            return requireEdit().patchXlsx(bytes, edits);
         } catch (err) {
-            const msg = 'Could not save your edits: ' + (err && err.message ? err.message : err);
-            shell.setMessage(msg);
-            throw new Error(msg);
+            const msg = 'Could not save your edits: ' + errText(err);
+            requireShell().setMessage(msg);
+            throw new Error(msg, { cause: err });
         }
     }
 
-    function getBytesAsync() {
+    function getBytesAsync(): Promise<Uint8Array | null> {
         let dirty = false;
         providers.forEach(function (p) {
             if (p.dirty) dirty = true;
@@ -620,21 +891,22 @@ export function initPage(options, ignoreState) {
         return (dirty ? ensureEdit() : Promise.resolve()).then(getBytes);
     }
 
-    window.oxExcel = {
+    const api: ExcelApi = {
         load: load,
         undo: undo,
         redo: redo,
         getBytes: getBytes,
         getBytesAsync: getBytesAsync
     };
+    window.oxExcel = api;
 
     createShell();
-    shell.setMessage('Opening...');
+    requireShell().setMessage('Opening...');
     const t0 = performance.now();
-    window.oxExcel.t0 = t0;
+    api.t0 = t0;
     if (options.directUrl) {
         // read the file straight from disk; any failure falls back to the host round trip
-        fetch(options.directUrl, { cache: 'no-store' })
+        void fetch(options.directUrl, { cache: 'no-store' })
             .then(function (r) {
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 return r.arrayBuffer();
@@ -656,13 +928,13 @@ export function initPage(options, ignoreState) {
     } else vscode.postMessage({ refresh: true });
 }
 
-export function handleEvents() {
-    window.addEventListener('message', function (event) {
+export function handleEvents(): void {
+    window.addEventListener('message', function (event: MessageEvent<unknown>) {
         const d = event.data,
             app = window.oxExcel;
         if (!app) return;
-        if (d.refresh) app.load(d.content);
-        else if (d.type === 'getData') {
+        if (isRefreshMessage(d)) app.load(d.content);
+        else if (isGetDataMessage(d)) {
             app.getBytesAsync().then(
                 function (body) {
                     sendMessage({ response: true, requestId: d.requestId, body: body });
@@ -671,18 +943,18 @@ export function handleEvents() {
                     sendMessage({
                         response: true,
                         requestId: d.requestId,
-                        error: (err && err.message) || String(err)
+                        error: errText(err)
                     });
                 }
             );
-        } else if (d.undo) app.undo();
-        else if (d.redo) app.redo();
-        else if (d.content && !d.type) app.load(d.content);
+        } else if (isUndoMessage(d)) app.undo();
+        else if (isRedoMessage(d)) app.redo();
+        else if (isContentMessage(d)) app.load(d.content);
     });
 }
 
 // Entry point called by the inline script of the page: xlPage.start(options, ignoreState)
-export function start(options, ignoreState) {
+export function start(options: ExcelOptions, ignoreState?: boolean): void {
     handleEvents();
     initPage(options, ignoreState);
 }

@@ -1,5 +1,34 @@
+export interface CsvParseOptions {
+    separator?: string | null | undefined;
+    quote?: string | null | undefined;
+    hasHeaders?: boolean | undefined;
+    skipComments?: boolean | undefined;
+    commentChar?: string | null | undefined;
+}
+
+/** Result of parseCsv; header is null unless hasHeaders was requested. */
+export interface CsvParseResult {
+    header: string[] | null;
+    rows: string[][];
+    colCount: number;
+    sepDirective: string | null;
+    rowLine: Int32Array;
+    rowSpan: Int32Array;
+    headerLine: number;
+    headerSpan: number;
+    lineCount: number;
+    endsWithNewline: boolean;
+    quotedMask: Int32Array;
+    quotedExtra: Set<number> | null;
+}
+
+/** Values serializeCsvField can stringify. */
+export type CsvScalar = string | number | boolean | bigint | null | undefined;
+
+export type CsvInput = Uint8Array | string | null | undefined;
+
 // JS \s set
-function isWs(c) {
+function isWs(c: number): boolean {
     return (
         c === 32 ||
         (c >= 9 && c <= 13) ||
@@ -16,7 +45,7 @@ function isWs(c) {
 }
 
 // Counts source line breaks: \n, \r\n and lone \r each count once.
-function lineBreaks(s) {
+function lineBreaks(s: string): number {
     let n = 0,
         i = s.indexOf('\n');
     const hasCr = s.indexOf('\r') >= 0;
@@ -35,17 +64,18 @@ function lineBreaks(s) {
     return n;
 }
 
-function growI32(a, cap) {
+function growI32(a: Int32Array, cap: number): Int32Array<ArrayBuffer> {
     const b = new Int32Array(cap);
     b.set(a);
     return b;
 }
 
 // Parity scanner: a quote char anywhere toggles quoted state (lenient, same as the legacy regex parser).
-function parseCsv(text, opts) {
-    opts = opts || {};
-    text = text == null ? '' : String(text);
-    let sep = opts.separator == null || opts.separator === '' ? ',' : String(opts.separator);
+function parseCsv(textIn: string | null | undefined, optsIn?: CsvParseOptions | null): CsvParseResult {
+    const opts: CsvParseOptions = optsIn || {};
+    const text = textIn === null || textIn === undefined ? '' : String(textIn);
+    let sep =
+        opts.separator === null || opts.separator === undefined || opts.separator === '' ? ',' : String(opts.separator);
     const quoteStr = opts.quote ? String(opts.quote).charAt(0) : '"';
     const q = quoteStr.charCodeAt(0);
     const dq = quoteStr + quoteStr;
@@ -59,7 +89,7 @@ function parseCsv(text, opts) {
     let pos = n && text.charCodeAt(0) === 0xfeff ? 1 : 0;
     let line = 0;
     let first = true;
-    let sepDirective = null;
+    let sepDirective: string | null = null;
 
     let starts = new Int32Array(64),
         ends = new Int32Array(64);
@@ -67,16 +97,16 @@ function parseCsv(text, opts) {
     let rowLine = new Int32Array(cap),
         rowSpan = new Int32Array(cap),
         qmask = new Int32Array(cap);
-    let qextra = null;
-    const rows = [];
+    let qextra: Set<number> | null = null;
+    const rows: string[][] = [];
     let nr = 0;
-    let header = null,
+    let header: string[] | null = null,
         headerLine = -1,
         headerSpan = 0;
     let colCount = 0;
     let qflag = false;
 
-    function mk(s, e) {
+    function mk(s: number, e: number): string {
         if (e - s >= 2 && text.charCodeAt(s) === q && text.charCodeAt(e - 1) === q) {
             qflag = true;
             const inner = text.substring(s + 1, e - 1);
@@ -165,20 +195,21 @@ function parseCsv(text, opts) {
         if (nf > colCount) colCount = nf;
 
         if (hasHeaders && header === null) {
-            header = new Array(nf);
-            for (let j = 0; j < nf; j++) header[j] = mk(starts[j], ends[j]);
+            const h: string[] = new Array<string>(nf);
+            for (let j = 0; j < nf; j++) h[j] = mk(starts[j], ends[j]);
+            header = h;
             headerLine = lineAt;
             headerSpan = nl + 1;
             continue;
         }
-        const row = new Array(nf);
+        const row: string[] = new Array<string>(nf);
         let mask = 0;
         for (let j = 0; j < nf; j++) {
             row[j] = mk(starts[j], ends[j]);
             if (qflag) {
                 if (j < 32) mask |= 1 << j;
                 else {
-                    if (!qextra) qextra = new Set();
+                    if (!qextra) qextra = new Set<number>();
                     qextra.add(nr * 1048576 + j);
                 }
             }
@@ -223,22 +254,22 @@ const P10 = [
     1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20,
     1e21, 1e22
 ];
-let _enc = null,
-    _dec = null;
+let _enc: TextEncoder | null = null,
+    _dec: TextDecoder | null = null;
 const encoder = () => _enc || (_enc = new TextEncoder());
 const decoder = () => _dec || (_dec = new TextDecoder('utf-8', { ignoreBOM: true }));
 const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 const tmp16 = new Uint16Array(64);
 
-function toBytes(x) {
-    if (x == null) return new Uint8Array(0);
+function toBytes(x: CsvInput): Uint8Array {
+    if (x === null || x === undefined) return new Uint8Array(0);
     if (typeof x === 'string') return encoder().encode(x);
     return x;
 }
 
 // Number grammar on bytes [s,e): [+-]?(d+[.d*]|.d+)([eE][+-]?d+)?; returns NaN when not a number.
 // strict mirrors CsvProvider's isNumeric (<=15 int digits, no leading zeros, <=40 chars).
-function numBytes(b, s, e, strict) {
+function numBytes(b: Uint8Array, s: number, e: number, strict?: boolean): number {
     const n = e - s;
     if (n <= 0 || (strict && n > 40)) return NaN;
     let i = s,
@@ -289,7 +320,7 @@ function numBytes(b, s, e, strict) {
     }
     if (i !== e) return NaN;
     const x = ex - frac;
-    let v;
+    let v: number;
     if (sig <= 15 && x >= -22 && x <= 22) v = x < 0 ? m / P10[-x] : m * P10[x];
     else {
         return Number(decoder().decode(b.subarray(s, e)));
@@ -297,16 +328,56 @@ function numBytes(b, s, e, strict) {
     return neg ? -v : v;
 }
 
-function matchAt(b, i, p) {
+function matchAt(b: Uint8Array, i: number, p: Uint8Array): boolean {
     for (let k = 1; k < p.length; k++) if (b[i + k] !== p[k]) return false;
     return true;
 }
 
 // Row index over a UTF-8 byte buffer: start offset, source line and line span per row; fields are located on demand.
 class CsvIndex {
-    constructor(opts) {
-        opts = opts || {};
-        const sep = opts.separator == null || opts.separator === '' ? ',' : String(opts.separator);
+    quoteStr: string;
+    dq: string;
+    qc: number;
+    qb: Uint8Array;
+    q0: number;
+    qlen: number;
+    sep = ',';
+    sepb: Uint8Array = new Uint8Array(0);
+    sep0 = 0;
+    sepLen = 0;
+    hasHeaders: boolean;
+    skipComments: boolean;
+    cm: string;
+    cmb: Uint8Array | null;
+    bytes: Uint8Array;
+    filled: number;
+    final: boolean;
+    pos: number;
+    line: number;
+    first: boolean;
+    started: boolean;
+    cap: number;
+    start: Int32Array;
+    lineAt: Int32Array;
+    span: Int32Array;
+    n: number;
+    colCount: number;
+    header: string[] | null;
+    headerLine: number;
+    headerSpan: number;
+    sepDirective: string | null;
+    fs: Int32Array;
+    fe: Int32Array;
+    done: boolean;
+    lineCount: number;
+    endsWithNewline: boolean;
+
+    constructor(optsIn?: CsvParseOptions | null) {
+        const opts: CsvParseOptions = optsIn || {};
+        const sep =
+            opts.separator === null || opts.separator === undefined || opts.separator === ''
+                ? ','
+                : String(opts.separator);
         const quoteStr = opts.quote ? String(opts.quote).charAt(0) : '"';
         this.quoteStr = quoteStr;
         this.dq = quoteStr + quoteStr;
@@ -343,7 +414,7 @@ class CsvIndex {
         this.endsWithNewline = true;
     }
 
-    _setSep(sep) {
+    _setSep(sep: string): void {
         this.sep = sep;
         this.sepb = encoder().encode(sep);
         this.sep0 = this.sepb[0];
@@ -351,13 +422,13 @@ class CsvIndex {
     }
 
     // bytes may be reallocated between calls; filled = valid prefix length; final = no more data will follow.
-    setSource(bytes, filled, final) {
+    setSource(bytes: Uint8Array, filled: number, final?: boolean): void {
         this.bytes = bytes;
         this.filled = filled;
         this.final = !!final;
     }
 
-    decode(s, e) {
+    decode(s: number, e: number): string {
         const n = e - s;
         if (n <= 0) return '';
         const b = this.bytes;
@@ -368,13 +439,13 @@ class CsvIndex {
                 if (c > 127) break;
                 tmp16[i] = c;
             }
-            if (i === n) return String.fromCharCode.apply(null, tmp16.subarray(0, n));
+            if (i === n) return String.fromCharCode(...tmp16.subarray(0, n));
         }
         return decoder().decode(b.subarray(s, e));
     }
 
     // Field value for bytes [s,e): strips the quote pair and unescapes doubled quotes (same rules as parseCsv).
-    field(s, e) {
+    field(s: number, e: number): string {
         if (e - s >= 2 && this.qlen === 1 && this.bytes[s] === this.q0 && this.bytes[e - 1] === this.q0) {
             const inner = this.decode(s + 1, e - 1);
             return inner.length > 1 && inner.indexOf(this.dq) >= 0 ? inner.split(this.dq).join(this.quoteStr) : inner;
@@ -387,7 +458,7 @@ class CsvIndex {
         return raw;
     }
 
-    isQuotedRange(s, e) {
+    isQuotedRange(s: number, e: number): boolean {
         if (e - s < 2) return false;
         const b = this.bytes;
         if (this.qlen === 1) return b[s] === this.q0 && b[e - 1] === this.q0;
@@ -397,7 +468,7 @@ class CsvIndex {
 
     // Locates fields of the row starting at byte `st` into this.fs/this.fe; returns the field count.
     // With `upto`, stops once field index `upto` is recorded (later fields are not located).
-    scanRow(st, upto) {
+    scanRow(st: number, upto?: number): number {
         if (upto === undefined) upto = 0x7fffffff;
         const b = this.bytes,
             end = this.filled,
@@ -443,7 +514,7 @@ class CsvIndex {
         return nf;
     }
 
-    _blankOrComment(ls, le) {
+    _blankOrComment(ls: number, le: number): boolean {
         const b = this.bytes;
         let k = ls;
         while (k < le) {
@@ -465,7 +536,7 @@ class CsvIndex {
         return true;
     }
 
-    _grow() {
+    _grow(): void {
         this.cap *= 2;
         this.start = growI32(this.start, this.cap);
         this.lineAt = growI32(this.lineAt, this.cap);
@@ -473,7 +544,7 @@ class CsvIndex {
     }
 
     // Indexes complete rows until the budget (ms, 0 = unbounded) is spent or data runs out; true when finished.
-    run(budget) {
+    run(budget: number): boolean {
         if (this.done) return true;
         const b = this.bytes,
             end = this.filled,
@@ -563,7 +634,7 @@ class CsvIndex {
 
             if (this.hasHeaders && this.header === null) {
                 const k = this.scanRow(ls),
-                    h = new Array(k);
+                    h: string[] = new Array<string>(k);
                 for (let j = 0; j < k; j++) h[j] = this.field(this.fs[j], this.fe[j]);
                 this.header = h;
                 this.headerLine = lineAt;
@@ -583,7 +654,7 @@ class CsvIndex {
         return this.done;
     }
 
-    _finish() {
+    _finish(): void {
         this.done = true;
         const n = this.n,
             end = this.filled;
@@ -605,15 +676,15 @@ class CsvIndex {
     }
 
     // parseCsv-compatible views of the finished index.
-    get rowLine() {
+    get rowLine(): Int32Array {
         return this.lineAt.subarray(0, this.n);
     }
-    get rowSpan() {
+    get rowSpan(): Int32Array {
         return this.span.subarray(0, this.n);
     }
 }
 
-function indexCsv(input, opts) {
+function indexCsv(input: CsvInput, opts?: CsvParseOptions | null): CsvIndex {
     const bytes = toBytes(input);
     const ix = new CsvIndex(opts);
     ix.setSource(bytes, bytes.length, true);
@@ -621,10 +692,15 @@ function indexCsv(input, opts) {
     return ix;
 }
 
-function serializeCsvField(text, sep, quote, forceQuote) {
-    text = text == null ? '' : String(text);
-    quote = quote || '"';
-    sep = sep == null || sep === '' ? ',' : sep;
+function serializeCsvField(
+    textIn: CsvScalar,
+    sepIn?: string | null,
+    quoteIn?: string | null,
+    forceQuote?: boolean
+): string {
+    const text = textIn === null || textIn === undefined ? '' : String(textIn);
+    const quote = quoteIn || '"';
+    const sep = sepIn === null || sepIn === undefined || sepIn === '' ? ',' : sepIn;
     let need = !!forceQuote;
     if (!need) {
         need = text.indexOf(quote) >= 0 || text.indexOf(sep) >= 0 || text.indexOf('\n') >= 0 || text.indexOf('\r') >= 0;
@@ -633,8 +709,13 @@ function serializeCsvField(text, sep, quote, forceQuote) {
     return quote + (text.indexOf(quote) >= 0 ? text.split(quote).join(quote + quote) : text) + quote;
 }
 
-function serializeCsvRow(fields, sep, quote, quotedFlags) {
-    sep = sep == null || sep === '' ? ',' : sep;
+function serializeCsvRow(
+    fields: readonly CsvScalar[],
+    sepIn?: string | null,
+    quote?: string | null,
+    quotedFlags?: ArrayLike<boolean> | null
+): string {
+    const sep = sepIn === null || sepIn === undefined || sepIn === '' ? ',' : sepIn;
     let out = '';
     for (let i = 0; i < fields.length; i++) {
         if (i) out += sep;
@@ -643,12 +724,12 @@ function serializeCsvRow(fields, sep, quote, quotedFlags) {
     return out;
 }
 
-function detectSeparator(text) {
+function detectSeparator(textIn: string | null | undefined): string {
     const cands = [',', ';', '\t', '|'];
-    text = text == null ? '' : String(text);
+    let text = textIn === null || textIn === undefined ? '' : String(textIn);
     if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
     const lim = Math.min(text.length, 1 << 16);
-    const lines = [];
+    const lines: number[][] = [];
     let counts = [0, 0, 0, 0],
         par = 0,
         any = false,
@@ -688,7 +769,7 @@ function detectSeparator(text) {
         bestScore = 0,
         bestMode = 0;
     for (let k = 0; k < 4; k++) {
-        const freq = new Map();
+        const freq = new Map<number, number>();
         for (const l of lines) if (l[k] > 0) freq.set(l[k], (freq.get(l[k]) || 0) + 1);
         let mode = 0,
             mc = 0;

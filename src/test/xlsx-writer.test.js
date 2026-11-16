@@ -1,7 +1,8 @@
 'use strict';
+const webview = require('./helpers/webview.js');
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const OX = require('../webview/core/xlsx-writer.js');
+const OX = webview('core/xlsx-writer');
 const fflate = require('fflate');
 const XLSX = require('xlsx');
 
@@ -630,7 +631,7 @@ test('double patch is stable and SheetJS-readable', () => {
 test('optional reader oracle', () => {
     let R;
     try {
-        R = require('../webview/core/xlsx-reader.js');
+        R = webview('core/xlsx-reader');
     } catch (_) {
         return;
     }

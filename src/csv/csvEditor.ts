@@ -15,7 +15,11 @@ export class CsvEditorProvider implements vscode.CustomTextEditorProvider {
 
     private static readonly viewType = 'xl-csv-editor';
 
-    constructor(private readonly context: vscode.ExtensionContext) {}
+    private readonly context: vscode.ExtensionContext;
+
+    constructor(context: vscode.ExtensionContext) {
+        this.context = context;
+    }
 
     public resolveCustomTextEditor(document: vscode.TextDocument, webviewPanel: vscode.WebviewPanel): void {
         const editor = new CsvDocumentView(this.context, document.uri);

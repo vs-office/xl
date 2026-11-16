@@ -1,8 +1,9 @@
 'use strict';
+const webview = require('./helpers/webview.js');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const SSF = require('../webview/vendor/ssf.js');
-const OX = require('../webview/core/format.js');
+const OX = webview('core/format');
 
 const fc = (v, fmt, d1904, t) => OX.formatCell({ t: t || 'n', v }, { fmt }, d1904);
 const txt = (v, fmt, d1904) => fc(v, fmt, d1904).text;
@@ -733,7 +734,7 @@ test('typed times get duration and AM/PM formats', () => {
 });
 
 test('General cells convert full m/d/yyyy dates and keep ambiguous text', () => {
-    const OXf = require('../webview/core/format.js');
+    const OXf = webview('core/format');
     const r = OXf.parseInput('12/25/2024', null, null, false);
     assert.equal(r.t, 'n');
     assert.equal(r.fmt, 'm/d/yyyy');

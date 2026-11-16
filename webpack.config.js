@@ -21,8 +21,17 @@ const hostConfig = {
         rules: [
             {
                 test: /\.ts$/,
-                exclude: /node_modules/,
-                use: [{ loader: 'ts-loader' }]
+                exclude: [/node_modules/, path.resolve(__dirname, 'src', 'webview')],
+                use: [
+                    {
+                        loader: 'ts-loader',
+                        // tsconfig is a type-check-only config (noEmit, .ts import specifiers); the host bundle emits CommonJS
+                        options: {
+                            onlyCompileBundledFiles: true,
+                            compilerOptions: { noEmit: false, allowImportingTsExtensions: false }
+                        }
+                    }
+                ]
             }
         ]
     },
@@ -43,22 +52,41 @@ const hostConfig = {
 };
 
 // Pages that run inside the webview. The inline script of each page calls xlPage.start(options, ignoreState).
-// excel-edit.js is the lazily loaded chunk behind import('./edit.js') in excel.js.
+// excel-edit.js is the lazily loaded chunk behind import('./edit.ts') in excel.ts.
 const webviewConfig = {
     name: 'webview',
     mode: 'none',
     target: 'web',
     entry: {
-        excel: './src/webview/excel.js',
-        csv: './src/webview/csv.js'
+        excel: './src/webview/excel.ts',
+        csv: './src/webview/csv.ts'
     },
     output: {
         path: path.resolve(__dirname, 'dist', 'webview'),
         filename: '[name].js',
         chunkFilename: '[name].js',
-        // excel.js sets __webpack_public_path__ from the host-provided script uri before loading the editing chunk
+        // excel.ts sets __webpack_public_path__ from the host-provided script uri before loading the editing chunk
         publicPath: '',
         library: { name: 'xlPage', type: 'var' }
+    },
+    resolve: { extensions: ['.ts', '.js'] },
+    module: {
+        rules: [
+            {
+                // types are checked by tsc; webpack only strips them and keeps ES modules for code splitting
+                test: /\.ts$/,
+                include: path.resolve(__dirname, 'src', 'webview'),
+                use: [
+                    {
+                        loader: 'ts-loader',
+                        options: {
+                            transpileOnly: true,
+                            compilerOptions: { module: 'esnext', noEmit: false, allowImportingTsExtensions: false }
+                        }
+                    }
+                ]
+            }
+        ]
     },
     devtool: false,
     performance: { hints: false }

@@ -1,12 +1,13 @@
 'use strict';
+const webview = require('./helpers/webview.js');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const fflate = require('fflate');
 const OX = {
-    ...require('../webview/core/xlsx-reader.js'),
-    ...require('../webview/core/format.js'),
-    ...require('../webview/core/xlsx-writer.js'),
-    ...require('../webview/core/xlsx-provider.js')
+    ...webview('core/xlsx-reader'),
+    ...webview('core/format'),
+    ...webview('core/xlsx-writer'),
+    ...webview('core/xlsx-provider')
 };
 const fl = fflate;
 const enc = s => new TextEncoder().encode(s);

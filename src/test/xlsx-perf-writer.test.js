@@ -1,9 +1,10 @@
 'use strict';
+const webview = require('./helpers/webview.js');
 // Raw-copy zip assembly in xlsx-writer: strict structural verifier + fuzz over odd zip layouts.
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const zlib = require('node:zlib');
-const OX = require('../webview/core/xlsx-writer.js');
+const OX = webview('core/xlsx-writer');
 const fflate = require('fflate');
 const XLSX = require('xlsx');
 

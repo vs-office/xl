@@ -22,7 +22,11 @@ export class ExcelEditorProvider implements vscode.CustomEditorProvider<ExcelDoc
 
     private static readonly viewType = 'xl-excel-editor';
 
-    constructor(private readonly context: vscode.ExtensionContext) {}
+    private readonly context: vscode.ExtensionContext;
+
+    constructor(context: vscode.ExtensionContext) {
+        this.context = context;
+    }
 
     private readonly _onDidChangeCustomDocument = new vscode.EventEmitter<
         vscode.CustomDocumentContentChangeEvent<ExcelDocument>

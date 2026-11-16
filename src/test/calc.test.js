@@ -1,7 +1,8 @@
 'use strict';
+const webview = require('./helpers/webview.js');
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const OX = require('../webview/core/calc.js');
+const OX = webview('core/calc');
 const { budget } = require('./helpers/timing.js');
 const { Calc } = OX;
 

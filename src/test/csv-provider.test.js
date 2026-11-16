@@ -1,7 +1,8 @@
 'use strict';
+const webview = require('./helpers/webview.js');
 const test = require('node:test');
 const assert = require('node:assert');
-const OX = { ...require('../webview/core/csv-parser.js'), ...require('../webview/core/csv-provider.js') };
+const OX = { ...webview('core/csv-parser'), ...webview('core/csv-provider') };
 
 const mk = (text, o, po) => {
     const parsed = OX.indexCsv(text, Object.assign({ separator: ',', quote: '"' }, po));

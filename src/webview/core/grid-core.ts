@@ -1,6 +1,74 @@
 const MAX_SCROLL = 30e6;
 
-function colName(c) {
+/** Inclusive cell rectangle (zero-based). */
+export interface Range {
+    r1: number;
+    c1: number;
+    r2: number;
+    c2: number;
+}
+/** Zero-based cell address. */
+export interface CellPos {
+    r: number;
+    c: number;
+}
+/** Cell value as it may appear in clipboard / export rows. */
+export type CellValue = string | number | boolean | null | undefined;
+export type TextGetter = (r: number, c: number) => string | null | undefined;
+export type TextMatcher = (t: string) => boolean;
+export interface FindOptions {
+    matchCase?: boolean | undefined;
+    wholeCell?: boolean | undefined;
+}
+export interface ScrollScale {
+    cssTotal: number;
+    ratio: number;
+}
+export interface FillSeries {
+    start: number;
+    step: number;
+    single: boolean;
+}
+export interface ViewMap {
+    count: number;
+    order: ArrayLike<number> | null;
+    toSource: (v: number) => number;
+    toView: (s: number) => number;
+}
+export interface Slicer {
+    cancelled: boolean;
+    finished: boolean;
+    slices: number;
+    start: (sync?: boolean) => Slicer;
+    cancel: () => void;
+}
+export interface SlicerOptions {
+    now?: (() => number) | undefined;
+    budget?: number | undefined;
+    defer?: ((f: () => void) => void) | undefined;
+    onDone?: (() => void) | undefined;
+}
+export interface FindScanOptions {
+    rowCount: number;
+    colCount: number;
+    getText: TextGetter;
+    getText2?: TextGetter | null | undefined;
+    match: TextMatcher;
+    maxMatches?: number | undefined;
+    startRow: number;
+}
+export interface TsvBuilderOptions {
+    rowCount: number;
+    getRow: (i: number) => string | null;
+    maxChars?: number | undefined;
+}
+/** Axis size overrides: [index, unzoomedSize] pairs (array or Map entries). */
+export type SizeOverrides = Iterable<readonly [number, number]>;
+
+const EMPTY_F64 = new Float64Array(0);
+const EMPTY_I32 = new Int32Array(0);
+
+function colName(c: number): string {
     let s = '';
     c++;
     while (c > 0) {
@@ -13,6 +81,19 @@ function colName(c) {
 
 // Axis: layout of rows or columns with hidden items and zoom. Modes: uniform, sparse (few overrides over a default), dense (prefix sums).
 class Axis {
+    count: number;
+    def: number;
+    zoom: number;
+    uniform: boolean;
+    mode: 0 | 1 | 2;
+    u: number;
+    total: number;
+    base: Float64Array | null;
+    sizes: Float64Array | null;
+    pre: Float64Array | null;
+    idx: Int32Array | null;
+    bsz: Float64Array | null;
+    cum: Float64Array | null;
     constructor() {
         this.count = 0;
         this.def = 20;
@@ -29,8 +110,14 @@ class Axis {
         this.cum = null;
     }
     // sizeFn(i)->px (unzoomed), hiddenFn(i)->bool
-    build(count, sizeFn, hiddenFn, def, zoom) {
-        let base = null,
+    build(
+        count: number,
+        sizeFn: (i: number) => number,
+        hiddenFn: ((i: number) => boolean) | null | undefined,
+        def: number,
+        zoom: number
+    ): this {
+        let base: Float64Array | null = null,
             nd = 0;
         for (let i = 0; i < count; i++) {
             let s = hiddenFn && hiddenFn(i) ? 0 : sizeFn(i);
@@ -58,7 +145,7 @@ class Axis {
         return this._dense(count, def, zoom, base);
     }
     // quick path for huge uniform axes when the caller guarantees uniformity
-    buildUniform(count, size, zoom) {
+    buildUniform(count: number, size: number, zoom: number): this {
         this.count = count;
         this.def = size;
         this._z(zoom);
@@ -69,20 +156,20 @@ class Axis {
         return this;
     }
     // overrides: Map/array of [index, unzoomedSize] over a uniform default; indices >= count ignored
-    buildSparse(count, def, zoom, overrides) {
-        const m = new Map();
+    buildSparse(count: number, def: number, zoom: number, overrides: SizeOverrides): this {
+        const m = new Map<number, number>();
         for (const [i, s] of overrides) if (i >= 0 && i < count) m.set(i, s >= 0 ? s : def);
         if (!m.size) return this.buildUniform(count, def, zoom);
         const idx = Int32Array.from(m.keys()).sort(),
             sz = new Float64Array(idx.length);
-        for (let k = 0; k < idx.length; k++) sz[k] = m.get(idx[k]);
+        for (let k = 0; k < idx.length; k++) sz[k] = m.get(idx[k]) ?? 0;
         return this._sparse(count, def, zoom, idx, sz);
     }
-    _z(zoom) {
+    _z(zoom: number): void {
         this.zoom = zoom || 1;
         this.u = Math.round(this.def * this.zoom * 100) / 100;
     }
-    _sparse(count, def, zoom, idx, sz) {
+    _sparse(count: number, def: number, zoom: number, idx: Int32Array, sz: Float64Array): this {
         this.count = count;
         this.def = def;
         this._z(zoom);
@@ -94,21 +181,23 @@ class Axis {
         this._cumSparse();
         return this;
     }
-    _cumSparse() {
-        const n = this.idx.length,
+    _cumSparse(): void {
+        const idx = this.idx ?? EMPTY_I32,
+            bsz = this.bsz ?? EMPTY_F64,
+            n = idx.length,
             z = this.zoom,
             u = this.u,
             cum = this.cum && this.cum.length === n + 1 ? this.cum : new Float64Array(n + 1);
         let acc = 0;
         for (let k = 0; k < n; k++) {
             cum[k] = acc;
-            acc += this.bsz[k] * z - u;
+            acc += bsz[k] * z - u;
         }
         cum[n] = acc;
         this.cum = cum;
         this.total = this.count * u + acc;
     }
-    _dense(count, def, zoom, base) {
+    _dense(count: number, def: number, zoom: number, base: Float64Array): this {
         this.count = count;
         this.def = def;
         this._z(zoom);
@@ -121,12 +210,12 @@ class Axis {
         this._cumDense(0);
         return this;
     }
-    _cumDense(from) {
+    _cumDense(from: number): void {
         const n = this.count,
             z = this.zoom,
-            base = this.base,
-            sizes = this.sizes,
-            pre = this.pre;
+            base = this.base ?? EMPTY_F64,
+            sizes = this.sizes ?? EMPTY_F64,
+            pre = this.pre ?? EMPTY_F64;
         let acc = from > 0 ? pre[from] : 0;
         for (let i = from; i < n; i++) {
             const s = base[i] * z;
@@ -137,7 +226,7 @@ class Axis {
         pre[n] = acc;
         this.total = acc;
     }
-    setZoom(zoom) {
+    setZoom(zoom: number): this {
         if (this.mode === 0 || this.mode === 1) {
             this._z(zoom);
             if (this.mode === 0) this.total = this.count * this.u;
@@ -149,14 +238,16 @@ class Axis {
         return this;
     }
     // change the item count keeping sizes (uniform/sparse axes only); false when a rebuild is needed
-    setCount(n) {
+    setCount(n: number): boolean {
         if (n === this.count) return true;
         if (this.mode === 2) return false;
         if (this.mode === 1 && n < this.count) {
             const k = this._lb(n);
-            if (k < this.idx.length) {
-                this.idx = this.idx.slice(0, k);
-                this.bsz = this.bsz.slice(0, k);
+            const idx = this.idx ?? EMPTY_I32,
+                bsz = this.bsz ?? EMPTY_F64;
+            if (k < idx.length) {
+                this.idx = idx.slice(0, k);
+                this.bsz = bsz.slice(0, k);
                 this.cum = null;
             }
         }
@@ -166,11 +257,15 @@ class Axis {
         return true;
     }
     // apply unzoomed size changes (Map index->px) without calling back into the provider
-    setSizes(upd) {
+    setSizes(upd: ReadonlyMap<number, number>): this {
         if (!upd.size) return this;
         if (this.mode === 0 || this.mode === 1) {
-            const m = new Map();
-            if (this.mode === 1) for (let k = 0; k < this.idx.length; k++) m.set(this.idx[k], this.bsz[k]);
+            const m = new Map<number, number>();
+            if (this.mode === 1) {
+                const oi = this.idx ?? EMPTY_I32,
+                    ob = this.bsz ?? EMPTY_F64;
+                for (let k = 0; k < oi.length; k++) m.set(oi[k], ob[k]);
+            }
             for (const [i, s] of upd)
                 if (i >= 0 && i < this.count) {
                     if (s === this.def) m.delete(i);
@@ -184,7 +279,7 @@ class Axis {
             if (!m.size) return this.buildUniform(this.count, this.def, this.zoom);
             const idx = Int32Array.from(m.keys()).sort(),
                 sz = new Float64Array(idx.length);
-            for (let k = 0; k < idx.length; k++) sz[k] = m.get(idx[k]);
+            for (let k = 0; k < idx.length; k++) sz[k] = m.get(idx[k]) ?? 0;
             this.idx = idx;
             this.bsz = sz;
             this.mode = 1;
@@ -194,17 +289,18 @@ class Axis {
             return this;
         }
         let lo = this.count;
+        const dbase = this.base ?? EMPTY_F64;
         for (const [i, s] of upd)
             if (i >= 0 && i < this.count) {
-                this.base[i] = s >= 0 ? s : this.def;
+                dbase[i] = s >= 0 ? s : this.def;
                 if (i < lo) lo = i;
             }
         if (lo < this.count) this._cumDense(lo);
         return this;
     }
-    _lb(i) {
+    _lb(i: number): number {
         // number of override indices < i
-        const idx = this.idx;
+        const idx = this.idx ?? EMPTY_I32;
         let lo = 0,
             hi = idx.length;
         while (lo < hi) {
@@ -214,21 +310,24 @@ class Axis {
         }
         return lo;
     }
-    offset(i) {
+    offset(i: number): number {
         if (i <= 0) return 0;
         if (i >= this.count) return this.total + (i - this.count) * this.u;
-        return this.mode === 0 ? i * this.u : this.mode === 2 ? this.pre[i] : i * this.u + this.cum[this._lb(i)];
+        if (this.mode === 0) return i * this.u;
+        if (this.mode === 2) return (this.pre ?? EMPTY_F64)[i];
+        return i * this.u + (this.cum ?? EMPTY_F64)[this._lb(i)];
     }
-    size(i) {
+    size(i: number): number {
         if (i < 0) return 0;
         if (i >= this.count) return this.u;
         if (this.mode === 0) return this.u;
-        if (this.mode === 2) return this.sizes[i];
-        const k = this._lb(i);
-        return k < this.idx.length && this.idx[k] === i ? this.bsz[k] * this.zoom : this.u;
+        if (this.mode === 2) return (this.sizes ?? EMPTY_F64)[i];
+        const k = this._lb(i),
+            idx = this.idx ?? EMPTY_I32;
+        return k < idx.length && idx[k] === i ? (this.bsz ?? EMPTY_F64)[k] * this.zoom : this.u;
     }
     // index containing pixel p (clamped to [0,count-1]); skips zero-size items forward
-    indexAt(p) {
+    indexAt(p: number): number {
         const n = this.count;
         if (n === 0) return 0;
         if (p >= this.total) return n - 1;
@@ -237,7 +336,7 @@ class Axis {
         if (p > 0) {
             let hi = n - 1;
             if (this.mode === 2) {
-                const pre = this.pre;
+                const pre = this.pre ?? EMPTY_F64;
                 while (lo < hi) {
                     const mid = (lo + hi + 1) >> 1;
                     if (pre[mid] <= p) lo = mid;
@@ -253,11 +352,11 @@ class Axis {
         while (lo < n - 1 && this.size(lo) === 0) lo++;
         return lo;
     }
-    isHidden(i) {
+    isHidden(i: number): boolean {
         return i >= 0 && i < this.count && this.size(i) === 0;
     }
     // next visible index from i in direction d (+1/-1), or -1
-    nextVisible(i, d) {
+    nextVisible(i: number, d: number): number {
         i += d;
         while (i >= 0 && i < this.count && this.size(i) === 0) i += d;
         return i >= 0 && i < this.count ? i : -1;
@@ -265,7 +364,7 @@ class Axis {
 }
 
 // Scroll mapping for totals beyond browser limits.
-function scrollScale(total, viewport) {
+function scrollScale(total: number, viewport: number): ScrollScale {
     const max = Math.max(0, total - viewport);
     if (total <= MAX_SCROLL) return { cssTotal: total, ratio: 1 };
     const cssTotal = MAX_SCROLL;
@@ -276,8 +375,14 @@ function scrollScale(total, viewport) {
 // Merge lookup: merges are bucketed by row block (16 rows); very tall merges live in a short side list. Cost is independent of the merge count.
 const MB = 4,
     MB_TALL = 256;
-class MergeIndex {
-    constructor(merges) {
+class MergeIndex<M extends Range = Range> {
+    list: readonly M[];
+    bk: Map<number, number[]>;
+    tall: number[];
+    stamp: Int32Array;
+    st: number;
+    tmp: M[];
+    constructor(merges?: readonly M[] | null) {
         const L = (this.list = merges || []);
         this.bk = new Map();
         this.tall = [];
@@ -299,10 +404,10 @@ class MergeIndex {
             }
         }
     }
-    get size() {
+    get size(): number {
         return this.list.length;
     }
-    at(r, c) {
+    at(r: number, c: number): M | null {
         const L = this.list;
         if (!L.length) return null;
         const a = this.bk.get(r >> MB);
@@ -319,7 +424,7 @@ class MergeIndex {
         return null;
     }
     // true when any merge may touch rows r1..r2 (cheap pre-check for paint loops)
-    hasInRows(r1, r2) {
+    hasInRows(r1: number, r2: number): boolean {
         if (!this.list.length) return false;
         if (this.tall.length) return true;
         const b2 = r2 >> MB;
@@ -328,7 +433,7 @@ class MergeIndex {
         return false;
     }
     // merges intersecting the rect, appended to out (deduped)
-    query(r1, c1, r2, c2, out) {
+    query(r1: number, c1: number, r2: number, c2: number, out: M[]): M[] {
         const L = this.list;
         if (!L.length) return out;
         const b1 = r1 >> MB,
@@ -342,7 +447,7 @@ class MergeIndex {
         }
         const st = ++this.st,
             stamp = this.stamp;
-        const chk = i => {
+        const chk = (i: number): void => {
             if (stamp[i] === st) return;
             stamp[i] = st;
             const m = L[i];
@@ -356,7 +461,7 @@ class MergeIndex {
         return out;
     }
     // expand rect until it fully contains any merge it touches
-    expand(r1, c1, r2, c2) {
+    expand(r1: number, c1: number, r2: number, c2: number): Range {
         if (!this.list.length) return { r1, c1, r2, c2 };
         const hit = this.tmp;
         for (let ch = true; ch;) {
@@ -388,18 +493,26 @@ class MergeIndex {
     }
 }
 
-const normRange = (r1, c1, r2, c2) => ({
+const normRange = (r1: number, c1: number, r2: number, c2: number): Range => ({
     r1: Math.min(r1, r2),
     c1: Math.min(c1, c2),
     r2: Math.max(r1, r2),
     c2: Math.max(c1, c2)
 });
-const inRange = (g, r, c) => r >= g.r1 && r <= g.r2 && c >= g.c1 && c <= g.c2;
-const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+const inRange = (g: Range, r: number, c: number): boolean => r >= g.r1 && r <= g.r2 && c >= g.c1 && c <= g.c2;
+const clamp = (v: number, lo: number, hi: number): number => (v < lo ? lo : v > hi ? hi : v);
 
 // Excel-like data-edge jump. isEmpty(r,c) -> bool.
-function dataEdge(isEmpty, r, c, dr, dc, maxR, maxC) {
-    const inb = (rr, cc) => rr >= 0 && cc >= 0 && rr <= maxR && cc <= maxC;
+function dataEdge(
+    isEmpty: (r: number, c: number) => boolean,
+    r: number,
+    c: number,
+    dr: number,
+    dc: number,
+    maxR: number,
+    maxC: number
+): CellPos {
+    const inb = (rr: number, cc: number): boolean => rr >= 0 && cc >= 0 && rr <= maxR && cc <= maxC;
     let nr = r + dr,
         nc = c + dc;
     if (!inb(nr, nc)) return { r, c };
@@ -421,24 +534,27 @@ function dataEdge(isEmpty, r, c, dr, dc, maxR, maxC) {
 }
 
 // TSV / CSV
-function needsQuote(s) {
+function needsQuote(s: string): boolean {
     return s.indexOf('\t') >= 0 || s.indexOf('\n') >= 0 || s.indexOf('\r') >= 0 || s.indexOf('"') >= 0;
 }
-function encodeTSV(rows) {
-    const out = [];
+function encodeTSV(rows: readonly (readonly CellValue[])[]): string {
+    const out: string[] = [];
     for (const row of rows)
         out.push(
             row
-                .map(s => ((s = s == null ? '' : String(s)), needsQuote(s) ? '"' + s.replace(/"/g, '""') + '"' : s))
+                .map(v => {
+                    const s = v === null || v === undefined ? '' : String(v);
+                    return needsQuote(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+                })
                 .join('\t')
         );
     return out.join('\r\n');
 }
-function decodeDelimited(text, d) {
-    const rows = [];
-    let row = [],
-        i = 0,
-        n = text.length,
+function decodeDelimited(text: string, d: string): string[][] {
+    const rows: string[][] = [];
+    let row: string[] = [];
+    const n = text.length;
+    let i = 0,
         field = '';
     while (i < n) {
         const ch = text.charCodeAt(i);
@@ -502,8 +618,8 @@ function decodeDelimited(text, d) {
     return rows;
 }
 // tabs present -> TSV, else CSV when it looks like one, else single column
-function decodeClipboard(text) {
-    if (text == null || text === '') return [['']];
+function decodeClipboard(text: string | null | undefined): string[][] {
+    if (text === null || text === undefined || text === '') return [['']];
     if (text.indexOf('\t') >= 0) return decodeDelimited(text, '\t');
     if (text.indexOf(',') >= 0 && /[\r\n]/.test(text.replace(/[\r\n]+$/, ''))) {
         const rows = decodeDelimited(text, ',');
@@ -513,10 +629,10 @@ function decodeClipboard(text) {
     return decodeDelimited(text, '\u0000');
 }
 
-function toMarkdown(rows) {
+function toMarkdown(rows: readonly (readonly CellValue[])[]): string {
     if (!rows.length) return '';
-    const esc = s =>
-        String(s == null ? '' : s)
+    const esc = (s: CellValue): string =>
+        String(s ?? '')
             .replace(/\\/g, '\\\\')
             .replace(/\|/g, '\\|')
             .replace(/\r\n|\r|\n/g, '<br>')
@@ -525,7 +641,7 @@ function toMarkdown(rows) {
     let w = 0;
     for (const r of rows) if (r.length > w) w = r.length;
     if (!w) return '';
-    const line = r => {
+    const line = (r: readonly CellValue[]): string => {
         let o = '|';
         for (let i = 0; i < w; i++) o += ' ' + esc(r[i]) + ' |';
         return o;
@@ -536,7 +652,7 @@ function toMarkdown(rows) {
 }
 
 // Series detection for fill: returns step if all numbers evenly spaced.
-function fillSeries(values) {
+function fillSeries(values: readonly CellValue[]): FillSeries | null {
     const nums = values.map(v => (v !== '' && isFinite(Number(v)) ? Number(v) : NaN));
     if (!nums.length || nums.some(isNaN)) return null;
     if (nums.length === 1) return { start: nums[0], step: 1, single: true };
@@ -545,13 +661,20 @@ function fillSeries(values) {
         if (Math.abs(nums[i] - nums[i - 1] - step) > 1e-9 * Math.max(1, Math.abs(step))) return null;
     return { start: nums[0], step, single: false };
 }
-function fmtNum(n) {
+function fmtNum(n: number): string {
     return String(Math.round(n * 1e10) / 1e10);
 }
 
 // Two-generation width cache bounded by entry count and total key chars; long strings are measured but not cached.
 class WidthCache {
-    constructor(cap, maxChars, maxLen) {
+    cap: number;
+    maxChars: number;
+    maxLen: number;
+    m: Map<string, Map<string, number>>;
+    old: Map<string, Map<string, number>> | null;
+    n: number;
+    chars: number;
+    constructor(cap?: number, maxChars?: number, maxLen?: number) {
         this.cap = cap || 20000;
         this.maxChars = maxChars || 2e6;
         this.maxLen = maxLen || 400;
@@ -560,8 +683,8 @@ class WidthCache {
         this.n = 0;
         this.chars = 0;
     }
-    get(font, text, measure) {
-        let fm = this.m.get(font);
+    get(font: string, text: string, measure: (text: string) => number): number {
+        const fm = this.m.get(font);
         if (fm !== undefined) {
             const w = fm.get(text);
             if (w !== undefined) return w;
@@ -580,7 +703,7 @@ class WidthCache {
         if (text.length <= this.maxLen) this._put(font, fm, text, w);
         return w;
     }
-    _put(font, fm, text, w) {
+    _put(font: string, fm: Map<string, number> | undefined, text: string, w: number): void {
         if (this.n >= this.cap || this.chars >= this.maxChars) {
             this.old = this.m;
             this.m = new Map();
@@ -602,7 +725,7 @@ class WidthCache {
 }
 
 // Shift relative A1 refs in a formula (skips string literals).
-function shiftFormula(f, dr, dc) {
+function shiftFormula(f: string, dr: number, dc: number): string {
     if (!f || (!dr && !dc)) return f;
     const lead = f.charCodeAt(0) === 61;
     const body = lead ? f.slice(1) : f;
@@ -610,7 +733,7 @@ function shiftFormula(f, dr, dc) {
     for (let i = 0; i < parts.length; i += 2) {
         parts[i] = parts[i].replace(
             /(^|[^A-Za-z0-9_.$])(\$?)([A-Z]{1,3})(\$?)(\d+)(?![A-Za-z0-9_(])/g,
-            (m, pre, ca, col, ra, row) => {
+            (_m: string, pre: string, ca: string, col: string, ra: string, row: string): string => {
                 let c = col.split('').reduce((a, ch) => a * 26 + ch.charCodeAt(0) - 64, 0) - 1;
                 let r = parseInt(row, 10) - 1;
                 if (!ca) c += dc;
@@ -624,9 +747,9 @@ function shiftFormula(f, dr, dc) {
 }
 
 // View-order mapping: visible row index -> source row.
-function makeViewMap(order, rowCount) {
+function makeViewMap(order: ArrayLike<number> | null | undefined, rowCount: number): ViewMap {
     if (!order) return { count: rowCount, toSource: v => v, toView: s => s, order: null };
-    let inv = null;
+    let inv: Int32Array | null = null;
     return {
         count: order.length,
         order,
@@ -642,8 +765,14 @@ function makeViewMap(order, rowCount) {
 }
 
 // Search all cells; getText(r,c)->string|undefined. Returns [r,c] pairs flat array.
-function findAll(rowCount, colCount, getText, query, opts) {
-    const out = [];
+function findAll(
+    rowCount: number,
+    colCount: number,
+    getText: TextGetter,
+    query: string,
+    opts?: FindOptions | null
+): number[] {
+    const out: number[] = [];
     if (!query) return out;
     const mc = opts && opts.matchCase,
         whole = opts && opts.wholeCell;
@@ -659,7 +788,7 @@ function findAll(rowCount, colCount, getText, query, opts) {
 }
 
 // text predicate for find: (text)->bool, no per-call allocation
-function makeMatcher(query, opts) {
+function makeMatcher(query: string, opts?: FindOptions | null): TextMatcher {
     const mc = opts && opts.matchCase,
         whole = opts && opts.wholeCell;
     if (!query) return () => false;
@@ -671,31 +800,54 @@ function makeMatcher(query, opts) {
 }
 
 // Time-sliced task runner: step(deadline)->true when finished. First slice runs synchronously on start(true).
-let _chan = null;
-function defaultDefer(f) {
+interface DeferChannel {
+    q: (() => void)[];
+    port: MessagePort;
+}
+let _chan: DeferChannel | null = null;
+// Node's MessagePort has unref(); browsers do not.
+function hasUnref(p: MessagePort): p is MessagePort & { unref(): void } {
+    return 'unref' in p && typeof p.unref === 'function';
+}
+function defaultDefer(f: () => void): void {
     if (typeof MessageChannel === 'function') {
         if (!_chan) {
-            const q = [];
+            const q: (() => void)[] = [];
             const ch = new MessageChannel();
             ch.port1.onmessage = () => {
                 const fn = q.shift();
                 if (fn) fn();
             };
-            if (ch.port1.unref) ch.port1.unref();
+            if (hasUnref(ch.port1)) ch.port1.unref();
             _chan = { q, port: ch.port2 };
         }
         _chan.q.push(f);
         _chan.port.postMessage(0);
     } else setTimeout(f, 0);
 }
-function createSlicer(step, o) {
-    o = o || {};
+function createSlicer(step: (deadline: number) => boolean, opts?: SlicerOptions | null): Slicer {
+    const o: SlicerOptions = opts || {};
     const now = o.now || (() => (typeof performance !== 'undefined' ? performance : Date).now()),
         budget = o.budget || 8,
         defer = o.defer || defaultDefer;
-    const t = { cancelled: false, finished: false, slices: 0 };
+    const t: Slicer = {
+        cancelled: false,
+        finished: false,
+        slices: 0,
+        start: sync => {
+            if (sync) run();
+            else if (!queued) {
+                queued = true;
+                defer(run);
+            }
+            return t;
+        },
+        cancel: () => {
+            t.cancelled = true;
+        }
+    };
     let queued = false;
-    const run = () => {
+    const run = (): void => {
         queued = false;
         if (t.cancelled || t.finished) return;
         t.slices++;
@@ -707,26 +859,17 @@ function createSlicer(step, o) {
             defer(run);
         }
     };
-    t.start = sync => {
-        if (sync) run();
-        else if (!queued) {
-            queued = true;
-            defer(run);
-        }
-        return t;
-    };
-    t.cancel = () => {
-        t.cancelled = true;
-    };
     return t;
 }
 
 class MatchList {
+    a: Float64Array;
+    n: number;
     constructor() {
         this.a = new Float64Array(64);
         this.n = 0;
     }
-    push(k) {
+    push(k: number): void {
         if (this.n === this.a.length) {
             const b = new Float64Array(this.n * 2);
             b.set(this.a);
@@ -737,7 +880,22 @@ class MatchList {
 }
 // Incremental find over rows; scans [startRow,end) then [0,startRow). Keys are r*65536+c; list B (rows < startRow) sorts before list A.
 class FindScan {
-    constructor(o) {
+    rows: number;
+    cols: number;
+    get: TextGetter;
+    get2: TextGetter | null;
+    match: TextMatcher;
+    max: number;
+    s: number;
+    A: MatchList;
+    B: MatchList;
+    phase: 0 | 1;
+    r: number;
+    end: number;
+    done: boolean;
+    truncated: boolean;
+    scanned: number;
+    constructor(o: FindScanOptions) {
         this.rows = Math.max(0, o.rowCount | 0);
         this.cols = Math.max(0, o.colCount | 0);
         this.get = o.getText;
@@ -754,10 +912,10 @@ class FindScan {
         this.truncated = false;
         this.scanned = 0;
     }
-    get count() {
+    get count(): number {
         return this.A.n + this.B.n;
     }
-    step(deadline, now) {
+    step(deadline: number, now: () => number): boolean {
         const cols = this.cols,
             get = this.get,
             get2 = this.get2,
@@ -800,7 +958,7 @@ class FindScan {
     }
 }
 // number of keys in MatchList strictly below k
-function lowerBound(list, k) {
+function lowerBound(list: MatchList, k: number): number {
     const a = list.a;
     let lo = 0,
         hi = list.n;
@@ -813,12 +971,23 @@ function lowerBound(list, k) {
 }
 
 const TSV_Q = /[\t\n\r"]/;
-function tsvField(s) {
+function tsvField(s: string): string {
     return TSV_Q.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 // Chunked TSV assembly: getRow(i)->row string | null (skip). Bounded by maxChars; rows are joined in blocks to keep the heap flat.
 class TsvBuilder {
-    constructor(o) {
+    n: number;
+    getRow: (i: number) => string | null;
+    max: number;
+    i: number;
+    rows: number;
+    chars: number;
+    parts: string[];
+    cur: string[];
+    done: boolean;
+    tooLarge: boolean;
+    projected: number;
+    constructor(o: TsvBuilderOptions) {
         this.n = o.rowCount;
         this.getRow = o.getRow;
         this.max = o.maxChars || 64e6;
@@ -831,7 +1000,7 @@ class TsvBuilder {
         this.tooLarge = false;
         this.projected = 0;
     }
-    step(deadline, now) {
+    step(deadline: number, now: () => number): boolean {
         const n = this.n,
             getRow = this.getRow,
             cur = this.cur;
@@ -862,7 +1031,7 @@ class TsvBuilder {
         this.done = true;
         return true;
     }
-    _abort(proj) {
+    _abort(proj: number): true {
         this.tooLarge = true;
         this.projected = proj;
         this.parts = [];
@@ -870,7 +1039,7 @@ class TsvBuilder {
         this.done = true;
         return true;
     }
-    text() {
+    text(): string {
         return this.parts.length === 1 ? this.parts[0] : this.parts.join('\r\n');
     }
 }
@@ -904,4 +1073,4 @@ const GridCore = {
     MAX_SCROLL
 };
 
-export { GridCore };
+export { GridCore, Axis, MergeIndex, WidthCache, FindScan, MatchList, TsvBuilder };

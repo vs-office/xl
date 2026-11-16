@@ -1,3 +1,4 @@
+const webview = require('./webview.js');
 const fs = require('fs'),
     path = require('path'),
     vm = require('vm'),
@@ -8,10 +9,10 @@ delete globalThis.MessageChannel;
 const R = path.resolve(__dirname, '../../..');
 const ts = require(R + '/node_modules/typescript');
 const OX = {
-    ...require(R + '/src/webview/core/csv-parser.js'),
-    ...require(R + '/src/webview/core/csv-provider.js')
+    ...webview('core/csv-parser'),
+    ...webview('core/csv-provider')
 };
-const csvPage = require(R + '/src/webview/csv.js');
+const csvPage = webview('csv');
 const { URI } = require(R + '/node_modules/vscode-uri');
 // ---- fake vscode
 class Position {

@@ -13,12 +13,12 @@ npm ci --ignore-scripts
 ## Checks
 
 ```bash
-npm run check       # fmt-check + lint + tsc + test, the same as CI
+npm run check       # fmt-check + lint + tsc + test + compile, the same as CI
 npm run fmt         # format everything with Prettier
 npx eslint . --fix  # apply autofixable lint rules
 ```
 
-Individual steps: `npm run fmt-check`, `npm run lint`, `npm run tsc`, `npm test`.
+Individual steps: `npm run fmt-check`, `npm run lint`, `npm run tsc`, `npm test`, `npm run compile`.
 
 ## Build and run
 
@@ -37,6 +37,6 @@ TypeScript is strict. `any`, non-null assertions and `@ts-ignore` are lint error
 ## Layout
 
 - `src/extension.ts`, `src/common`, `src/csv`, `src/excel`: extension host.
-- `src/webview`: code that runs inside the webview pages.
+- `src/webview`: code that runs inside the webview pages (TypeScript, bundled by webpack; Node runs the same `.ts` files directly in tests).
 - `src/test`: tests (`node --test`).
 - `scripts`: build helpers.

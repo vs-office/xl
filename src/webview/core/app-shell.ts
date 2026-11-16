@@ -1,14 +1,187 @@
-import { Grid } from './grid.js';
-import { formatGeneral, colName, cellRef, parseRange, parseRef } from './format.js';
+import { Grid } from './grid.ts';
+import type {
+    GridActiveCell,
+    GridContextMenuEvent,
+    GridEdit,
+    GridEditSource,
+    GridFindState,
+    GridLinkEvent,
+    GridMenuItem,
+    GridProvider,
+    GridScroll,
+    GridScrollTarget,
+    GridSelection
+} from './grid.ts';
+import { colName, cellRef, parseRange, parseRef } from './cell-ref.ts';
+import type { CellRef } from './cell-ref.ts';
+import { generalNum as formatGeneral } from './general.ts';
+import type { Range } from './grid-core.ts';
+import type { SlotCell } from './xlsx-provider.ts';
+
+// ---------- public types ----------
+
+type TimerHandle = ReturnType<typeof setTimeout>;
+
+/** A background task started by runTask (cancellable, progress 0..1). */
+export interface Task {
+    cancelled: boolean;
+    done: boolean;
+    progress: number;
+    cancel(): void;
+}
+/** What runTask drives: a generator yielding progress (0..1) and returning the result. */
+export type TaskGen<T> = Iterator<number, T, undefined>;
+export interface TaskOptions<T> {
+    /** ms per slice (default 8) */
+    budget?: number | undefined;
+    onDone?: ((value: T) => void) | undefined;
+    onError?: ((error: unknown) => void) | undefined;
+    onProgress?: ((pct: number) => void) | undefined;
+}
+
+/** Running count / sum / min / max over a range of cells. */
+export interface StatsAcc {
+    cnt: number;
+    nums: number;
+    sum: number;
+    min: number;
+    max: number;
+}
+export type StatsGen = Generator<number, StatsAcc, undefined>;
+
+/** Order-preserving sort keys per provider row: cat 0 number (hi/lo = uint64), 1 text (lo = index into strs), 2 blank. */
+export interface SortKeys {
+    cat: Uint8Array;
+    hi: Uint32Array;
+    lo: Uint32Array;
+    strs: string[];
+}
+/** Distinct display values of a column; ids/values/counts are null when truncated. */
+export interface ColumnIds {
+    ids: Int32Array | null;
+    values: string[] | null;
+    counts: Int32Array | null;
+    truncated: boolean;
+}
+export interface ColumnIdsFull extends ColumnIds {
+    ids: Int32Array;
+    values: string[];
+    counts: Int32Array;
+}
+/** ColumnIds plus the display order of the distinct values (set by the filter popup scan). */
+export interface ScannedColumn extends ColumnIds {
+    order?: Int32Array | undefined;
+}
+
+/**
+ * What the Shell needs from a provider: the Grid contract plus optional capabilities (resize persistence, theme,
+ * fast sort/filter/stats paths). CsvProvider and XlsxProvider both satisfy it.
+ */
+export interface ShellProvider extends GridProvider {
+    /** the Shell wraps colName once to append sort / filter markers; a provider's own colName must return a string */
+    colName?(c: number): string;
+    _shellColName?: boolean | undefined;
+    /** true while the file is still loading (sort and filter are disabled) */
+    readonly partial?: boolean | undefined;
+    readonly dataVersion?: number | undefined;
+    setColWidth?(c: number, w: number): void;
+    setRowHeight?(r: number, h: number): void;
+    setDark?(dark: boolean): void;
+    forEachCell?(
+        r1: number,
+        c1: number,
+        r2: number,
+        c2: number,
+        fn: (cell: SlotCell, r: number, c: number) => void
+    ): void;
+    columnIds?(c: number, maxDistinct?: number, raw?: boolean): Generator<number, ColumnIds, undefined>;
+    sortKeyColumn?(c: number): Generator<number, SortKeys, undefined>;
+    rangeStats?(
+        acc: StatsAcc,
+        rows: ArrayLike<number> | null | undefined,
+        r1: number,
+        r2: number,
+        c1: number,
+        c2: number
+    ): StatsGen;
+}
+
+export type TextFilterOp = 'contains' | 'equals' | 'starts' | 'ends' | 'notcontains';
+export interface TextFilter {
+    kind: 'text';
+    op: TextFilterOp;
+    q: string;
+}
+export interface SetFilter {
+    kind: 'set';
+    set: Set<string>;
+}
+export type ColumnFilter = TextFilter | SetFilter;
+export interface SortSpec {
+    c: number;
+    /** > 0 ascending, < 0 descending */
+    dir: number;
+}
+/** The (never persisted) sort / filter view applied on top of the provider. */
+export interface ShellView {
+    sort: SortSpec | null;
+    filters: Map<number, ColumnFilter>;
+}
+
+/** Source of an onEdit call: a grid edit or the formula bar. */
+export type ShellEditSource = GridEditSource | 'formula';
+export interface ShellOptions {
+    readOnly?: boolean | undefined;
+    /** show the sheet tab strip */
+    tabs?: boolean | undefined;
+    onEdit?: ((edits: GridEdit[], source: ShellEditSource) => void) | undefined;
+    /** number of leading rows that are never sorted / filtered */
+    headerRows?: (() => number) | undefined;
+    onViewState?: ((state: ShellViewState) => void) | undefined;
+    onLink?: ((e: GridLinkEvent) => void) | undefined;
+}
+
+/** Zoom / scroll / active cell (source row) as persisted by the pages. */
+export interface ShellViewState {
+    zoom: number;
+    scroll: GridScroll;
+    active: CellRef | null;
+}
+/** Shape accepted by applyViewState (a restored, possibly partial state). */
+export interface ShellViewStateInput {
+    zoom?: number | undefined;
+    scroll?: GridScrollTarget | null | undefined;
+    active?: CellRef | null | undefined;
+}
+
+interface FindBar {
+    el: HTMLDivElement;
+    input: HTMLInputElement;
+    count: HTMLSpanElement;
+    prev: HTMLButtonElement;
+    next: HTMLButtonElement;
+    mc: HTMLButtonElement;
+    wc: HTMLButtonElement;
+    close: HTMLButtonElement;
+}
+interface ColCacheEntry {
+    ver: number;
+    res: ColumnIds;
+}
+interface RadixPass {
+    arr: ArrayLike<number>;
+    sh: number;
+    h: Uint32Array;
+}
 
 const root = globalThis;
 const MAX_DISTINCT = 50000;
 const SMALL_STATS = 20000;
-const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
-const tick = (function () {
+const nowMs = (): number => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+const tick = (function (): (fn: () => void) => void {
     if (typeof window !== 'undefined' && typeof MessageChannel !== 'undefined') {
         const ch = new MessageChannel(),
-            q = [];
+            q: (() => void)[] = [];
         ch.port1.onmessage = () => {
             const f = q.shift();
             if (f) f();
@@ -22,21 +195,25 @@ const tick = (function () {
 })();
 
 // Runs generator `gen` in slices of ~budget ms; a yielded number is the progress (0..1). First slice runs synchronously.
-function runTask(gen, o) {
-    o = o || {};
+function runTask<T>(gen: TaskGen<T>, opts?: TaskOptions<T>): Task {
+    const o: TaskOptions<T> = opts || {};
     const budget = o.budget || 8,
-        t = { cancelled: false, done: false, progress: 0 };
-    t.cancel = () => {
-        if (!t.done) {
-            t.cancelled = true;
-            t.done = true;
-            try {
-                gen.return();
-            } catch (e) {
-                /* closing */
+        t: Task = {
+            cancelled: false,
+            done: false,
+            progress: 0,
+            cancel: () => {
+                if (!t.done) {
+                    t.cancelled = true;
+                    t.done = true;
+                    try {
+                        gen.return?.();
+                    } catch (e) {
+                        /* closing */
+                    }
+                }
             }
-        }
-    };
+        };
     const step = () => {
         if (t.cancelled) return;
         const t0 = nowMs();
@@ -54,7 +231,7 @@ function runTask(gen, o) {
         } catch (e) {
             t.done = true;
             if (o.onError) o.onError(e);
-            else if (root.console) console.error(e);
+            else if (root.console) root.console.error(e);
             return;
         }
         if (o.onProgress) o.onProgress(t.progress);
@@ -65,11 +242,14 @@ function runTask(gen, o) {
 }
 
 // Stable bottom-up merge sort of an Int32Array of indices, sliceable.
-function* mergeSortGen(a, less) {
+function* mergeSortGen(
+    a: Int32Array,
+    less: (a: number, b: number) => boolean
+): Generator<number, Int32Array, undefined> {
     const n = a.length,
         RUN = 16;
-    let src = a,
-        dst = new Int32Array(n),
+    let src: Int32Array = a,
+        dst: Int32Array = new Int32Array(n),
         work = 0;
     for (let s = 0; s < n; s += RUN) {
         const e = Math.min(n, s + RUN);
@@ -115,10 +295,15 @@ function* mergeSortGen(a, less) {
 }
 
 // LSD radix sort of source rows by (cat, hi, lo) keys indexed by row; stable, so ties keep ascending row order.
-function* radixRows(rows, cat, hi, lo) {
+function* radixRows(
+    rows: Int32Array,
+    cat: Uint8Array,
+    hi: Uint32Array,
+    lo: Uint32Array
+): Generator<number, Int32Array, undefined> {
     const n = rows.length,
         B = 1 << 16;
-    const passes = [
+    const passes: RadixPass[] = [
         { arr: lo, sh: 0, h: new Uint32Array(B) },
         { arr: lo, sh: 16, h: new Uint32Array(B) },
         { arr: hi, sh: 0, h: new Uint32Array(B) },
@@ -180,7 +365,7 @@ const f64 = new Float64Array(1),
     u32 = new Uint32Array(f64.buffer),
     LE = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 
-function matchText(spec) {
+function matchText(spec: TextFilter): (s: string) => boolean {
     const q = spec.q.toLowerCase();
     switch (spec.op) {
         case 'equals':
@@ -196,14 +381,36 @@ function matchText(spec) {
     }
 }
 
-function h(tag, cls, text) {
+const noMatch = (_s: string): boolean => false;
+
+function textOp(v: string): TextFilterOp {
+    switch (v) {
+        case 'equals':
+        case 'starts':
+        case 'ends':
+        case 'notcontains':
+            return v;
+        default:
+            return 'contains';
+    }
+}
+
+function hasIds<C extends ColumnIds>(col: C): col is C & ColumnIdsFull {
+    return col.ids !== null && col.values !== null && col.counts !== null;
+}
+
+function h<K extends keyof HTMLElementTagNameMap>(
+    tag: K,
+    cls?: string | null,
+    text?: string | null
+): HTMLElementTagNameMap[K] {
     const e = document.createElement(tag);
     if (cls) e.className = cls;
-    if (text != null) e.textContent = text;
+    if (text !== null && text !== undefined) e.textContent = text;
     return e;
 }
 
-function icon(path) {
+function icon(path: string): SVGSVGElement {
     const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     s.setAttribute('viewBox', '0 0 16 16');
     s.setAttribute('width', '14');
@@ -219,11 +426,51 @@ function icon(path) {
     return s;
 }
 
-const fmtNum = n => formatGeneral(Math.round(n * 1e9) / 1e9);
+/** Source row of the active cell (falls back to the view row). */
+const srcRow = (a: GridActiveCell): number => (a.sr !== undefined && a.sr !== null ? a.sr : a.r);
+
+const fmtNum = (n: number): string => formatGeneral(Math.round(n * 1e9) / 1e9);
 
 class Shell {
-    // opts: { readOnly, tabs, onEdit(edits, source), headerRows(), onViewState(state), onLink(e) }
-    constructor(app, opts) {
+    app: HTMLElement;
+    o: ShellOptions;
+    provider: ShellProvider | null;
+    view: ShellView;
+    loading: boolean;
+    grid: Grid;
+    // DOM chrome, created by _build() from the constructor
+    bar!: HTMLDivElement;
+    nameBox!: HTMLInputElement;
+    fx!: HTMLSpanElement;
+    formula!: HTMLTextAreaElement;
+    fxExpand!: HTMLButtonElement;
+    fxBox!: HTMLDivElement;
+    btnFind!: HTMLButtonElement;
+    btnClear!: HTMLButtonElement;
+    gridWrap!: HTMLDivElement;
+    gridHost!: HTMLDivElement;
+    findBar!: FindBar;
+    tabs!: HTMLDivElement;
+    status!: HTMLDivElement;
+    msg!: HTMLSpanElement;
+    stats!: HTMLSpanElement;
+    zoomBox!: HTMLSpanElement;
+    zOut!: HTMLButtonElement;
+    zVal!: HTMLSpanElement;
+    zIn!: HTMLButtonElement;
+    /** view row -> source row of the active sort / filter, or null */
+    _order: Int32Array | null | undefined;
+    _tasks: { [name: string]: Task | undefined };
+    _colCache: Map<string, ColCacheEntry>;
+    _statKey: string | null;
+    _statText0: string | undefined;
+    _statT: TimerHandle | undefined;
+    _findT: TimerHandle | 0 | undefined;
+    _vt: TimerHandle | undefined;
+    _fxBase: string | undefined;
+    _popClose: (() => void) | null | undefined;
+
+    constructor(app: HTMLElement, opts?: ShellOptions) {
         this.app = app;
         this.o = opts || {};
         this.provider = null;
@@ -237,7 +484,7 @@ class Shell {
         this._wire();
     }
 
-    _build() {
+    _build(): void {
         const a = this.app;
         a.classList.add('ox-app');
         this.bar = h('div', 'ox-bar');
@@ -282,7 +529,7 @@ class Shell {
         a.append(this.bar, this.gridWrap, this.tabs, this.status);
     }
 
-    _buildFind() {
+    _buildFind(): FindBar {
         const el = h('div', 'ox-find');
         el.style.display = 'none';
         const input = h('input', 'ox-find-in');
@@ -306,7 +553,7 @@ class Shell {
         return { el, input, count, prev, next, mc, wc, close };
     }
 
-    _wire() {
+    _wire(): void {
         const g = this.grid;
         g.on('select', e => this._onSelect(e));
         g.on('edit', e => {
@@ -435,11 +682,18 @@ class Shell {
         mo.observe(document.documentElement, { attributes: true, attributeFilter: ['style', 'class'] });
     }
 
-    isDark() {
+    /** The provider; the view / stats pipeline only runs with one. */
+    _need(): ShellProvider {
+        const p = this.provider;
+        if (!p) throw new Error('Shell has no provider');
+        return p;
+    }
+
+    isDark(): boolean {
         return !document.body.classList.contains('vscode-light');
     }
 
-    setProvider(p) {
+    setProvider(p: ShellProvider): void {
         this._cancelAll();
         this.provider = p;
         this._order = null;
@@ -447,10 +701,10 @@ class Shell {
         this._statKey = null;
         this._closePopup();
         this.view = { sort: null, filters: new Map() };
-        if (p && !p._shellColName) {
+        if (!p._shellColName) {
             const orig = p.colName ? p.colName.bind(p) : null;
             p._shellColName = true;
-            p.colName = c => {
+            p.colName = (c: number): string => {
                 let base = orig ? orig(c) : colName(c);
                 const v = this.view;
                 if (v.sort && v.sort.c === c) base += v.sort.dir > 0 ? ' ▲' : ' ▼';
@@ -465,60 +719,60 @@ class Shell {
         this.btnClear.style.display = 'none';
     }
 
-    setMessage(t) {
+    setMessage(t: string): void {
         this.msg.textContent = t;
     }
 
     // ---- background tasks ----
-    _start(name, gen, o) {
+    _start<T>(name: string, gen: TaskGen<T>, opts?: TaskOptions<T>): Task {
         this._cancel(name);
-        o = o || {};
-        const slot = {};
+        const o: TaskOptions<T> = opts || {};
+        const slot: { t?: Task } = {};
         const finish = () => {
             if (slot.t && this._tasks[name] === slot.t) delete this._tasks[name];
         };
         const t = (slot.t = runTask(
             gen,
             Object.assign({}, o, {
-                onDone: v => {
+                onDone: (v: T) => {
                     finish();
                     if (o.onDone) o.onDone(v);
                 },
-                onError: e => {
+                onError: (e: unknown) => {
                     finish();
                     if (o.onError) o.onError(e);
-                    else if (root.console) console.error(e);
+                    else if (root.console) root.console.error(e);
                 }
             })
         ));
         if (!t.done) this._tasks[name] = t;
         return t;
     }
-    _cancel(name) {
+    _cancel(name: string): void {
         const t = this._tasks[name];
         if (t) {
             t.cancel();
             delete this._tasks[name];
         }
     }
-    _cancelAll() {
+    _cancelAll(): void {
         for (const k of Object.keys(this._tasks)) this._cancel(k);
         clearTimeout(this._statT);
         clearTimeout(this._findT);
         this._findT = 0;
     }
-    busy() {
+    busy(): boolean {
         return Object.keys(this._tasks).length > 0;
     }
 
     // ---- selection UI ----
-    _onSelect(e) {
+    _onSelect(e: GridSelection): void {
         this._updateName();
         this._updateFormula();
         this._scheduleStats(e && e.dragging);
         this._viewState();
     }
-    _updateAll() {
+    _updateAll(): void {
         this._colCache.clear();
         this._statKey = null;
         this._updateName();
@@ -526,22 +780,22 @@ class Shell {
         this._scheduleStats(false);
     }
 
-    _updateName() {
+    _updateName(): void {
         const s = this.grid.getSelection();
         if (!s || !s.active) return;
         const rg = s.ranges[s.ranges.length - 1];
         const single = rg.r1 === rg.r2 && rg.c1 === rg.c2;
-        if (single) this.nameBox.value = cellRef(s.active.sr != null ? s.active.sr : s.active.r, s.active.c);
+        if (single) this.nameBox.value = cellRef(srcRow(s.active), s.active.c);
         else this.nameBox.value = rg.r2 - rg.r1 + 1 + 'R x ' + (rg.c2 - rg.c1 + 1) + 'C';
     }
 
-    _updateFormula() {
+    _updateFormula(): void {
         const s = this.grid.getSelection();
         if (!s || !s.active || !this.provider) {
             this.formula.value = '';
             return;
         }
-        const sr = s.active.sr != null ? s.active.sr : s.active.r;
+        const sr = srcRow(s.active);
         this.formula.value = this.provider.getRaw(sr, s.active.c) || '';
         this._fxBase = this.formula.value;
         this.formula.readOnly = !!this.o.readOnly;
@@ -550,11 +804,11 @@ class Shell {
         if (!multi) this.fxBox.classList.remove('open');
     }
 
-    _fxMulti() {
+    _fxMulti(): boolean {
         return this.formula.value.indexOf('\n') >= 0;
     }
 
-    _fxNewline() {
+    _fxNewline(): void {
         const f = this.formula;
         if (f.readOnly) return;
         const a = f.selectionStart,
@@ -565,15 +819,15 @@ class Shell {
         this.fxBox.classList.add('open');
     }
 
-    _closePopup() {
+    _closePopup(): void {
         if (this._popClose) this._popClose();
     }
 
-    _commitFormula() {
+    _commitFormula(): void {
         if (this.o.readOnly) return;
         const s = this.grid.getSelection();
         if (!s || !s.active) return;
-        const sr = s.active.sr != null ? s.active.sr : s.active.r;
+        const sr = srcRow(s.active);
         // Untouched text is not re-committed (it would also round-trip multi-line cells through the input).
         if (this.formula.value !== this._fxBase && this.o.onEdit)
             this.o.onEdit([{ r: sr, c: s.active.c, text: this.formula.value }], 'formula');
@@ -582,28 +836,24 @@ class Shell {
         this._updateFormula();
     }
 
-    _goto(text) {
+    _goto(text: unknown): boolean {
         const t = String(text).trim();
         if (!t) return false;
-        const rg =
-            parseRange(t) ||
-            (parseRef(t) &&
-                (function (p) {
-                    return { r1: p.r, c1: p.c, r2: p.r, c2: p.c };
-                })(parseRef(t)));
+        const ref = parseRef(t);
+        const rg = parseRange(t) || (ref && { r1: ref.r, c1: ref.c, r2: ref.r, c2: ref.c });
         if (!rg) return false;
         this.grid.select(rg.r1, rg.c1, rg.r2, rg.c2);
         this.grid.scrollTo(rg.r1, rg.c1);
         return true;
     }
 
-    _selCells(s) {
+    _selCells(s: GridSelection): number {
         let n = 0;
         for (const rg of s.ranges) n += (rg.r2 - rg.r1 + 1) * (rg.c2 - rg.c1 + 1);
         return n;
     }
 
-    _scheduleStats(dragging) {
+    _scheduleStats(dragging: boolean | undefined): void {
         clearTimeout(this._statT);
         const p = this.provider,
             s = this.grid.getSelection();
@@ -627,11 +877,11 @@ class Shell {
         this._statT = setTimeout(() => this._runStats(this.grid.getSelection()), 120);
     }
 
-    _updateStats() {
+    _updateStats(): void {
         this._scheduleStats(false);
     }
 
-    _statText(a, pct) {
+    _statText(a: StatsAcc, pct?: number): string {
         const parts = [];
         if (a.nums) parts.push('Average: ' + fmtNum(a.sum / a.nums));
         parts.push('Count: ' + a.cnt);
@@ -640,10 +890,12 @@ class Shell {
             parts.push('Min: ' + fmtNum(a.min));
             parts.push('Max: ' + fmtNum(a.max));
         }
-        return parts.join('    ') + (pct == null ? '' : '    (partial, calculating ' + Math.round(pct * 100) + '%)');
+        return (
+            parts.join('    ') + (pct === undefined ? '' : '    (partial, calculating ' + Math.round(pct * 100) + '%)')
+        );
     }
 
-    _runStats(s) {
+    _runStats(s: GridSelection): void {
         const p = this.provider;
         if (!p || !s) return;
         const key =
@@ -664,9 +916,10 @@ class Shell {
             r2: Math.min(rg.r2, (order ? order.length : p.rowCount) - 1),
             c2: Math.min(rg.c2, p.colCount - 1)
         }));
-        const self = this;
-        const cur = { acc: null };
-        const live = () => {
+        const genericStats = (acc: StatsAcc, ord: ArrayLike<number> | null | undefined, rg: Range): StatsGen =>
+            this._genericStats(acc, ord, rg);
+        const cur: { acc: StatsAcc | null } = { acc: null };
+        const live = (): StatsAcc => {
             const t = { cnt: total.cnt, nums: total.nums, sum: total.sum, min: total.min, max: total.max };
             if (cur.acc) {
                 t.cnt += cur.acc.cnt;
@@ -677,14 +930,14 @@ class Shell {
             }
             return t;
         };
-        function* gen() {
+        const gen = function* (): Generator<number, void, undefined> {
             for (let i = 0; i < ranges.length; i++) {
                 const rg = ranges[i];
                 if (rg.r2 < rg.r1 || rg.c2 < rg.c1) continue;
                 cur.acc = { cnt: 0, nums: 0, sum: 0, min: Infinity, max: -Infinity };
                 const it = p.rangeStats
                     ? p.rangeStats(cur.acc, order, rg.r1, rg.r2, rg.c1, rg.c2)
-                    : self._genericStats(cur.acc, order, rg);
+                    : genericStats(cur.acc, order, rg);
                 for (let r = it.next(); !r.done; r = it.next())
                     yield (i + (typeof r.value === 'number' ? r.value : 0)) / ranges.length;
                 total.cnt += cur.acc.cnt;
@@ -694,7 +947,7 @@ class Shell {
                 if (cur.acc.max > total.max) total.max = cur.acc.max;
                 cur.acc = null;
             }
-        }
+        };
         this._start('stats', gen(), {
             onProgress: pct => {
                 this.stats.textContent = this._statText(live(), pct);
@@ -708,13 +961,13 @@ class Shell {
     }
 
     // Provider-agnostic fallback (sliced): forEachCell per row slab, else getCell per cell.
-    *_genericStats(a, order, rg) {
-        const p = this.provider,
+    *_genericStats(a: StatsAcc, order: ArrayLike<number> | null | undefined, rg: Range): StatsGen {
+        const p = this._need(),
             nc = rg.c2 - rg.c1 + 1,
             nr = rg.r2 - rg.r1 + 1;
         if (!order && p.forEachCell) {
             const slab = Math.max(1, Math.floor(100000 / nc));
-            const cb = cell => {
+            const cb = (cell: SlotCell): void => {
                 if (cell.t === 'z' || cell.v === null || cell.v === '') return;
                 a.cnt++;
                 if (cell.t === 'n') {
@@ -757,25 +1010,25 @@ class Shell {
     }
 
     // ---- find ----
-    openFind() {
+    openFind(): void {
         const f = this.findBar;
         f.el.style.display = 'flex';
         const s = this.grid.getSelection();
         if (s && s.active && this.provider && !f.input.value) {
-            const raw = this.provider.getRaw(s.active.sr != null ? s.active.sr : s.active.r, s.active.c);
+            const raw = this.provider.getRaw(srcRow(s.active), s.active.c);
             if (raw && raw.indexOf('\n') < 0 && raw.length < 80) f.input.value = raw;
         }
         f.input.focus();
         f.input.select();
         this._doFind(false);
     }
-    closeFind() {
+    closeFind(): void {
         this.findBar.el.style.display = 'none';
         this.grid.clearFind();
         this.findBar.count.textContent = '';
         this.grid.focus();
     }
-    _doFind(jump) {
+    _doFind(_jump: boolean): void {
         const f = this.findBar,
             q = f.input.value;
         if (!q) {
@@ -790,7 +1043,7 @@ class Shell {
             })
         );
     }
-    _findCount(r) {
+    _findCount(r: GridFindState | null | undefined): void {
         if (!r) return;
         const more = r.done === false ? ' (searching...)' : r.truncated ? ' (limit reached)' : '';
         this.findBar.count.textContent = r.count
@@ -802,13 +1055,13 @@ class Shell {
     }
 
     // ---- sort / filter (view only) ----
-    _hdr() {
+    _hdr(): number {
         return this.o.headerRows ? this.o.headerRows() : 0;
     }
 
     // Per-row ids into distinct values of column c (display text, or raw when raw=true); ids null if > MAX_DISTINCT values.
-    *_columnIds(c, raw) {
-        const p = this.provider,
+    *_columnIds(c: number, raw: boolean): Generator<number, ColumnIds, undefined> {
+        const p = this._need(),
             hdr = this._hdr();
         if (p.columnIds) return yield* p.columnIds(c, MAX_DISTINCT, raw);
         const key = c + (raw ? 'r' : 'd'),
@@ -817,17 +1070,17 @@ class Shell {
         if (hit && hit.ver === ver) return hit.res;
         const total = p.rowCount,
             ids = new Int32Array(total).fill(-1),
-            map = new Map(),
-            values = [],
-            cnt = [];
+            map = new Map<string, number>(),
+            values: string[] = [],
+            cnt: number[] = [];
         let work = 0,
             truncated = false;
         for (let r = hdr; r < total; r++) {
-            let t;
+            let t: string;
             if (raw) t = p.getRaw(r, c) || '';
             else {
                 const cv = p.getCell(r, c);
-                t = cv && cv.text != null ? cv.text : '';
+                t = cv && cv.text !== undefined && cv.text !== null ? cv.text : '';
             }
             let k = map.get(t);
             if (k === undefined) {
@@ -847,17 +1100,20 @@ class Shell {
                 yield r / total;
             }
         }
-        const res = truncated
+        const res: ColumnIds = truncated
             ? { ids: null, values: null, counts: null, truncated: true }
             : { ids, values, counts: Int32Array.from(cnt), truncated: false };
         this._colCache.set(key, { ver, res });
-        if (this._colCache.size > 6) this._colCache.delete(this._colCache.keys().next().value);
+        if (this._colCache.size > 6) {
+            const oldest = this._colCache.keys().next().value;
+            if (oldest !== undefined) this._colCache.delete(oldest);
+        }
         return res;
     }
 
     // Row subset (Int32Array of source rows) passing one column filter; `rows` null = all body rows.
-    *_applyFilter(rows, c, spec) {
-        const p = this.provider,
+    *_applyFilter(rows: Int32Array | null, c: number, spec: ColumnFilter): Generator<number, Int32Array, undefined> {
+        const p = this._need(),
             hdr = this._hdr(),
             total = p.rowCount;
         const isText = spec.kind === 'text';
@@ -865,8 +1121,8 @@ class Shell {
         const n = rows ? rows.length : Math.max(0, total - hdr);
         const out = new Int32Array(n);
         let m = 0;
-        if (col.ids) {
-            const test = isText ? matchText(spec) : null,
+        if (hasIds(col)) {
+            const test = isText ? matchText(spec) : noMatch,
                 allowed = new Uint8Array(col.values.length);
             for (let i = 0; i < allowed.length; i++)
                 allowed[i] = isText ? (test(col.values[i]) ? 1 : 0) : spec.set.has(col.values[i]) ? 1 : 0;
@@ -877,14 +1133,14 @@ class Shell {
                 if ((i & 0x3ffff) === 0x3ffff) yield i / n;
             }
         } else {
-            const test = isText ? matchText(spec) : null;
+            const test = isText ? matchText(spec) : noMatch;
             for (let i = 0; i < n; i++) {
                 const r = rows ? rows[i] : hdr + i;
-                let ok;
+                let ok: boolean;
                 if (isText) ok = test(p.getRaw(r, c) || '');
                 else {
                     const cv = p.getCell(r, c);
-                    ok = spec.set.has(cv && cv.text != null ? cv.text : '');
+                    ok = spec.set.has(cv && cv.text !== undefined && cv.text !== null ? cv.text : '');
                 }
                 if (ok) out[m++] = r;
                 if ((i & 0x7fff) === 0x7fff) yield i / n;
@@ -894,14 +1150,14 @@ class Shell {
     }
 
     // Generic sort keys (same shape as CsvProvider.sortKeyColumn).
-    *_sortKeys(c) {
-        const p = this.provider;
+    *_sortKeys(c: number): Generator<number, SortKeys, undefined> {
+        const p = this._need();
         if (p.sortKeyColumn) return yield* p.sortKeyColumn(c);
         const R = p.rowCount,
             cat = new Uint8Array(R).fill(2),
             hi = new Uint32Array(R),
             lo = new Uint32Array(R),
-            strs = [];
+            strs: string[] = [];
         const hiI = LE ? 1 : 0,
             loI = LE ? 0 : 1;
         let work = 0;
@@ -935,7 +1191,7 @@ class Shell {
         return { cat, hi, lo, strs };
     }
 
-    *_sortRows(rows, c, dir) {
+    *_sortRows(rows: Int32Array, c: number, dir: number): Generator<number, Int32Array, undefined> {
         const keys = yield* this._sortKeys(c),
             cat = keys.cat,
             hi = keys.hi,
@@ -970,12 +1226,12 @@ class Shell {
         return yield* radixRows(rows, cat, hi, lo);
     }
 
-    *_viewGen() {
-        const p = this.provider,
+    *_viewGen(): Generator<number, Int32Array, undefined> {
+        const p = this._need(),
             v = this.view,
             hdr = this._hdr(),
             total = p.rowCount;
-        let rows = null;
+        let rows: Int32Array | null = null;
         const filt = [...v.filters.entries()],
             steps = filt.length + (v.sort ? 1 : 0);
         let stepNo = 0;
@@ -1010,7 +1266,7 @@ class Shell {
         return out;
     }
 
-    recomputeView() {
+    recomputeView(): void {
         const p = this.provider;
         if (!p) return;
         this._cancel('view');
@@ -1037,13 +1293,13 @@ class Shell {
                 this._updateAll();
             },
             onError: e => {
-                this.setMessage('Sort/filter failed: ' + (e && e.message));
-                if (root.console) console.error(e);
+                this.setMessage('Sort/filter failed: ' + (e instanceof Error ? e.message : undefined));
+                if (root.console) root.console.error(e);
             }
         });
     }
 
-    _status() {
+    _status(): void {
         const v = this.view,
             parts = [],
             hdr = this._hdr();
@@ -1053,29 +1309,29 @@ class Shell {
                 'Filtered: ' +
                     (this._order ? Math.max(0, this._order.length - hdr) : 0) +
                     ' of ' +
-                    Math.max(0, this.provider.rowCount - hdr) +
+                    Math.max(0, this._need().rowCount - hdr) +
                     ' rows'
             );
         this.setMessage(parts.length ? parts.join('  |  ') + '  (view only, file unchanged)' : 'Ready');
     }
 
-    sortBy(c, dir) {
+    sortBy(c: number, dir: number): void {
         if (this._guardLoading()) return;
         this.view.sort = { c, dir };
         this.recomputeView();
     }
-    clearView() {
+    clearView(): void {
         this.view = { sort: null, filters: new Map() };
         this.recomputeView();
     }
 
-    _guardLoading() {
+    _guardLoading(): boolean {
         if (!this.loading && !(this.provider && this.provider.partial)) return false;
         this.setMessage('Still loading: sort and filter are available when the file is fully loaded');
         return true;
     }
 
-    filterColumn(c, x, y) {
+    filterColumn(c: number, x: number, y: number): void {
         if (this._guardLoading()) return;
         const cur = this.view.filters.get(c);
         this._closePopup();
@@ -1114,37 +1370,40 @@ class Shell {
 
         const ROW = 22,
             VIS = 12;
-        let col = null,
-            order = null,
-            fl = null,
-            sel = null;
+        let col: ScannedColumn | null = null,
+            order: Int32Array | null | undefined = null,
+            fl: Int32Array | null = null,
+            sel: Uint8Array | null = null;
         const curText = cur && cur.kind === 'text' ? cur : null;
         mode.value = curText ? curText.op : 'values';
         search.value = curText ? curText.q : '';
         const isValues = () => mode.value === 'values';
-        const render = () => {
-            if (!col || !col.ids) return;
+        const render = (): void => {
+            if (!col || !hasIds(col) || !fl || !sel) return;
+            const cl = col,
+                flv = fl,
+                selv = sel;
             const top = Math.floor(listBox.scrollTop / ROW),
-                n = fl.length;
+                n = flv.length;
             win.style.transform = 'translateY(' + top * ROW + 'px)';
             win.textContent = '';
             for (let i = top; i < Math.min(n, top + VIS + 2); i++) {
-                const vi = fl[i],
+                const vi = flv[i],
                     l = h('label', 'ox-pop-row');
                 const cb = h('input');
                 cb.type = 'checkbox';
-                cb.checked = sel[vi] === 1;
+                cb.checked = selv[vi] === 1;
                 cb.addEventListener('change', () => {
-                    sel[vi] = cb.checked ? 1 : 0;
+                    selv[vi] = cb.checked ? 1 : 0;
                     syncAll();
                 });
-                const v = col.values[vi];
-                l.append(cb, h('span', null, v === '' ? '(Blanks)' : v), h('em', null, String(col.counts[vi])));
+                const v = cl.values[vi];
+                l.append(cb, h('span', null, v === '' ? '(Blanks)' : v), h('em', null, String(cl.counts[vi])));
                 win.appendChild(l);
             }
         };
-        const syncAll = () => {
-            if (!fl) return;
+        const syncAll = (): void => {
+            if (!fl || !sel) return;
             let every = fl.length > 0;
             for (let i = 0; i < fl.length; i++)
                 if (sel[fl[i]] !== 1) {
@@ -1153,37 +1412,41 @@ class Shell {
                 }
             allCb.checked = every;
         };
-        const refilter = () => {
+        const refilter = (): void => {
+            if (!col || !hasIds(col) || !order) return;
+            const cl = col,
+                ord = order;
             const q = search.value.toLowerCase();
-            const keep = [];
-            for (let i = 0; i < order.length; i++) {
-                const vi = order[i];
-                if (!q || col.values[vi].toLowerCase().indexOf(q) >= 0) keep.push(vi);
+            const keep: number[] = [];
+            for (let i = 0; i < ord.length; i++) {
+                const vi = ord[i];
+                if (!q || cl.values[vi].toLowerCase().indexOf(q) >= 0) keep.push(vi);
             }
             fl = Int32Array.from(keep);
             spacer.style.height = fl.length * ROW + 'px';
             listBox.scrollTop = 0;
-            info.textContent = fl.length.toLocaleString() + ' of ' + col.values.length.toLocaleString() + ' values';
+            info.textContent = fl.length.toLocaleString() + ' of ' + cl.values.length.toLocaleString() + ' values';
             syncAll();
             render();
         };
-        const layout = () => {
-            const vals = isValues() && col && col.ids;
+        const layout = (): void => {
+            const vals = isValues() && col && hasIds(col);
             listBox.style.display = all.style.display = vals ? '' : 'none';
             search.placeholder = isValues() ? 'Search' : 'Text';
-            if (col && !col.ids) mode.options[0].disabled = true;
+            if (col && !hasIds(col)) mode.options[0].disabled = true;
             if (!isValues())
                 info.textContent =
-                    col && !col.ids
+                    col && !hasIds(col)
                         ? 'More than ' + MAX_DISTINCT.toLocaleString() + ' distinct values: filter by text'
                         : 'Rows whose value matches the text (case-insensitive)';
-            else if (col && col.ids)
+            else if (col && hasIds(col))
                 info.textContent =
                     (fl ? fl.length : 0).toLocaleString() + ' of ' + col.values.length.toLocaleString() + ' values';
             if (vals) refilter();
         };
         listBox.addEventListener('scroll', render);
         allCb.addEventListener('change', () => {
+            if (!fl || !sel) return;
             for (let i = 0; i < fl.length; i++) sel[fl[i]] = allCb.checked ? 1 : 0;
             render();
         });
@@ -1192,9 +1455,9 @@ class Shell {
             search.focus();
         });
         search.addEventListener('input', () => {
-            if (isValues() && col && col.ids) refilter();
+            if (isValues() && col && hasIds(col)) refilter();
         });
-        const close = () => {
+        const close: () => void = () => {
             this._cancel('filterScan');
             pop.remove();
             document.removeEventListener('mousedown', off, true);
@@ -1202,21 +1465,21 @@ class Shell {
             this.grid.focus();
         };
         this._popClose = close;
-        const off = e => {
-            if (!pop.contains(e.target)) close();
+        const off = (e: MouseEvent): void => {
+            if (!(e.target instanceof Node) || !pop.contains(e.target)) close();
         };
         no.addEventListener('click', close);
         ok.addEventListener('click', () => {
             if (!isValues()) {
                 const q = search.value;
                 if (q === '') this.view.filters.delete(c);
-                else this.view.filters.set(c, { kind: 'text', op: mode.value, q });
-            } else if (col && col.ids) {
+                else this.view.filters.set(c, { kind: 'text', op: textOp(mode.value), q });
+            } else if (col && hasIds(col) && sel) {
                 let count = 0;
                 for (let i = 0; i < sel.length; i++) count += sel[i];
                 if (count === sel.length) this.view.filters.delete(c);
                 else {
-                    const set = new Set();
+                    const set = new Set<string>();
                     for (let i = 0; i < sel.length; i++) if (sel[i]) set.add(col.values[i]);
                     this.view.filters.set(c, { kind: 'set', set });
                 }
@@ -1237,10 +1500,10 @@ class Shell {
         document.addEventListener('mousedown', off, true);
         layout();
         search.focus();
-        const self = this;
-        function* scan() {
-            const it = self._columnIds(c, false);
-            let res;
+        const columnIds = (): Generator<number, ColumnIds, undefined> => this._columnIds(c, false);
+        function* scan(): Generator<number, ScannedColumn, undefined> {
+            const it = columnIds();
+            let res: ScannedColumn;
             for (let r = it.next(); ; r = it.next()) {
                 if (r.done) {
                     res = r.value;
@@ -1248,9 +1511,9 @@ class Shell {
                 }
                 yield r.value;
             }
-            if (res.ids) {
-                const nums = [],
-                    strs = [];
+            if (hasIds(res)) {
+                const nums: number[] = [],
+                    strs: number[] = [];
                 for (let i = 0; i < res.values.length; i++) {
                     const t = res.values[i];
                     (t !== '' && NUM_RE.test(t) ? nums : strs).push(i);
@@ -1279,9 +1542,9 @@ class Shell {
             onProgress: pct => {
                 info.textContent = 'Scanning column ' + Math.round(pct * 100) + '%...';
             },
-            onDone: res => {
+            onDone: (res: ScannedColumn) => {
                 col = res;
-                if (col.ids) {
+                if (hasIds(col)) {
                     order = col.order;
                     sel = new Uint8Array(col.values.length);
                     const set = cur && cur.kind === 'set' ? cur.set : null;
@@ -1292,12 +1555,12 @@ class Shell {
         });
     }
 
-    _onContext(e) {
+    _onContext(e: GridContextMenuEvent): void {
         if (e.zone !== 'colhdr' || !this.provider) return;
         e.handled = true;
         const c = e.c,
             v = this.view;
-        const items = [
+        const items: GridMenuItem[] = [
             ['Sort A to Z', '', () => this.sortBy(c, 1)],
             ['Sort Z to A', '', () => this.sortBy(c, -1)],
             ['Filter...', '', () => this.filterColumn(c, e.clientX, e.clientY)],
@@ -1309,25 +1572,24 @@ class Shell {
     }
 
     // ---- persisted view state ----
-    getViewState() {
+    getViewState(): ShellViewState {
         const sel = this.grid.getSelection();
         return {
             zoom: this.grid.getZoom(),
             scroll: this.grid.getScroll(),
-            active:
-                sel && sel.active ? { r: sel.active.sr != null ? sel.active.sr : sel.active.r, c: sel.active.c } : null
+            active: sel && sel.active ? { r: srcRow(sel.active), c: sel.active.c } : null
         };
     }
-    applyViewState(s) {
+    applyViewState(s: ShellViewStateInput | null | undefined): void {
         if (!s) return;
         if (s.zoom) this.grid.setZoom(s.zoom);
         if (s.active) this.grid.select(s.active.r, s.active.c);
         if (s.scroll) this.grid.setScroll(s.scroll);
     }
-    _viewState() {
+    _viewState(): void {
         if (!this.o.onViewState) return;
         clearTimeout(this._vt);
-        this._vt = setTimeout(() => this.o.onViewState(this.getViewState()), 300);
+        this._vt = setTimeout(() => this.o.onViewState?.(this.getViewState()), 300);
     }
 }
 

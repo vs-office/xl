@@ -1,96 +1,62 @@
 import SSF from '../vendor/ssf.js';
+import { colName, colIndex, cellRef, parseRef, parseRange } from './cell-ref.ts';
+import { generalNum } from './general.ts';
+export type { CellRef, RangeRef } from './cell-ref.ts';
 
-// ---------- addresses ----------
-const MAXC = 16383,
-    MAXR = 1048575;
-const colCache = [];
-function colName(c) {
-    let s = colCache[c];
-    if (s !== undefined) return s;
-    if (!(c >= 0 && c <= MAXC) || c !== (c | 0)) return '';
-    s = '';
-    for (let n = c + 1; n > 0; n = ((n - 1) / 26) | 0) s = String.fromCharCode(65 + ((n - 1) % 26)) + s;
-    return (colCache[c] = s);
+// ---------- public types ----------
+/** The fields of a grid cell this module reads. */
+export interface FormatCell {
+    t: string;
+    v?: unknown;
+    f?: string | null | undefined;
 }
-function colIndex(s) {
-    const n = s.length;
-    if (n < 1 || n > 3) return -1;
-    let v = 0;
-    for (let i = 0; i < n; i++) {
-        let ch = s.charCodeAt(i);
-        if (ch >= 97 && ch <= 122) ch -= 32;
-        if (ch < 65 || ch > 90) return -1;
-        v = v * 26 + (ch - 64);
-    }
-    return v - 1 <= MAXC ? v - 1 : -1;
+/** The fields of a cell style this module reads. */
+export interface FormatStyle {
+    fmt?: string | undefined;
 }
-function cellRef(r, c) {
-    return colName(c) + (r + 1);
+export type FormatKind = 'text' | 'number' | 'date' | 'bool' | 'error';
+export interface FormatResult {
+    text: string;
+    color: string | undefined;
+    kind: FormatKind;
+}
+export interface ParsedString {
+    t: 's';
+    v: string;
+}
+export interface ParsedError {
+    t: 'e';
+    v: string;
+}
+export interface ParsedBool {
+    t: 'b';
+    v: boolean;
+}
+/** Numeric input; `f` is set (with v null) for formulas, `fmt` is an inferred number format. */
+export interface ParsedNumber {
+    t: 'n';
+    v: number | null;
+    f?: string;
+    fmt?: string;
+}
+export type ParsedInput = ParsedString | ParsedError | ParsedBool | ParsedNumber;
+/** Running numeric statistics over a selection. */
+export interface Stats {
+    count: number;
+    sum: number;
+    min: number;
+    max: number;
+    add(n: number): void;
+    avg(): number;
 }
 
-// parses one endpoint into _pc/_pr (-1 when absent); returns false if invalid
-let _pc = -1,
-    _pr = -1;
-function parsePart(s, a, b) {
-    let i = a,
-        ch;
-    if (i < b && s.charCodeAt(i) === 36) i++;
-    let c = 0,
-        nl = 0;
-    for (; i < b; i++) {
-        ch = s.charCodeAt(i);
-        if (ch >= 97 && ch <= 122) ch -= 32;
-        if (ch < 65 || ch > 90) break;
-        c = c * 26 + (ch - 64);
-        if (++nl > 3) return false;
-    }
-    if (nl && c - 1 > MAXC) return false;
-    if (i < b && s.charCodeAt(i) === 36) {
-        if (!nl) return false;
-        i++;
-    }
-    let r = 0,
-        nd = 0;
-    for (; i < b; i++) {
-        ch = s.charCodeAt(i);
-        if (ch < 48 || ch > 57) return false;
-        r = r * 10 + (ch - 48);
-        if (++nd > 7) return false;
-    }
-    if (nd && (r < 1 || r - 1 > MAXR)) return false;
-    if (!nl && !nd) return false;
-    _pc = nl ? c - 1 : -1;
-    _pr = nd ? r - 1 : -1;
-    return true;
-}
-function parseRef(s) {
-    if (typeof s !== 'string' || !parsePart(s, 0, s.length) || _pc < 0 || _pr < 0) return null;
-    return { r: _pr, c: _pc };
-}
-function parseRange(s) {
-    if (typeof s !== 'string') return null;
-    const k = s.indexOf(':');
-    let r1, c1, r2, c2;
-    if (k < 0) {
-        if (!parsePart(s, 0, s.length) || _pc < 0 || _pr < 0) return null;
-        return { r1: _pr, c1: _pc, r2: _pr, c2: _pc };
-    }
-    if (!parsePart(s, 0, k)) return null;
-    c1 = _pc;
-    r1 = _pr;
-    if (!parsePart(s, k + 1, s.length)) return null;
-    c2 = _pc;
-    r2 = _pr;
-    if (c1 < 0 !== c2 < 0 || r1 < 0 !== r2 < 0 || (c1 < 0 && r1 < 0)) return null;
-    if (r1 < 0) {
-        r1 = 0;
-        r2 = MAXR;
-    }
-    if (c1 < 0) {
-        c1 = 0;
-        c2 = MAXC;
-    }
-    return { r1: r1 < r2 ? r1 : r2, c1: c1 < c2 ? c1 : c2, r2: r1 < r2 ? r2 : r1, c2: c1 < c2 ? c2 : c1 };
+// String(v) for cell values of unknown shape; null/undefined become ''.
+function textOf(v: unknown): string {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' || typeof v === 'bigint')
+        return String(v);
+    if (v instanceof Date) return String(v);
+    return Object.prototype.toString.call(v);
 }
 
 // ---------- dates ----------
@@ -100,24 +66,24 @@ const UTC_1899_1230 = Date.UTC(1899, 11, 30),
 const MAX_SERIAL_1900 = 2958465,
     MAX_SERIAL_1904 = 2957003;
 
-function serialToDate(n, date1904) {
+function serialToDate(n: number, date1904?: boolean): Date {
     if (date1904) return new Date(UTC_1904 + Math.round(n * MS_DAY));
     // serials below 61 are shifted by the fictitious 1900-02-29 (serial 60 maps to Mar 1)
     const days = n < 61 ? n + 1 : n;
     return new Date(UTC_1899_1230 + Math.round(days * MS_DAY));
 }
-function dateToSerial(d, date1904) {
+function dateToSerial(d: Date | number, date1904?: boolean): number {
     const t = d instanceof Date ? d.getTime() : +d;
     if (date1904) return (t - UTC_1904) / MS_DAY;
     const days = (t - UTC_1899_1230) / MS_DAY;
     return days < 61 ? days - 1 : days;
 }
-function isLeap(y) {
+function isLeap(y: number) {
     return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
 }
 const DIM = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 // serial for a calendar date, or -1 if invalid (1900-02-29 accepted like Excel)
-function ymdToSerial(y, m, d, date1904) {
+function ymdToSerial(y: number, m: number, d: number, date1904?: boolean): number {
     if (m < 1 || m > 12 || d < 1) return -1;
     if (!(d <= DIM[m - 1] || (m === 2 && d === 29 && (isLeap(y) || y === 1900)))) return -1;
     if (y === 1900 && m === 2 && d === 29) return date1904 ? -1 : 60;
@@ -144,105 +110,29 @@ const MONTHS = [
 const MON3 = MONTHS.map(m => m.slice(0, 3));
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 const DAY3 = DAYS.map(d => d.slice(0, 3));
-const P2 = [];
+const P2: string[] = [];
 for (let i = 0; i < 100; i++) P2.push(i < 10 ? '0' + i : '' + i);
 
-// ---------- General ----------
-function incDigits(D, keep) {
-    // round digit string D to `keep` sig digits (half up); returns [digits, carry]
-    if (keep >= D.length) return [D, 0];
-    const up = D.charCodeAt(keep) >= 53;
-    let head = D.slice(0, keep);
-    if (!up) return [head, 0];
-    const a = head.split('');
-    let i = keep - 1;
-    while (i >= 0) {
-        if (a[i] === '9') {
-            a[i] = '0';
-            i--;
-        } else {
-            a[i] = String.fromCharCode(a[i].charCodeAt(0) + 1);
-            break;
-        }
-    }
-    if (i < 0) return ['1' + a.join(''), 1];
-    return [a.join(''), 0];
-}
-function stripZeros(D) {
-    let n = D.length;
-    while (n > 1 && D.charCodeAt(n - 1) === 48) n--;
-    return n === D.length ? D : D.slice(0, n);
-}
-// Excel General: <= 11 chars, 15 significant digits, scientific outside [1e-4, 1e11)
-function generalSlow(v) {
-    const neg = v < 0,
-        a = neg ? -v : v;
-    const es = a.toExponential(14);
-    const k = es.indexOf('e');
-    let ex = +es.slice(k + 1);
-    let D = es.charAt(0) + es.slice(2, k);
-    let out;
-    if (ex >= -4 && ex <= 10) {
-        const keep = ex >= 0 ? (ex === 10 ? 11 : 10) : 10 + ex;
-        const r = incDigits(D, keep);
-        D = r[0];
-        ex += r[1];
-        if (ex <= 10) {
-            D = stripZeros(D);
-            if (ex >= 0) {
-                out =
-                    D.length <= ex + 1 ? D + '0'.repeat(ex + 1 - D.length) : D.slice(0, ex + 1) + '.' + D.slice(ex + 1);
-            } else out = '0.' + '0'.repeat(-ex - 1) + D;
-            return neg ? '-' + out : out;
-        }
-        D = es.charAt(0) + es.slice(2, k);
-        ex = +es.slice(k + 1);
-    }
-    const ae = ex < 0 ? -ex : ex;
-    const keep = 1 + 7 - (ae >= 100 ? 3 : 2);
-    const r = incDigits(D, keep);
-    D = stripZeros(r[0]);
-    ex += r[1];
-    const ae2 = ex < 0 ? -ex : ex;
-    out =
-        D.charAt(0) +
-        (D.length > 1 ? '.' + D.slice(1) : '') +
-        'E' +
-        (ex < 0 ? '-' : '+') +
-        (ae2 < 10 ? '0' + ae2 : ae2);
-    return neg ? '-' + out : out;
-}
-function generalNum(v) {
-    if ((v | 0) === v) return '' + v;
-    if (v !== v || v === Infinity || v === -Infinity) return '#NUM!';
-    const a = v < 0 ? -v : v;
-    if (a >= 1e-4 && a < 1e11) {
-        const s = '' + v;
-        if (s.length - (v < 0 ? 1 : 0) <= 11 && s.indexOf('e') < 0) return s;
-    }
-    return generalSlow(v);
-}
-
 // ---------- fixed-decimal fast path ----------
-const POW10 = [];
+const POW10: number[] = [];
 for (let i = 0; i <= 20; i++) POW10.push(Math.pow(10, i));
-function exactRound(a, shift) {
+function exactRound(a: number, shift: number) {
     const es = a.toExponential(14),
         k = es.indexOf('e');
     return Math.round(Number(es.slice(0, k) + 'e' + (+es.slice(k + 1) + shift)));
 }
-function group(s) {
-    let n = s.length;
+function group(s: string) {
+    const n = s.length;
     if (n <= 3) return s;
     let out = s.slice(0, n % 3 || 3);
     for (let i = n % 3 || 3; i < n; i += 3) out += ',' + s.slice(i, i + 3);
     return out;
 }
 const ZEROS = '0000000000000000000000';
-function makeFixed(d, comma, pct) {
+function makeFixed(d: number, comma: boolean, pct: boolean): (v: number) => string | null {
     const sh = d + (pct ? 2 : 0),
         sc = POW10[sh];
-    return function (v) {
+    return function (v: number) {
         const a = v < 0 ? -v : v,
             x = a * sc;
         if (!(x < 1e15)) {
@@ -257,12 +147,12 @@ function makeFixed(d, comma, pct) {
     };
 }
 // integer digits of a large double with 15 significant digits (like Excel), then zeros
-function bigDigits(x) {
+function bigDigits(x: number) {
     const es = x.toExponential(14),
         k = es.indexOf('e');
     return es.charAt(0) + es.slice(2, k) + '0'.repeat(+es.slice(k + 1) - 14);
 }
-function fixedStr(s, d, comma, pct, neg) {
+function fixedStr(s: string, d: number, comma: boolean, pct: boolean, neg: boolean) {
     if (d > 0) {
         if (s.length <= d) s = ZEROS.slice(0, d - s.length + 1) + s;
         const ip = s.slice(0, s.length - d);
@@ -293,14 +183,16 @@ const OP_LIT = 0,
     OP_S2 = 17,
     OP_AMPM = 18,
     OP_AP = 19;
-function compileDate(code) {
+/** Compiled date/time renderer; null when the code needs the generic SSF engine. */
+type DateFormatter = (v: number, d1904?: boolean) => string;
+function compileDate(code: string): DateFormatter | null {
     const n = code.length;
-    const ops = [],
-        args = [];
+    const ops: number[] = [],
+        args: string[] = [];
     let i = 0,
         hasTime = false,
         ampm = false;
-    const push = (o, a) => {
+    const push = (o: number, a = ''): void => {
         ops.push(o);
         args.push(a);
     };
@@ -408,7 +300,7 @@ function compileDate(code) {
     }
     for (let k = 0; k < ops.length; k++) if (ops[k] === OP_LIT && args[k] === undefined) args[k] = '';
     const N = ops.length;
-    return function (v, d1904) {
+    return function (v: number, d1904?: boolean): string {
         if (!(v >= 0)) return '########';
         const maxS = d1904 ? MAX_SERIAL_1904 : MAX_SERIAL_1900;
         let days = Math.floor(v),
@@ -421,10 +313,7 @@ function compileDate(code) {
             }
         }
         if (days > maxS) return '########';
-        let y = 0,
-            m = 0,
-            d = 0,
-            dow = 0;
+        let y: number, m: number, d: number, dow: number;
         if (d1904) {
             dow = (days + 5) % 7;
         } else {
@@ -527,7 +416,7 @@ function compileDate(code) {
 // ---------- format preparation ----------
 const SSF_OPTS = { date1904: false },
     SSF_OPTS_1904 = { date1904: true };
-const NAMED = {
+const NAMED: Record<string, string> = {
     black: '#000000',
     blue: '#0000ff',
     cyan: '#00ffff',
@@ -600,12 +489,12 @@ const COND_ANY = /\[[=<>]/;
 const COND_RE = /\[(=|>[=]?|<[>=]?)(-?\d+(?:\.\d*)?)\]/;
 
 // Normalizes a format code for SSF: drops [$-LCID] tokens (SSF turns [$-409] into "$"), removes spaces before % (re-added to the output, SSF rejects them), quotes bare non-ASCII chars, uppercases e+/e-.
-const NORM_NEEDED = /\[\$-|[^\x00-\x7f]|[ \\]+%|[eE][+-]|\\ /;
-function pctPad(code) {
+const NORM_NEEDED = /\[\$-|[^\0-\x7f]|[ \\]+%|[eE][+-]|\\ /;
+function pctPad(code: string) {
     const m = /((?:\\? )+)%/.exec(code.replace(/"[^"]*"/g, ''));
     return m ? m[1].replace(/\\/g, '') : '';
 }
-function normCode(code) {
+function normCode(code: string) {
     if (!NORM_NEEDED.test(code)) return code;
     let out = '',
         i = 0;
@@ -648,7 +537,7 @@ function normCode(code) {
     return out;
 }
 
-function sectionColor(sec) {
+function sectionColor(sec: string) {
     const m = COLOR_RE.exec(sec);
     if (!m) return undefined;
     if (m[2] !== undefined) {
@@ -657,22 +546,26 @@ function sectionColor(sec) {
     }
     return NAMED[m[1].toLowerCase()];
 }
-function condOf(sec) {
+interface Cond {
+    op: string;
+    t: number;
+}
+function condOf(sec: string): Cond | null {
     const m = COND_RE.exec(sec);
     return m ? { op: m[1], t: parseFloat(m[2]) } : null;
 }
-function condHit(v, c) {
+function condHit(v: number, c: Cond | null): boolean {
     if (!c) return false;
     switch (c.op) {
         case '=':
             // loose on purpose: criteria may be text while the value is a number
-            return v == c.t; // eslint-disable-line eqeqeq
+            return v === c.t;
         case '>':
             return v > c.t;
         case '<':
             return v < c.t;
         case '<>':
-            return v != c.t; // eslint-disable-line eqeqeq
+            return v !== c.t;
         case '>=':
             return v >= c.t;
         case '<=':
@@ -682,15 +575,40 @@ function condHit(v, c) {
 }
 
 const FIXED_RE = /^(#,##0|0)(?:\.(0{1,10}))?(%)?$/;
-const fmtCache = new Map();
+/** Parsed/compiled form of one number-format code, cached per code. */
+interface PreparedFormat {
+    code: string;
+    isDate: boolean;
+    general: boolean;
+    fast: ((v: number, d1904?: boolean) => string | null) | null;
+    ssfCode: string;
+    colors: (string | undefined)[] | null;
+    sec4: string[] | null;
+    c1: Cond | null;
+    c2: Cond | null;
+    cond: boolean;
+    textColor: string | undefined;
+    hasAt: boolean;
+    textOnly: boolean;
+    pad: string;
+    lowE: boolean;
+    cache: Map<number | string, string>;
+    cache1904: Map<number | string, string>;
+    datePart: boolean;
+    timePart: boolean;
+    pct: boolean;
+    genLit: boolean;
+    broken: boolean;
+}
+const fmtCache = new Map<string, PreparedFormat>();
 let lastFmt = 'General',
-    lastPrep = null;
+    lastPrep: PreparedFormat | null = null;
 const CACHE_MAX = 4096;
 
-function prepare(code) {
-    let p = fmtCache.get(code);
-    if (p) return p;
-    p = {
+function prepare(code: string): PreparedFormat {
+    const cached = fmtCache.get(code);
+    if (cached) return cached;
+    const p: PreparedFormat = {
         code,
         isDate: false,
         general: code === 'General',
@@ -725,10 +643,10 @@ function prepare(code) {
             if (secs.length > 4) throw new Error('sections');
             const m = FIXED_RE.exec(sc);
             if (m) {
-                p.fast = makeFixed(m[2] ? m[2].length : 0, m[1] === '#,##0', !!m[3]);
+                const f0 = makeFixed(m[2] ? m[2].length : 0, m[1] === '#,##0', !!m[3]);
+                p.fast = f0;
                 if (p.pad) {
-                    const f0 = p.fast,
-                        pad = p.pad;
+                    const pad = p.pad;
                     p.fast = v => {
                         const r = f0(v);
                         return r === null ? null : r.replace('%', pad + '%');
@@ -752,7 +670,7 @@ function prepare(code) {
                 const last = secs[secs.length - 1],
                     lat = last.indexOf('@');
                 p.hasAt = secs.some(s => s.indexOf('@') >= 0);
-                let f;
+                let f: string[];
                 switch (secs.length) {
                     case 1:
                         f = lat > -1 ? ['General', 'General', 'General', secs[0]] : [secs[0], secs[0], secs[0], '@'];
@@ -776,7 +694,7 @@ function prepare(code) {
                 }
                 if (secs.length === 4 || lat > -1) p.textColor = sectionColor(last);
             } else p.hasAt = sc.indexOf('@') >= 0;
-        } catch (e) {
+        } catch {
             p.broken = true;
             p.general = true;
             p.fast = null;
@@ -787,7 +705,7 @@ function prepare(code) {
     fmtCache.set(code, p);
     return p;
 }
-function getPrep(fmt) {
+function getPrep(fmt: string): PreparedFormat {
     if (fmt === lastFmt && lastPrep !== null) return lastPrep;
     lastPrep = prepare(fmt);
     lastFmt = fmt;
@@ -795,7 +713,7 @@ function getPrep(fmt) {
 }
 const GENERAL_PREP = prepare('General');
 
-function pickIndex(p, v) {
+function pickIndex(p: PreparedFormat, v: number): number {
     if (p.cond) {
         if (condHit(v, p.c1)) return 0;
         if (condHit(v, p.c2)) return 1;
@@ -804,16 +722,16 @@ function pickIndex(p, v) {
     return v > 0 ? 0 : v < 0 ? 1 : 2;
 }
 
-function ssfRun(p, v, d1904, code) {
+function ssfRun(p: PreparedFormat, v: number | string, d1904: boolean | undefined, code?: string): string | null {
     try {
         return SSF.format(code || p.ssfCode, v, d1904 ? SSF_OPTS_1904 : SSF_OPTS);
-    } catch (e) {
+    } catch {
         return null;
     }
 }
-function slowNumber(p, v, d1904) {
+function slowNumber(p: PreparedFormat, v: number, d1904?: boolean): string {
     const cache = d1904 ? p.cache1904 : p.cache;
-    let s = cache.get(v);
+    let s: string | null | undefined = cache.get(v);
     if (s !== undefined) return s;
     if (p.genLit) {
         const sc = p.ssfCode;
@@ -832,7 +750,7 @@ function slowNumber(p, v, d1904) {
     cache.set(v, s);
     return s;
 }
-function numberText(p, v, d1904) {
+function numberText(p: PreparedFormat, v: number, d1904?: boolean): string {
     if (p.general) return generalNum(v);
     if (p.fast !== null) {
         const s = p.fast(v, d1904);
@@ -842,7 +760,7 @@ function numberText(p, v, d1904) {
 }
 
 const MAXDATE_STR = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?Z?$/;
-function isoToSerial(s, d1904) {
+function isoToSerial(s: string, d1904: boolean): number {
     const m = MAXDATE_STR.exec(s);
     if (!m) return NaN;
     const day = ymdToSerial(+m[1], +m[2], +m[3], d1904);
@@ -850,7 +768,7 @@ function isoToSerial(s, d1904) {
     return m[4] === undefined ? day : day + (+m[4] * 3600 + +m[5] * 60 + (m[6] ? +m[6] : 0)) / 86400;
 }
 
-function formatCell(cell, style, date1904) {
+function formatCell(cell: FormatCell | null | undefined, style?: FormatStyle | null, date1904?: boolean): FormatResult {
     if (cell === undefined || cell === null) return { text: '', color: undefined, kind: 'text' };
     const fmt = style ? style.fmt || 'General' : 'General';
     switch (cell.t) {
@@ -858,22 +776,22 @@ function formatCell(cell, style, date1904) {
             const v = cell.v;
             if (typeof v !== 'number') {
                 if (v === null || v === undefined) return { text: '', color: undefined, kind: 'number' };
-                return { text: String(v), color: undefined, kind: 'text' };
+                return { text: textOf(v), color: undefined, kind: 'text' };
             }
             if (v !== v || v === Infinity || v === -Infinity) return { text: '#NUM!', color: undefined, kind: 'error' };
             const p = fmt === 'General' ? GENERAL_PREP : getPrep(fmt);
             const text = numberText(p, v, date1904);
-            let color;
+            let color: string | undefined;
             if (p.colors !== null) color = p.colors[pickIndex(p, v)];
             return { text, color, kind: p.isDate ? 'date' : 'number' };
         }
         case 's': {
             const v = cell.v;
-            let s = typeof v === 'string' ? v : v == null ? '' : String(v);
+            const s = textOf(v);
             if (fmt === 'General') return { text: s, color: undefined, kind: 'text' };
             const p = getPrep(fmt);
             if (!p.hasAt || p.textOnly) return { text: s, color: undefined, kind: 'text' };
-            let t = p.cache.get('s' + s);
+            let t: string | null | undefined = p.cache.get('s' + s);
             if (t === undefined) {
                 t = ssfRun(p, s, false);
                 if (t === null) t = s;
@@ -885,13 +803,12 @@ function formatCell(cell, style, date1904) {
         case 'b':
             return { text: cell.v ? 'TRUE' : 'FALSE', color: undefined, kind: 'bool' };
         case 'e':
-            return { text: cell.v == null ? '' : String(cell.v), color: undefined, kind: 'error' };
+            return { text: textOf(cell.v), color: undefined, kind: 'error' };
         case 'd': {
             let v = cell.v;
             if (typeof v === 'string') v = isoToSerial(v, !!date1904);
             else if (v instanceof Date) v = dateToSerial(v, !!date1904);
-            if (typeof v !== 'number' || v !== v)
-                return { text: cell.v == null ? '' : String(cell.v), color: undefined, kind: 'text' };
+            if (typeof v !== 'number' || v !== v) return { text: textOf(cell.v), color: undefined, kind: 'text' };
             let p = fmt === 'General' ? null : getPrep(fmt);
             if (p === null || !p.isDate) p = prepare('yyyy-mm-dd' + (v % 1 ? ' hh:mm:ss' : ''));
             const text = numberText(p, v, date1904);
@@ -916,7 +833,7 @@ const MDY_RE = new RegExp('^([A-Za-z]{3,9})\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?,?\
 const DMY_RE = new RegExp('^(\\d{1,2})[\\s-]([A-Za-z]{3,9})\\.?[\\s,-]+(\\d{2,4})' + TAIL + '$');
 const MY_RE = new RegExp('^([A-Za-z]{3,9})\\.?[\\s-]+(\\d{4})$');
 
-function monthOf(name) {
+function monthOf(name: string): number {
     const l = name.toLowerCase();
     for (let i = 0; i < 12; i++) {
         const f = MONTHS[i].toLowerCase();
@@ -924,16 +841,16 @@ function monthOf(name) {
     }
     return 0;
 }
-function fullYear(s) {
+function fullYear(s: string): number {
     const y = +s;
     if (s.length === 4) return y;
     if (s.length === 3) return -1;
     return y < 30 ? 2000 + y : 1900 + y;
 }
-function timeFrac(h, mi, s, ap) {
-    h = +h;
-    mi = +mi;
-    s = s ? +s : 0;
+function timeFrac(hs: string, mis: string, ss: string | undefined, ap?: string): number {
+    let h = +hs;
+    const mi = +mis,
+        s = ss ? +ss : 0;
     if (mi > 59 || s > 59) return -1;
     if (ap) {
         if (h < 1 || h > 12) return -1;
@@ -941,12 +858,12 @@ function timeFrac(h, mi, s, ap) {
     }
     return (h * 3600 + mi * 60 + s) / 86400;
 }
-function tailFrac(t) {
+function tailFrac(t: string | undefined): number {
     if (!t) return 0;
     const m = TIME_RE.exec(t);
     return m ? timeFrac(m[1], m[2], m[3], m[4]) : -1;
 }
-function numLit(s) {
+function numLit(s: string) {
     let neg = false;
     if (s.charCodeAt(0) === 43) s = s.slice(1);
     else if (s.charCodeAt(0) === 45) {
@@ -958,7 +875,7 @@ function numLit(s) {
     const v = Number(s);
     return neg ? -v : v;
 }
-function dateInput(s, d1904, allowLoose) {
+function dateInput(s: string, d1904: boolean, allowLoose: boolean): { v: number; fmt?: string } | null {
     let m = ISO_RE.exec(s);
     if (m) {
         const day = ymdToSerial(+m[1], +m[2], +m[3], d1904);
@@ -977,7 +894,7 @@ function dateInput(s, d1904, allowLoose) {
         const day = ymdToSerial(+m[3], +m[1], +m[2], d1904);
         return day < 0 ? null : { v: day, fmt: 'm/d/yyyy' };
     }
-    let y, mo, d, tail, t;
+    let y: number, mo: number, d: number, tail: string | undefined;
     if ((m = SLASH_RE.exec(s))) {
         mo = +m[1];
         d = +m[2];
@@ -1007,14 +924,19 @@ function dateInput(s, d1904, allowLoose) {
     if (!mo || y < 0) return null;
     const day = ymdToSerial(y, mo, d, d1904);
     if (day < 0) return null;
-    t = tailFrac(tail);
+    const t = tailFrac(tail);
     if (t < 0) return null;
     return { v: day + t };
 }
 
-function parseInput(text, prevCell, style, date1904) {
-    if (text === '' || text === null || text === undefined) return null;
-    if (typeof text !== 'string') text = String(text);
+function parseInput(
+    input: string | number | boolean | null | undefined,
+    _prevCell?: unknown,
+    style?: FormatStyle | null,
+    date1904?: boolean
+): ParsedInput | null {
+    if (input === '' || input === null || input === undefined) return null;
+    const text = typeof input === 'string' ? input : String(input);
     const fmt = style && style.fmt ? style.fmt : 'General';
     const p = fmt === 'General' ? GENERAL_PREP : getPrep(fmt);
     const c0 = text.charCodeAt(0);
@@ -1055,7 +977,7 @@ function parseInput(text, prevCell, style, date1904) {
                 const clean = body.replace(/,/g, '');
                 const v = Number(clean + 'e-2');
                 if (isFinite(v)) {
-                    const o = { t: 'n', v: v === 0 ? 0 : v };
+                    const o: ParsedNumber = { t: 'n', v: v === 0 ? 0 : v };
                     if (fmt === 'General') o.fmt = /\.\d*[1-9]/.test(clean) ? '0.00%' : '0%';
                     return o;
                 }
@@ -1069,7 +991,7 @@ function parseInput(text, prevCell, style, date1904) {
             if (tm) {
                 const f = timeFrac(tm[1], tm[2], tm[3], tm[4]);
                 if (f >= 0) {
-                    const o = { t: 'n', v: f };
+                    const o: ParsedNumber = { t: 'n', v: f };
                     if (!p.isDate)
                         o.fmt =
                             (+tm[1] >= 24 && !tm[4] ? '[h]:mm' : 'h:mm') +
@@ -1080,7 +1002,7 @@ function parseInput(text, prevCell, style, date1904) {
             } else {
                 const r = dateInput(s, !!date1904, p.isDate);
                 if (r) {
-                    const o = { t: 'n', v: r.v };
+                    const o: ParsedNumber = { t: 'n', v: r.v };
                     if (!p.isDate && r.fmt) o.fmt = r.fmt;
                     return o;
                 }
@@ -1091,10 +1013,10 @@ function parseInput(text, prevCell, style, date1904) {
 }
 
 // ---------- export ----------
-function pad2(n) {
+function pad2(n: number): string {
     return n < 10 ? '0' + n : '' + n;
 }
-function isoOf(v, d1904, p) {
+function isoOf(v: number, d1904: boolean, p: PreparedFormat): string | null {
     if (!(v >= 0) || v > (d1904 ? MAX_SERIAL_1904 : MAX_SERIAL_1900)) return null;
     let days = Math.floor(v),
         secs = Math.round((v - days) * 86400);
@@ -1113,19 +1035,19 @@ function isoOf(v, d1904, p) {
     const ds = d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate());
     return secs ? ds + ' ' + tstr : ds;
 }
-function looksTyped(s, style, d1904) {
+function looksTyped(s: string, _style: unknown, d1904?: boolean): boolean {
     const c0 = s.charCodeAt(0);
     if (c0 === 39 || (c0 === 61 && s.length > 1)) return true;
     const r = parseInput(s, null, { fmt: 'm/d/yyyy' }, d1904);
     return r !== null && r.t !== 's';
 }
-function exportText(cell, style, date1904) {
+function exportText(cell: FormatCell | null | undefined, style?: FormatStyle | null, date1904?: boolean): string {
     if (!cell) return '';
     if (cell.f !== undefined && cell.f !== null && cell.f !== '') return '=' + cell.f;
     const v = cell.v;
     switch (cell.t) {
         case 'n': {
-            if (typeof v !== 'number') return v == null ? '' : String(v);
+            if (typeof v !== 'number') return textOf(v);
             if (v !== v || v === Infinity || v === -Infinity) return '#NUM!';
             const fmt = style && style.fmt ? style.fmt : 'General';
             if (fmt !== 'General') {
@@ -1146,7 +1068,7 @@ function exportText(cell, style, date1904) {
             return String(v);
         }
         case 's': {
-            const s = typeof v === 'string' ? v : v == null ? '' : String(v);
+            const s = textOf(v);
             if (s === '') return s;
             if (style && style.fmt === '@') return s;
             return looksTyped(s, style, date1904) ? "'" + s : s;
@@ -1154,11 +1076,11 @@ function exportText(cell, style, date1904) {
         case 'b':
             return v ? 'TRUE' : 'FALSE';
         case 'e':
-            return v == null ? '' : String(v);
+            return textOf(v);
         case 'd': {
             if (typeof v === 'string') return v;
             if (v instanceof Date) return v.toISOString().slice(0, 10);
-            return v == null ? '' : String(v);
+            return textOf(v);
         }
         default:
             return '';
@@ -1166,13 +1088,13 @@ function exportText(cell, style, date1904) {
 }
 
 // ---------- stats ----------
-function createStats() {
+function createStats(): Stats {
     return {
         count: 0,
         sum: 0,
         min: Infinity,
         max: -Infinity,
-        add(n) {
+        add(n: number) {
             this.count++;
             this.sum += n;
             if (n < this.min) this.min = n;
@@ -1183,7 +1105,7 @@ function createStats() {
         }
     };
 }
-function isNumericCell(cell) {
+function isNumericCell(cell: FormatCell | null | undefined): boolean {
     return (
         !!cell &&
         cell.t === 'n' &&
@@ -1209,6 +1131,6 @@ export {
     isNumericCell,
     generalNum as formatGeneral
 };
-export function isDateFormat(fmt) {
+export function isDateFormat(fmt: string) {
     return !!fmt && fmt !== 'General' && prepare(fmt).isDate;
 }

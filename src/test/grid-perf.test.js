@@ -1,6 +1,7 @@
+const webview = require('./helpers/webview.js');
 const test = require('node:test');
 const assert = require('node:assert');
-const OX = require('../webview/core/grid-core.js');
+const OX = webview('core/grid-core');
 const { budget } = require('./helpers/timing.js');
 const C = OX.GridCore;
 

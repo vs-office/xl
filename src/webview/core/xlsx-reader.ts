@@ -3,7 +3,28 @@ import SSF from '../vendor/ssf.js';
 
 // zip-bomb guards shared with the writer; override per call (readXlsx opts.limits) or by mutating zipLimits
 const ZIP_BOMB = 'File is too large or looks like a zip bomb';
-const zipLimits = Object.assign({
+
+/** Zip-bomb and streaming limits; every value is a byte count except maxEntries and ratio. */
+export interface ZipLimits {
+    /** maximum number of central directory entries */
+    maxEntries: number;
+    /** maximum declared sum of uncompressed sizes */
+    maxTotal: number;
+    /** maximum size of one ordinary part */
+    maxPart: number;
+    /** maximum size of one worksheet part */
+    maxSheet: number;
+    /** maximum output/input expansion ratio, enforced once the output exceeds ratioMin */
+    ratio: number;
+    ratioMin: number;
+    /** sharedStrings parts at least this large are inflated and indexed lazily */
+    lazySst: number;
+    /** compressed bytes consumed per lazy shared-string step */
+    sstChunk: number;
+    /** deflated worksheets at least this large use the native DecompressionStream when available */
+    nativeInflate: number;
+}
+const zipLimits: ZipLimits = {
     maxEntries: 100000,
     maxTotal: 2 * 1024 ** 3,
     maxPart: 256 * 1024 ** 2,
@@ -13,15 +34,22 @@ const zipLimits = Object.assign({
     lazySst: 2 * 1024 ** 2,
     sstChunk: 65536,
     nativeInflate: 1024 ** 2
-});
+};
+interface CodedError extends Error {
+    code?: string;
+}
 const bombErr = () => {
-    const e = new Error(ZIP_BOMB);
+    const e: CodedError = new Error(ZIP_BOMB);
     e.code = 'ZIPBOMB';
     return e;
 };
 
+function isZipBomb(e: unknown): boolean {
+    return typeof e === 'object' && e !== null && 'code' in e && e.code === 'ZIPBOMB';
+}
+
 // entry count + declared total size from the central directory (zip64 aware); throws on bombs
-function checkZipDir(bytes, L) {
+function checkZipDir(bytes: Uint8Array, L: ZipLimits) {
     const n = bytes.length,
         dv = new DataView(bytes.buffer, bytes.byteOffset, n);
     let e = n - 22;
@@ -52,8 +80,8 @@ function checkZipDir(bytes, L) {
 }
 
 // ---------- small helpers ----------
-const colNameCache = [];
-function colName(c) {
+const colNameCache: string[] = [];
+function colName(c: number) {
     let s = colNameCache[c];
     if (s !== undefined) return s;
     s = '';
@@ -65,14 +93,14 @@ function colName(c) {
     }
     return (colNameCache[c] = s);
 }
-function colIndex(letters) {
+function colIndex(letters: string) {
     let n = 0;
     for (let i = 0; i < letters.length; i++) n = n * 26 + ((letters.charCodeAt(i) | 32) - 96);
     return n - 1;
 }
 
 const ENT = /&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g;
-function entRep(m, g) {
+function entRep(_m: string, g: string) {
     switch (g) {
         case 'amp':
             return '&';
@@ -89,31 +117,31 @@ function entRep(m, g) {
     if (!(n >= 0 && n <= 0x10ffff) || (n >= 0xd800 && n <= 0xdfff)) return '�';
     return String.fromCodePoint(n);
 }
-function xmlDecode(s) {
+function xmlDecode(s: string) {
     return s.indexOf('&') < 0 ? s : s.replace(ENT, entRep);
 }
 const UESC = /_x([0-9A-Fa-f]{4})_/g;
-function uescRep(m, h) {
+function uescRep(_m: string, h: string) {
     return String.fromCharCode(parseInt(h, 16));
 }
 // entity decode + OOXML _xHHHH_ escapes (strings in sharedStrings/inline/str cells)
-function decodeStr(s) {
+function decodeStr(s: string) {
     if (s.indexOf('&') >= 0) s = s.replace(ENT, entRep);
     if (s.indexOf('_x') >= 0) s = s.replace(UESC, uescRep);
     return s;
 }
 
-function toText(u8) {
+function toText(u8: Uint8Array) {
     let i = 0;
     if (u8.length >= 3 && u8[0] === 0xef && u8[1] === 0xbb && u8[2] === 0xbf) i = 3;
-    let s;
+    let s: string;
     if (typeof TextDecoder !== 'undefined') s = new TextDecoder('utf-8').decode(i ? u8.subarray(i) : u8);
     else s = fflate.strFromU8(i ? u8.subarray(i) : u8);
     return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
 }
 
 // remove an element namespace prefix (e.g. <x:row>) so scanners can assume bare names
-function prep(x) {
+function prep(x: string) {
     let p = 0;
     for (;;) {
         p = x.indexOf('<', p);
@@ -141,7 +169,7 @@ function prep(x) {
     }
 }
 
-function tagEnd(x, p) {
+function tagEnd(x: string, p: number) {
     let q = 0;
     for (let i = p, n = x.length; i < n; i++) {
         const c = x.charCodeAt(i);
@@ -153,9 +181,17 @@ function tagEnd(x, p) {
     return -1;
 }
 
+/** XML attributes of one element; absent attributes read as undefined. */
+export type Attrs = Record<string, string | undefined>;
+/** An element found by firstElem: its attributes and the raw inner XML. */
+interface Elem {
+    a: Attrs;
+    inner: string;
+}
+
 // parse attributes of a tag text like `<a b="1" c='2'/>` into a plain object
-function attrMap(t) {
-    const o = {};
+function attrMap(t: string): Attrs {
+    const o: Attrs = {};
     let i = t.indexOf(' ');
     const n = t.length;
     if (i < 0) return o;
@@ -184,7 +220,7 @@ function attrMap(t) {
 }
 
 // iterate elements named `name`: cb(attrs, innerXml)
-function eachElem(x, name, cb) {
+function eachElem(x: string, name: string, cb: (a: Attrs, inner: string) => void) {
     const open = '<' + name,
         ol = open.length,
         close = '</' + name + '>';
@@ -216,8 +252,7 @@ function eachElem(x, name, cb) {
     }
 }
 // first element named `name` -> {a: attrs, inner} or null
-function firstElem(x, name) {
-    let r = null;
+function firstElem(x: string, name: string): Elem | null {
     const open = '<' + name,
         ol = open.length;
     let p = 0;
@@ -236,23 +271,22 @@ function firstElem(x, name) {
             const ce = x.indexOf('</' + name + '>', te + 1);
             inner = ce < 0 ? x.substring(te + 1) : x.substring(te + 1, ce);
         }
-        r = { a: attrMap(x.substring(p, te)), inner };
-        return r;
+        return { a: attrMap(x.substring(p, te)), inner };
     }
 }
-function block(x, name) {
+function block(x: string, name: string) {
     const f = firstElem(x, name);
     return f ? f.inner : '';
 }
-function relId(a) {
+function relId(a: Attrs) {
     if (a['r:id'] !== undefined) return a['r:id'];
     for (const k in a) if (k.length > 3 && k.endsWith(':id')) return a[k];
     return a.id;
 }
-const isTrue = v => v === '1' || v === 'true';
+const isTrue = (v: string | undefined) => v === '1' || v === 'true';
 
 // text of <si>/<is> content: concatenate <t> runs, ignoring phonetic <rPh>
-function siText(x) {
+function siText(x: string) {
     if (x.indexOf('<rPh') >= 0) {
         let out = '',
             p = 0;
@@ -298,12 +332,36 @@ function siText(x) {
 // ---------- formula reference shifting ----------
 const MAXC = 16384,
     MAXR = 1048576;
-const isLetter = c => (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
-const isDigit = c => c >= 48 && c <= 57;
-const isTokCh = c => isLetter(c) || isDigit(c) || c === 95 || c === 46 || c === 36 || c === 92 || c > 127;
+const isLetter = (c: number) => (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+const isDigit = (c: number) => c >= 48 && c <= 57;
+const isTokCh = (c: number) => isLetter(c) || isDigit(c) || c === 95 || c === 46 || c === 36 || c === 92 || c > 127;
+
+/** Parsed formula reference tokens: 1 = A1 cell, 2 = column-only (A), 3 = row-only (1). */
+interface CellRefTok {
+    k: 1;
+    ca: boolean;
+    c: number;
+    ra: boolean;
+    r: number;
+}
+interface ColRefTok {
+    k: 2;
+    ca: boolean;
+    c: number;
+}
+interface RowRefTok {
+    k: 3;
+    ra: boolean;
+    r: number;
+}
+type RefToken = CellRefTok | ColRefTok | RowRefTok;
+/** Whole-column (A:C, k 12) or whole-row (1:3, k 13) range. */
+type RangeRefTok = { k: 12; a: ColRefTok; b: ColRefTok } | { k: 13; a: RowRefTok; b: RowRefTok };
+/** A compiled formula: literal text interleaved with shiftable references. */
+type FormulaPart = string | CellRefTok | RangeRefTok;
 
 // classify a token: returns object for refs or null. kinds: 1 cell, 2 col-only, 3 row-only
-function classify(tok) {
+function classify(tok: string): RefToken | null {
     let i = 0;
     const n = tok.length;
     let ca = false;
@@ -345,12 +403,12 @@ function classify(tok) {
 }
 
 // compile formula into literal strings and ref objects
-function compile(f) {
-    const parts = [];
+function compile(f: string) {
+    const parts: FormulaPart[] = [];
     let lit = 0; // start of pending literal
     const n = f.length;
     let i = 0;
-    const flush = to => {
+    const flush = (to: number) => {
         if (to > lit) parts.push(f.substring(lit, to));
     };
     while (i < n) {
@@ -392,7 +450,7 @@ function compile(f) {
             // number literal like 1.5 or 1E5
             const tok = f.substring(s, i);
             const first = tok.charCodeAt(0);
-            let a = classify(tok);
+            const a = classify(tok);
             if (!a) continue;
             if (a.k === 1) {
                 if (s > 0 && f.charCodeAt(s - 1) === 46) continue;
@@ -409,7 +467,8 @@ function compile(f) {
                 if (b && b.k === a.k && f.charCodeAt(j) !== 40 && f.charCodeAt(j) !== 33) {
                     if (a.k === 3 && isDigit(first) && s > 0 && isTokCh(f.charCodeAt(s - 1))) continue;
                     flush(s);
-                    parts.push({ k: a.k + 10, a, b });
+                    if (a.k === 2 && b.k === 2) parts.push({ k: 12, a, b });
+                    else if (a.k === 3 && b.k === 3) parts.push({ k: 13, a, b });
                     lit = j;
                     i = j;
                     continue;
@@ -426,10 +485,10 @@ function compile(f) {
 // _xlfn./_xlws./_xlpm. prefixes are file-format artifacts; show clean names
 const XLFN_RE = /_xlfn\._xlws\.|_xlfn\.|_xlws\.|_xlpm\./g;
 
-function shCol(c, abs, dc) {
+function shCol(c: number, abs: boolean, dc: number) {
     return abs ? c : c + dc;
 }
-function render(parts, dr, dc) {
+function render(parts: FormulaPart[], dr: number, dc: number) {
     let out = '';
     for (let i = 0; i < parts.length; i++) {
         const p = parts[i];
@@ -460,9 +519,10 @@ function render(parts, dr, dc) {
     }
     return out;
 }
-let lastF = null,
-    lastParts = null;
-function shiftFormula(formula, dRow, dCol) {
+let lastF: string | null = null,
+    lastParts: FormulaPart[] = [];
+/** Shifts the relative references of `formula` by (dRow, dCol), as Excel does when filling a shared formula. */
+function shiftFormula(formula: string, dRow: number, dCol: number): string {
     if (!formula || (!dRow && !dCol)) return formula;
     if (formula !== lastF) {
         lastParts = compile(formula);
@@ -496,11 +556,11 @@ const DEFAULT_THEME = [
     '#954f72'
 ];
 
-function hex2(n) {
+function hex2(n: number) {
     n = Math.max(0, Math.min(255, Math.round(n)));
     return (n < 16 ? '0' : '') + n.toString(16);
 }
-function applyTint(hex, tint) {
+function applyTint(hex: string, tint: number) {
     if (!tint) return hex;
     const r = parseInt(hex.substr(1, 2), 16) / 255,
         g = parseInt(hex.substr(3, 2), 16) / 255,
@@ -520,12 +580,12 @@ function applyTint(hex, tint) {
     }
     l = tint < 0 ? l * (1 + tint) : l * (1 - tint) + tint;
     l = Math.max(0, Math.min(1, l));
-    let R, G, B;
+    let R: number, G: number, B: number;
     if (s === 0) R = G = B = l;
     else {
         const q = l < 0.5 ? l * (1 + s) : l + s - l * s,
             p = 2 * l - q;
-        const hue = t => {
+        const hue = (t: number) => {
             if (t < 0) t += 1;
             if (t > 1) t -= 1;
             return t < 1 / 6 ? p + (q - p) * 6 * t : t < 0.5 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p;
@@ -537,10 +597,13 @@ function applyTint(hex, tint) {
     return '#' + hex2(R * 255) + hex2(G * 255) + hex2(B * 255);
 }
 
-function makeColorResolver(theme, indexed) {
+/** Resolves a colour element's attributes (rgb / theme / indexed, plus tint) to '#rrggbb', or null. */
+type ColorResolver = (a: Attrs | null) => string | null;
+
+function makeColorResolver(theme: string[], indexed: (string | null)[]): ColorResolver {
     return function (a) {
         if (!a) return null;
-        let hex = null;
+        let hex: string | null;
         if (a.rgb !== undefined) {
             const v = a.rgb;
             if (v.length === 8 || v.length === 6) hex = '#' + v.slice(-6).toLowerCase();
@@ -561,7 +624,7 @@ function makeColorResolver(theme, indexed) {
     };
 }
 
-function parseTheme(x) {
+function parseTheme(x: string | null) {
     const out = DEFAULT_THEME.slice();
     if (!x) return out;
     x = prep(x);
@@ -590,7 +653,7 @@ function parseTheme(x) {
 }
 
 // ---------- styles ----------
-const BUILTIN_FMT = {
+const BUILTIN_FMT: Record<number, string | undefined> = {
     0: 'General',
     1: '0',
     2: '0.00',
@@ -638,14 +701,55 @@ const BUILTIN_FMT = {
     48: '##0.0E+0',
     49: '@'
 };
-function builtinFmt(id) {
+function builtinFmt(id: number) {
     const t = SSF._table;
     const f = (t && t[id]) || BUILTIN_FMT[id] || 'General';
     // Excel shows the locale short date with a 4-digit year for builtin ids; only custom codes keep yy
     return f === 'm/d/yy' || f === 'mm-dd-yy' ? 'm/d/yyyy' : f === 'm/d/yy h:mm' ? 'm/d/yyyy h:mm' : f;
 }
 
-function defaultStyle() {
+/** One border edge of a cell. */
+export interface Border {
+    style: string;
+    color: string;
+}
+
+/** A resolved cell format (one entry of the workbook's cellXfs), indexed by Cell.s. */
+export interface CellStyle {
+    /** number format code */
+    fmt: string;
+    b: boolean;
+    i: boolean;
+    u: boolean;
+    strike: boolean;
+    /** font colour as '#rrggbb' */
+    color: string | null;
+    /** font size in points */
+    size: number;
+    /** font family name */
+    font: string;
+    /** solid fill colour as '#rrggbb' */
+    bg: string | null;
+    /** horizontal alignment ('general' unless set) */
+    h: string;
+    /** vertical alignment ('bottom' unless set) */
+    v: string;
+    wrap: boolean;
+    indent: number;
+    /** left / right / top / bottom borders */
+    bl: Border | null;
+    br: Border | null;
+    bt: Border | null;
+    bb: Border | null;
+}
+
+/** The workbook's default (first) font. */
+export interface DefaultFont {
+    name: string;
+    size: number;
+}
+
+function defaultStyle(): CellStyle {
     return {
         fmt: 'General',
         b: false,
@@ -667,7 +771,7 @@ function defaultStyle() {
     };
 }
 
-function flag(inner, tag) {
+function flag(inner: string, tag: string) {
     const m = inner.indexOf('<' + tag);
     if (m < 0) return false;
     const c = inner.charCodeAt(m + tag.length + 1);
@@ -678,21 +782,41 @@ function flag(inner, tag) {
     if (!mm) return true;
     return !(mm[1] === '0' || mm[1] === 'false' || (tag === 'u' && mm[1] === 'none'));
 }
-function elemAttrs(inner, tag) {
+function elemAttrs(inner: string, tag: string) {
     const e = firstElem(inner, tag);
     return e ? e.a : null;
 }
 
-function parseStyles(x, resolve, indexedHolder) {
-    const result = { styles: [defaultStyle()], defaultFont: { name: 'Calibri', size: 11 } };
+interface FontInfo {
+    b: boolean;
+    i: boolean;
+    u: boolean;
+    strike: boolean;
+    color: string | null;
+    size: number;
+    name: string;
+}
+interface BorderInfo {
+    l: Border | null;
+    r: Border | null;
+    t: Border | null;
+    b: Border | null;
+}
+interface ParsedStyles {
+    styles: CellStyle[];
+    defaultFont: DefaultFont;
+}
+
+function parseStyles(x: string | null, resolve: ColorResolver): ParsedStyles {
+    const result: ParsedStyles = { styles: [defaultStyle()], defaultFont: { name: 'Calibri', size: 11 } };
     if (!x) return result;
     x = prep(x);
-    const custom = {};
+    const custom: Record<string, string> = {};
     eachElem(block(x, 'numFmts'), 'numFmt', a => {
         if (a.numFmtId !== undefined) custom[a.numFmtId] = a.formatCode || 'General';
     });
-    const fonts = [];
-    eachElem(block(x, 'fonts'), 'font', (a, inner) => {
+    const fonts: FontInfo[] = [];
+    eachElem(block(x, 'fonts'), 'font', (_a, inner) => {
         const sz = elemAttrs(inner, 'sz'),
             nm = elemAttrs(inner, 'name');
         fonts.push({
@@ -701,13 +825,13 @@ function parseStyles(x, resolve, indexedHolder) {
             u: flag(inner, 'u'),
             strike: flag(inner, 'strike'),
             color: resolve(elemAttrs(inner, 'color')),
-            size: sz && parseFloat(sz.val) > 0 ? parseFloat(sz.val) : 11,
+            size: sz && parseFloat(sz.val ?? '') > 0 ? parseFloat(sz.val ?? '') : 11,
             name: nm && nm.val ? nm.val : 'Calibri'
         });
     });
-    const fills = [];
-    eachElem(block(x, 'fills'), 'fill', (a, inner) => {
-        let bg = null;
+    const fills: (string | null)[] = [];
+    eachElem(block(x, 'fills'), 'fill', (_a, inner) => {
+        let bg: string | null = null;
         const pf = firstElem(inner, 'patternFill');
         if (pf) {
             if (pf.a.patternType === 'solid') bg = resolve(elemAttrs(pf.inner, 'fgColor'));
@@ -717,10 +841,10 @@ function parseStyles(x, resolve, indexedHolder) {
         }
         fills.push(bg);
     });
-    const borders = [];
-    eachElem(block(x, 'borders'), 'border', (a, inner) => {
-        const side = (n1, n2) => {
-            let e = firstElem(inner, n1) || (n2 && firstElem(inner, n2));
+    const borders: BorderInfo[] = [];
+    eachElem(block(x, 'borders'), 'border', (_a, inner) => {
+        const side = (n1: string, n2?: string): Border | null => {
+            const e = firstElem(inner, n1) || (n2 && firstElem(inner, n2));
             if (!e || !e.a.style) return null;
             const col = elemAttrs(e.inner, 'color');
             return { style: e.a.style, color: resolve(col) || '#000000' };
@@ -728,12 +852,12 @@ function parseStyles(x, resolve, indexedHolder) {
         borders.push({ l: side('left', 'start'), r: side('right', 'end'), t: side('top'), b: side('bottom') });
     });
     const xfs = block(x, 'cellXfs');
-    const styles = [];
+    const styles: CellStyle[] = [];
     eachElem(xfs, 'xf', (a, inner) => {
         const st = defaultStyle();
         const nf = a.numFmtId !== undefined ? parseInt(a.numFmtId, 10) : 0;
         st.fmt = custom[nf] !== undefined ? custom[nf] : builtinFmt(nf);
-        const f = fonts[parseInt(a.fontId, 10) || 0];
+        const f = fonts[parseInt(a.fontId ?? '', 10) || 0];
         if (f) {
             st.b = f.b;
             st.i = f.i;
@@ -743,9 +867,9 @@ function parseStyles(x, resolve, indexedHolder) {
             st.size = f.size;
             st.font = f.name;
         }
-        const fl = fills[parseInt(a.fillId, 10) || 0];
+        const fl = fills[parseInt(a.fillId ?? '', 10) || 0];
         st.bg = fl || null;
-        const bd = borders[parseInt(a.borderId, 10) || 0];
+        const bd = borders[parseInt(a.borderId ?? '', 10) || 0];
         if (bd) {
             st.bl = bd.l;
             st.br = bd.r;
@@ -757,7 +881,7 @@ function parseStyles(x, resolve, indexedHolder) {
             if (al.horizontal) st.h = al.horizontal;
             if (al.vertical) st.v = al.vertical === 'justify' || al.vertical === 'distributed' ? 'top' : al.vertical;
             st.wrap = isTrue(al.wrapText);
-            st.indent = parseInt(al.indent, 10) || 0;
+            st.indent = parseInt(al.indent ?? '', 10) || 0;
         }
         styles.push(st);
     });
@@ -767,7 +891,7 @@ function parseStyles(x, resolve, indexedHolder) {
 }
 
 // ---------- A1 ref parsing ----------
-function parseRange(ref) {
+function parseRange(ref: string | undefined): Range | null {
     if (!ref) return null;
     const k = ref.indexOf(':');
     const a = parseCellRef(k < 0 ? ref : ref.substring(0, k)),
@@ -775,7 +899,7 @@ function parseRange(ref) {
     if (!a || !b) return null;
     return { r1: Math.min(a.r, b.r), c1: Math.min(a.c, b.c), r2: Math.max(a.r, b.r), c2: Math.max(a.c, b.c) };
 }
-function parseCellRef(s) {
+function parseCellRef(s: string): { c: number; r: number } | null {
     const m = /^\$?([A-Za-z]{1,3})\$?(\d+)$/.exec(s.trim());
     if (!m) return null;
     const c = colIndex(m[1]),
@@ -789,10 +913,92 @@ const PG = 16,
     PM = PSZ - 1;
 // type codes: 0 n, 1 s (sst id), 2 s (pool), 3 b, 4 e (pool), 5 d (pool), 6 z
 const FCH = 1 << 20;
-const TCH = ['n', 's', 's', 'b', 'e', 'd', 'z'];
 
+/** Fields shared by every cell. */
+interface CellBase {
+    /** index into Workbook.styles */
+    s: number;
+    /** formula text (without '='); present only on formula cells */
+    f?: string;
+}
+/** number */
+export interface NumberCell extends CellBase {
+    t: 'n';
+    v: number;
+}
+/** string (shared, inline or formula string result) */
+export interface StringCell extends CellBase {
+    t: 's';
+    v: string;
+}
+/** boolean */
+export interface BooleanCell extends CellBase {
+    t: 'b';
+    v: boolean;
+}
+/** error literal such as '#DIV/0!' */
+export interface ErrorCell extends CellBase {
+    t: 'e';
+    v: string;
+}
+/** ISO-8601 date text (t="d" cells) */
+export interface DateCell extends CellBase {
+    t: 'd';
+    v: string;
+}
+/** blank cell that only carries a style and/or formula */
+export interface BlankCell extends CellBase {
+    t: 'z';
+    v: null;
+}
+/** A worksheet cell, discriminated by its type tag `t`. */
+export type Cell = NumberCell | StringCell | BooleanCell | ErrorCell | DateCell | BlankCell;
+/** Tag of a Cell. */
+export type CellType = Cell['t'];
+
+/** Legacy sheet.rows view: sparse rows of sparse cells. */
+export type CellRow = (Cell | undefined)[];
+export type SheetRows = (CellRow | undefined)[];
+
+/** Shared string table with lazily decoded strings. */
+export interface Sst {
+    /** number of strings (may force the lazy table to index everything) */
+    readonly length: number;
+    has(i: number): boolean;
+    get(i: number): string;
+}
+
+/** The master of a shared formula: its text and anchor cell. */
+interface SharedMaster {
+    f: string;
+    r: number;
+    c: number;
+}
+
+/** Compact columnar store of a sheet's cells, in row-major order. */
 class SheetStore {
-    constructor(sst) {
+    sst: Sst;
+    n: number;
+    cap: number;
+    pc: Uint16Array[];
+    pt: Uint8Array[];
+    ps: Int32Array[];
+    pv: Float64Array[];
+    pr: Int32Array[] | null;
+    rs: Int32Array;
+    lastRow: number;
+    lastCol: number;
+    pool: string[];
+    masters: (SharedMaster | null)[];
+    fn: number;
+    fIdx: Int32Array;
+    fOff: Int32Array;
+    fLen: Int32Array;
+    fch: string[];
+    fcur: string;
+    fparts: string[];
+    fplen: number;
+    constructor(sst: Sst) {
         this.sst = sst;
         this.n = 0;
         this.cap = 64;
@@ -816,7 +1022,11 @@ class SheetStore {
         this.fplen = 0;
     }
     _grow() {
-        const g = (A, a, len) => {
+        const g = <T extends Uint16Array | Uint8Array | Int32Array | Float64Array>(
+            A: new (len: number) => T,
+            a: T,
+            len: number
+        ): T => {
             const x = new A(len);
             x.set(a);
             return x;
@@ -839,14 +1049,14 @@ class SheetStore {
         }
     }
     _unorder() {
-        const pr = (this.pr = []);
+        const pr: Int32Array[] = (this.pr = []);
         for (let k = 0; k < this.pc.length; k++) pr.push(new Int32Array(this.pc[k].length));
         for (let r = 0; r <= this.lastRow; r++) {
             const b = r < this.lastRow ? this.rs[r + 1] : this.n;
             for (let i = this.rs[r]; i < b; i++) pr[i >>> PG][i & PM] = r;
         }
     }
-    add(r, c, tc, s, v) {
+    add(r: number, c: number, tc: number, s: number, v: number) {
         if (this.pr === null) {
             if (r === this.lastRow) {
                 if (c <= this.lastCol) this._unorder();
@@ -877,10 +1087,10 @@ class SheetStore {
         return i;
     }
     // formulas: ascending cell ids + offsets into shared text chunks (len -1: shared-formula master id in off, -2: pool string)
-    setF(i, f) {
-        let n = this.fn;
+    setF(i: number, f: string | number) {
+        const n = this.fn;
         if (n === this.fIdx.length) {
-            const g = a => {
+            const g = (a: Int32Array) => {
                 const x = new Int32Array(n * 2);
                 x.set(a);
                 return x;
@@ -889,7 +1099,7 @@ class SheetStore {
             this.fOff = g(this.fOff);
             this.fLen = g(this.fLen);
         }
-        let off, len;
+        let off: number, len: number;
         if (typeof f !== 'string') {
             off = f;
             len = -1;
@@ -921,7 +1131,7 @@ class SheetStore {
         }
     }
     // raw formula slot of cell i: string, shared master id (number) or undefined
-    fget(i) {
+    fget(i: number): string | number | undefined {
         let lo = 0,
             hi = this.fn - 1;
         const fi = this.fIdx;
@@ -946,7 +1156,7 @@ class SheetStore {
         return undefined;
     }
     // index of cell (r,c) or -1
-    index(r, c) {
+    index(r: number, c: number) {
         if (r > this.lastRow || r < 0 || this.pr !== null) return -1;
         const a = this.rs[r],
             b = r < this.lastRow ? this.rs[r + 1] : this.n;
@@ -971,47 +1181,51 @@ class SheetStore {
         }
         return -1;
     }
-    cellAt(i, r, c) {
+    cellAt(i: number, r: number, c: number): Cell {
         const pg = i >>> PG,
             o = i & PM;
         const tc = this.pt[pg][o],
             s = this.ps[pg][o],
             v = this.pv[pg][o];
-        let val;
+        let cell: Cell;
         switch (tc) {
             case 0:
-                val = v;
+                cell = { t: 'n', v, s };
                 break;
             case 1:
-                val = this.sst.get(v);
+                cell = { t: 's', v: this.sst.get(v), s };
                 break;
             case 2:
+                cell = { t: 's', v: this.pool[v], s };
+                break;
             case 4:
+                cell = { t: 'e', v: this.pool[v], s };
+                break;
             case 5:
-                val = this.pool[v];
+                cell = { t: 'd', v: this.pool[v], s };
                 break;
             case 3:
-                val = v === 1;
+                cell = { t: 'b', v: v === 1, s };
                 break;
             default:
-                val = null;
+                cell = { t: 'z', v: null, s };
         }
         if (this.fn !== 0) {
             const f = this.fget(i);
-            if (f !== undefined) return { t: TCH[tc], v: val, s, f: typeof f === 'string' ? f : this._shared(f, r, c) };
+            if (f !== undefined) cell.f = typeof f === 'string' ? f : this._shared(f, r, c);
         }
-        return { t: TCH[tc], v: val, s };
+        return cell;
     }
-    _shared(id, r, c) {
+    _shared(id: number, r: number, c: number) {
         const m = this.masters[id];
         return m ? shiftFormula(m.f, r - m.r, c - m.c) : '';
     }
-    get(r, c) {
+    get(r: number, c: number) {
         const i = this.index(r, c);
         return i < 0 ? undefined : this.cellAt(i, r, c);
     }
     // fn(cell, r, c) in row-major order for cells inside the rectangle
-    each(r1, c1, r2, c2, fn) {
+    each(r1: number, c1: number, r2: number, c2: number, fn: (cell: Cell, r: number, c: number) => void) {
         if (this.pr !== null) return;
         const last = Math.min(r2, this.lastRow),
             pc = this.pc;
@@ -1052,39 +1266,36 @@ class SheetStore {
                 if (f !== undefined) o.setF(j, f);
             }
         }
-        for (const k of [
-            'n',
-            'cap',
-            'pc',
-            'pt',
-            'ps',
-            'pv',
-            'pr',
-            'rs',
-            'lastRow',
-            'lastCol',
-            'fn',
-            'fIdx',
-            'fOff',
-            'fLen',
-            'fch',
-            'fcur',
-            'fparts',
-            'fplen'
-        ])
-            this[k] = o[k];
+        this.n = o.n;
+        this.cap = o.cap;
+        this.pc = o.pc;
+        this.pt = o.pt;
+        this.ps = o.ps;
+        this.pv = o.pv;
+        this.pr = o.pr;
+        this.rs = o.rs;
+        this.lastRow = o.lastRow;
+        this.lastCol = o.lastCol;
+        this.fn = o.fn;
+        this.fIdx = o.fIdx;
+        this.fOff = o.fOff;
+        this.fLen = o.fLen;
+        this.fch = o.fch;
+        this.fcur = o.fcur;
+        this.fparts = o.fparts;
+        this.fplen = o.fplen;
     }
 }
 
 // legacy sheet.rows[r][c] view, built on demand (tests and tools; the provider reads the store)
-function legacyRows(st) {
-    const rows = [];
+function legacyRows(st: SheetStore): SheetRows {
+    const rows: SheetRows = [];
     if (st.pr !== null) return rows;
     for (let r = 0; r <= st.lastRow; r++) {
         const a = st.rs[r],
             b = r < st.lastRow ? st.rs[r + 1] : st.n;
         if (a === b) continue;
-        const arr = [];
+        const arr: CellRow = [];
         for (let i = a; i < b; i++) {
             const c = st.pc[i >>> PG][i & PM];
             arr[c] = st.cellAt(i, r, c);
@@ -1095,11 +1306,11 @@ function legacyRows(st) {
 }
 
 // lazily decoded shared string table (offsets only; strings materialize on first use)
-function makeSst(x) {
+function makeSst(x: string): Sst {
     let st = new Int32Array(1024),
         en = new Int32Array(1024),
         n = 0;
-    const put = (a, b) => {
+    const put = (a: number, b: number) => {
         if (n === st.length) {
             const s2 = new Int32Array(n * 2),
                 e2 = new Int32Array(n * 2);
@@ -1133,11 +1344,11 @@ function makeSst(x) {
         put(te + 1, e);
         p = e + 5;
     }
-    const cache = new Array(n);
+    const cache: (string | undefined)[] = new Array<string | undefined>(n);
     return {
         length: n,
-        has: i => i >= 0 && i < n,
-        get(i) {
+        has: (i: number) => i >= 0 && i < n,
+        get(i: number) {
             let v = cache[i];
             if (v !== undefined) return v;
             if (!(i >= 0 && i < n)) return '';
@@ -1149,7 +1360,7 @@ function makeSst(x) {
     };
 }
 
-function sstValue(x, a, b) {
+function sstValue(x: string, a: number, b: number) {
     if (a === b) return '';
     if (
         x.charCodeAt(a) === 60 &&
@@ -1165,29 +1376,37 @@ function sstValue(x, a, b) {
 // Same contract as makeSst, but the raw-deflate payload is inflated and indexed on demand, only as far as the
 // highest string id asked for, so a huge sharedStrings part no longer delays the first paint.
 // Returns null when the part is not a plain unprefixed <sst> (the caller then takes the eager path).
-function makeLazySst(data, L, fl) {
+interface SstChunk {
+    text: string;
+    first: number;
+    st: Int32Array;
+    en: Int32Array;
+    cache: (string | undefined)[] | null;
+}
+
+function makeLazySst(data: Uint8Array, L: ZipLimits, fl: typeof fflate): Sst | null {
     const td = new TextDecoder('utf-8');
-    const chunks = [];
+    const chunks: SstChunk[] = [];
     let n = 0,
         carry = '',
         pos = 0,
         got = 0,
         done = false,
-        failed = null,
-        parts = [],
+        failed: Error | null = null,
+        parts: string[] = [],
         probed = false,
         prefixed = false;
-    const inf = new fl.Inflate(c => {
+    const inf = new fl.Inflate((c: Uint8Array) => {
         got += c.length;
         if (got > L.maxPart || (got > L.ratioMin && got > L.ratio * Math.max(1, pos))) throw bombErr();
         if (c.length) parts.push(td.decode(c, { stream: true }));
     });
-    function index(text, final) {
-        const st = [],
-            en = [];
+    function index(text: string, final: boolean) {
+        const st: number[] = [],
+            en: number[] = [];
         const len = text.length;
         let p = 0,
-            keep = len;
+            keep: number;
         for (;;) {
             const q = text.indexOf('<si', p);
             if (q < 0) {
@@ -1233,7 +1452,7 @@ function makeLazySst(data, L, fl) {
             n += st.length;
         }
     }
-    function probe(text, last) {
+    function probe(text: string, last: boolean) {
         // prep() strips a namespace prefix decided by the first element only
         let q = 0;
         for (;;) {
@@ -1276,7 +1495,7 @@ function makeLazySst(data, L, fl) {
             index(text, last);
             if (last) done = true;
         } catch (e) {
-            failed = e;
+            failed = e instanceof Error ? e : new Error(String(e));
             done = true;
             throw e;
         }
@@ -1288,12 +1507,12 @@ function makeLazySst(data, L, fl) {
             while (!done) step();
             return n;
         },
-        has(i) {
+        has(i: number) {
             if (!(i >= 0)) return false;
             while (i >= n && !done) step();
             return i < n;
         },
-        get(i) {
+        get(i: number) {
             if (!(i >= 0 && i < n)) return '';
             let lo = 0,
                 hi = chunks.length - 1;
@@ -1313,7 +1532,124 @@ function makeLazySst(data, L, fl) {
 }
 
 // ---------- sheet parsing ----------
-function emptySheet(info) {
+/** One worksheet entry of the workbook. */
+export interface SheetInfo {
+    /** position in the workbook's sheet list */
+    index: number;
+    name: string;
+    state: 'visible' | 'hidden' | 'veryHidden';
+    /** tab colour as '#rrggbb' */
+    tabColor: string | null;
+    /** zip path of the worksheet part ('' when it cannot be resolved) */
+    path: string;
+}
+
+/** Zero-based inclusive cell rectangle. */
+export interface Range {
+    r1: number;
+    c1: number;
+    r2: number;
+    c2: number;
+}
+/** A merged cell range (never a single cell). */
+export type Merge = Range;
+/** Array-formula range together with its anchor (top-left formula) cell. */
+export interface ArrayRange extends Range {
+    mr: number;
+    mc: number;
+}
+
+/** External url and/or in-workbook location of a hyperlink. */
+export interface Hyperlink {
+    url?: string;
+    location?: string;
+    tooltip?: string;
+}
+
+/** Style of a whole column range (<col style=...>). */
+export interface ColStyle {
+    c1: number;
+    c2: number;
+    /** index into Workbook.styles */
+    s: number;
+}
+
+/** An Excel table part: range, header flag and column names. */
+export interface Table extends Range {
+    /** the first row is a header row */
+    header: boolean;
+    cols: string[];
+}
+
+/** A floating raster picture anchored at a cell, sizes in CSS pixels. */
+export interface Picture {
+    /** anchor row / column (zero-based) */
+    r: number;
+    c: number;
+    /** offset from the anchor cell's top-left corner */
+    dx: number;
+    dy: number;
+    w: number;
+    h: number;
+    /** data: URL of the image */
+    url: string;
+}
+
+/** A parsed worksheet. `store` is null for sheets without cell data (chart/dialog sheets, missing parts). */
+export interface Sheet {
+    info: SheetInfo;
+    /** legacy sparse rows[r][c] view, built on demand from the store */
+    rows: SheetRows;
+    store: SheetStore | null;
+    /** true while the sheet is still being streamed in */
+    partial: boolean;
+    rowCount: number;
+    colCount: number;
+    /** default column width / row height in pixels */
+    defaultColWidth: number;
+    defaultRowHeight: number;
+    colWidths: Map<number, number>;
+    rowHeights: Map<number, number>;
+    hiddenCols: Set<number>;
+    hiddenRows: Set<number>;
+    merges: Merge[];
+    frozenRows: number;
+    frozenCols: number;
+    showGridLines: boolean;
+    zoomScale: number;
+    dimension: Range | null;
+    /** keyed by 'row,col' */
+    hyperlinks: Map<string, Hyperlink>;
+    autoFilter: Range | null;
+    /** conditional formats are not read yet; always empty */
+    condFormats: unknown[];
+    colStyles: ColStyle[];
+    rowStyles: Map<number, number>;
+    /** sheetFormatPr zeroHeight: rows are hidden unless listed in shownRows */
+    zeroHeightRows: boolean;
+    shownRows: Set<number> | null;
+    arrays: ArrayRange[];
+    tables: Table[];
+    pictures: Picture[];
+    warning: string | null;
+}
+/** A worksheet backed by the compact cell store (the result of streaming a worksheet part). */
+export interface StoreSheet extends Sheet {
+    store: SheetStore;
+}
+
+/** Shared inputs of the worksheet parser. */
+export interface ParserContext {
+    sst: Sst;
+    resolve: ColorResolver;
+}
+/** Incremental worksheet parser: feed text chunks, the sheet is complete after feed(_, true). */
+export interface SheetParser {
+    sheet: StoreSheet;
+    feed(text: string, final: boolean): void;
+}
+
+function emptySheet(info: SheetInfo): Sheet {
     return {
         info,
         rows: [],
@@ -1348,12 +1684,12 @@ function emptySheet(info) {
 }
 
 // copy so a short slice does not pin the decoded chunk it came from
-const flat = v => (v.length < 13 ? v : (' ' + v).slice(1));
-const NOATTR = Object.freeze({});
+const flat = (v: string) => (v.length < 13 ? v : (' ' + v).slice(1));
+const NOATTR: Attrs = Object.freeze({});
 const SHEET_KIND = /^\s*(<\?[^>]*\?>\s*)?<(\w+:)?(chartsheet|dialogsheet)[\s>]/;
 
 // namespace prefix of the root element ('x:' for <x:worksheet>), null if none, undefined if not decidable yet
-function detectPrefix(x) {
+function detectPrefix(x: string) {
     let p = 0;
     for (;;) {
         p = x.indexOf('<', p);
@@ -1377,12 +1713,11 @@ function detectPrefix(x) {
 }
 
 // Incremental sheet parser: feed(text, final) with arbitrary chunk boundaries; result in .sheet (partial until final).
-function createSheetParser(info, ctx, relsXml) {
-    const sh = emptySheet(info);
+function createSheetParser(info: SheetInfo, ctx: ParserContext, relsXml?: string | null): SheetParser {
     const store = new SheetStore(ctx.sst);
-    sh.store = store;
+    const sh: StoreSheet = Object.assign(emptySheet(info), { store });
     sh.partial = true;
-    let legacy = null;
+    let legacy: SheetRows | null = null;
     Object.defineProperty(sh, 'rows', {
         configurable: true,
         enumerable: true,
@@ -1400,8 +1735,8 @@ function createSheetParser(info, ctx, relsXml) {
         postBuf = '',
         searchFrom = 0;
     let detected = false,
-        pre = null;
-    const sharedIds = new Map();
+        pre: string | null = null;
+    const sharedIds = new Map<string, number>();
     let curRowCtx = 0,
         nextCol = 0,
         lastRowIdx = -1,
@@ -1410,7 +1745,7 @@ function createSheetParser(info, ctx, relsXml) {
         emptyStr = -1;
     const defRowPx = () => sh.defaultRowHeight;
 
-    function parseHead(head) {
+    function parseHead(head: string) {
         const tc = firstElem(head, 'tabColor');
         if (tc) info.tabColor = ctx.resolve(tc.a) || info.tabColor;
         const dim = firstElem(head, 'dimension');
@@ -1421,15 +1756,15 @@ function createSheetParser(info, ctx, relsXml) {
             if (sv.a.zoomScale) sh.zoomScale = parseFloat(sv.a.zoomScale) || 100;
             const pn = firstElem(sv.inner, 'pane');
             if (pn && (pn.a.state === 'frozen' || pn.a.state === 'frozenSplit')) {
-                sh.frozenCols = Math.max(0, Math.floor(parseFloat(pn.a.xSplit) || 0));
-                sh.frozenRows = Math.max(0, Math.floor(parseFloat(pn.a.ySplit) || 0));
+                sh.frozenCols = Math.max(0, Math.floor(parseFloat(pn.a.xSplit ?? '') || 0));
+                sh.frozenRows = Math.max(0, Math.floor(parseFloat(pn.a.ySplit ?? '') || 0));
             }
         }
         const fp = firstElem(head, 'sheetFormatPr');
         if (fp) {
-            const d = parseFloat(fp.a.defaultColWidth),
-                bw = parseFloat(fp.a.baseColWidth),
-                rh = parseFloat(fp.a.defaultRowHeight);
+            const d = parseFloat(fp.a.defaultColWidth ?? ''),
+                bw = parseFloat(fp.a.baseColWidth ?? ''),
+                rh = parseFloat(fp.a.defaultRowHeight ?? '');
             if (d > 0) sh.defaultColWidth = Math.round(d * 7);
             else if (bw > 0 && bw !== 8) sh.defaultColWidth = Math.ceil((bw * 7 + 5) / 8) * 8;
             if (rh > 0) sh.defaultRowHeight = Math.round(((rh * 4) / 3) * 100) / 100;
@@ -1439,14 +1774,14 @@ function createSheetParser(info, ctx, relsXml) {
             }
         }
         eachElem(block(head, 'cols'), 'col', a => {
-            let min = parseInt(a.min, 10),
-                max = parseInt(a.max, 10);
+            const min = parseInt(a.min ?? '', 10);
+            let max = parseInt(a.max ?? '', 10);
             if (!(min >= 1)) return;
             if (!(max >= min)) max = min;
             if (max > MAXC) max = MAXC;
-            const w = parseFloat(a.width),
+            const w = parseFloat(a.width ?? ''),
                 hid = isTrue(a.hidden),
-                cst = parseInt(a.style, 10);
+                cst = parseInt(a.style ?? '', 10);
             if (cst > 0) sh.colStyles.push({ c1: min - 1, c2: max - 1, s: cst });
             const px = w >= 0 ? Math.round(w * 7) : -1;
             for (let c = min - 1; c < max; c++) {
@@ -1456,7 +1791,7 @@ function createSheetParser(info, ctx, relsXml) {
         });
     }
 
-    function parsePost(post) {
+    function parsePost(post: string) {
         eachElem(post, 'mergeCell', a => {
             const r = parseRange(a.ref);
             if (r && (r.r1 !== r.r2 || r.c1 !== r.c2)) sh.merges.push(r);
@@ -1465,18 +1800,19 @@ function createSheetParser(info, ctx, relsXml) {
         if (af) sh.autoFilter = parseRange(af.a.ref);
         const hls = block(post, 'hyperlinks');
         if (hls) {
-            let rels = null;
+            let rels: Record<string, Attrs> | null = null;
             eachElem(hls, 'hyperlink', a => {
                 const rg = parseRange(a.ref);
                 if (!rg) return;
-                const link = {};
+                const link: Hyperlink = {};
                 const id = relId(a);
                 if (id !== undefined) {
                     if (!rels) {
-                        rels = {};
+                        const byId: Record<string, Attrs> = {};
+                        rels = byId;
                         if (relsXml)
                             eachElem(prep(relsXml), 'Relationship', ra => {
-                                rels[ra.Id] = ra;
+                                if (ra.Id !== undefined) byId[ra.Id] = ra;
                             });
                     }
                     if (rels[id] && rels[id].Target && !/^\s*(?:javascript|data|vbscript):/i.test(rels[id].Target))
@@ -1495,7 +1831,7 @@ function createSheetParser(info, ctx, relsXml) {
     }
 
     // scans complete elements of `s` starting at 0; returns the offset to resume from (rest is carried)
-    function scan(s, final) {
+    function scan(s: string, final: boolean) {
         const n = s.length,
             pool = store.pool,
             sst = ctx.sst;
@@ -1505,7 +1841,7 @@ function createSheetParser(info, ctx, relsXml) {
             aS = 0,
             aT = 0,
             aTl = 0;
-        function cellAttrs(i, end) {
+        function cellAttrs(i: number, end: number) {
             aR = -1;
             aC = -1;
             aS = 0;
@@ -1621,7 +1957,7 @@ function createSheetParser(info, ctx, relsXml) {
                     vE = -1,
                     fS = -1,
                     fE = -1,
-                    fAttr = null,
+                    fAttr: Attrs = NOATTR,
                     isS = -1,
                     isE = -1;
                 if (!selfClose) {
@@ -1698,9 +2034,8 @@ function createSheetParser(info, ctx, relsXml) {
                     if (ft === 'array' && fAttr.ref) {
                         const ar = parseRange(fAttr.ref);
                         if (ar) {
-                            ar.mr = r;
-                            ar.mc = c;
-                            sh.arrays.push(ar);
+                            const arr: ArrayRange = Object.assign(ar, { mr: r, mc: c });
+                            sh.arrays.push(arr);
                         }
                     }
                     if (ft === 'shared' && fAttr.si !== undefined) {
@@ -1833,7 +2168,7 @@ function createSheetParser(info, ctx, relsXml) {
                     break;
                 }
                 const a = attrMap(s.substring(lt, te));
-                const rn = parseInt(a.r, 10);
+                const rn = parseInt(a.r ?? '', 10);
                 const ri = rn >= 1 ? rn - 1 : lastRowIdx + 1;
                 lastRowIdx = ri;
                 curRowCtx = ri;
@@ -1862,7 +2197,7 @@ function createSheetParser(info, ctx, relsXml) {
         return pos;
     }
 
-    function feed(text, final) {
+    function feed(text: string, final: boolean) {
         if (phase === 3) return;
         if (hold) {
             text = hold + text;
@@ -1950,7 +2285,7 @@ function createSheetParser(info, ctx, relsXml) {
 }
 
 // ---------- workbook ----------
-function resolveTarget(base, target) {
+function resolveTarget(base: string, target: string) {
     if (target.indexOf('\\') >= 0) target = target.replace(/\\/g, '/');
     if (target.indexOf('%') >= 0) {
         try {
@@ -1968,12 +2303,24 @@ function resolveTarget(base, target) {
     }
     return parts.join('/');
 }
-function relsPathOf(part) {
+function relsPathOf(part: string) {
     const k = part.lastIndexOf('/');
     return part.substring(0, k + 1) + '_rels/' + part.substring(k + 1) + '.rels';
 }
-function parseRels(xml, basePart) {
-    const map = {};
+/** One package relationship; `target` is a zip path unless `external`. */
+interface Rel {
+    type: string;
+    target: string;
+    external: boolean;
+}
+type Rels = Record<string, Rel>;
+/** Inflated zip entries by lower-cased name. */
+type FileMap = Record<string, Uint8Array>;
+type Unzip = (names: string[], limit?: number) => FileMap;
+type GetText = (files: FileMap, name: string) => string | null;
+
+function parseRels(xml: string | null, basePart: string): Rels {
+    const map: Rels = {};
     if (!xml) return map;
     eachElem(prep(xml), 'Relationship', a => {
         if (!a.Id || !a.Target) return;
@@ -1985,40 +2332,65 @@ function parseRels(xml, basePart) {
     });
     return map;
 }
-function relOfType(rels, suffix) {
+function relOfType(rels: Rels, suffix: string) {
     for (const k in rels) if (rels[k].type.endsWith(suffix)) return rels[k].target;
     return null;
 }
 
-function toU8(b) {
+/** Anything toU8 can turn into bytes: a typed array / view, an ArrayBuffer or a plain byte array. */
+export type XlsxInput = Uint8Array | ArrayBuffer | ArrayBufferView | readonly number[];
+
+interface BufferViewLike {
+    buffer: ArrayBuffer;
+    byteOffset?: unknown;
+    byteLength: number;
+}
+function isBufferViewLike(b: unknown): b is BufferViewLike {
+    return (
+        typeof b === 'object' &&
+        b !== null &&
+        'buffer' in b &&
+        b.buffer instanceof ArrayBuffer &&
+        'byteLength' in b &&
+        typeof b.byteLength === 'number'
+    );
+}
+
+// Blob parts must not be backed by a SharedArrayBuffer; copy in that (practically unused) case
+function blobPart(u: Uint8Array): Uint8Array<ArrayBuffer> {
+    return u.buffer instanceof ArrayBuffer ? new Uint8Array(u.buffer, u.byteOffset, u.byteLength) : u.slice();
+}
+
+function toU8(b: unknown): Uint8Array | null {
     if (b instanceof Uint8Array) return b;
-    if (b && b.buffer instanceof ArrayBuffer && typeof b.byteLength === 'number')
-        return new Uint8Array(b.buffer, b.byteOffset || 0, b.byteLength);
+    if (isBufferViewLike(b))
+        return new Uint8Array(b.buffer, typeof b.byteOffset === 'number' ? b.byteOffset : 0, b.byteLength);
     if (b instanceof ArrayBuffer) return new Uint8Array(b);
     if (Array.isArray(b)) return Uint8Array.from(b);
     return null;
 }
 
 // table parts: header row range + column names, so edits can be validated
-function loadTables(sh, relsXml, sheetPath, unzip, get) {
+function loadTables(sh: Sheet, relsXml: string, sheetPath: string, unzip: Unzip, get: GetText) {
     const rels = parseRels(relsXml, sheetPath),
-        paths = [];
+        paths: string[] = [];
     for (const k in rels) if (/\/table$/.test(rels[k].type) && !rels[k].external) paths.push(rels[k].target);
     if (!paths.length) return;
-    let files;
+    let files: FileMap;
     try {
         files = unzip(paths);
     } catch (e) {
-        if (e && e.code === 'ZIPBOMB') throw e;
+        if (isZipBomb(e)) throw e;
         return;
     }
     for (const pth of paths) {
         const x = get(files, pth);
         if (x === null) continue;
         const t = firstElem(prep(x), 'table');
-        const rg = t && parseRange(t.a.ref);
+        if (!t) continue;
+        const rg = parseRange(t.a.ref);
         if (!rg) continue;
-        const cols = [];
+        const cols: string[] = [];
         eachElem(block(t.inner, 'tableColumns'), 'tableColumn', a => {
             cols.push(a.name !== undefined ? decodeStr(a.name) : '');
         });
@@ -2029,7 +2401,7 @@ function loadTables(sh, relsXml, sheetPath, unzip, get) {
 
 // floating pictures (oneCell/twoCell anchors with raster blips) for read-only display; vector charts are skipped
 const B64C = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-function b64(u8) {
+function b64(u8: Uint8Array) {
     let s = '';
     for (let i = 0; i < u8.length; i += 3) {
         const a = u8[i],
@@ -2043,32 +2415,42 @@ function b64(u8) {
     }
     return s;
 }
-function loadDrawings(sh, relsXml, sheetPath, unzip, get) {
-    const pics = [];
+interface PicMeta {
+    r: number;
+    c: number;
+    dx: number;
+    dy: number;
+    w: number;
+    h: number;
+    ipath: string;
+    mt: string;
+}
+function loadDrawings(sh: Sheet, relsXml: string, sheetPath: string, unzip: Unzip, get: GetText) {
+    const pics: Picture[] = [];
     try {
         const rels = parseRels(relsXml, sheetPath);
-        let dpath = null;
+        let dpath: string | null = null;
         for (const k in rels)
             if (!rels[k].external && /\/drawing$/.test(rels[k].type)) {
                 dpath = rels[k].target;
                 break;
             }
         if (!dpath) return;
-        let files;
+        let files: FileMap;
         try {
             files = unzip([dpath, relsPathOf(dpath)], 32 * 1024 * 1024);
         } catch (e) {
-            if (e && e.code === 'ZIPBOMB') throw e;
+            if (isZipBomb(e)) throw e;
             return;
         }
         const dx = get(files, dpath);
         if (dx === null) return;
         const drels = parseRels(get(files, relsPathOf(dpath)), dpath);
-        const anchors = [];
+        const anchors: string[] = [];
         const clean = prep(dx);
-        eachElem(clean, 'oneCellAnchor', (a, inner) => anchors.push(inner));
-        eachElem(clean, 'twoCellAnchor', (a, inner) => anchors.push(inner));
-        const MIME = {
+        eachElem(clean, 'oneCellAnchor', (_a, inner) => anchors.push(inner));
+        eachElem(clean, 'twoCellAnchor', (_a, inner) => anchors.push(inner));
+        const MIME: Record<string, string | undefined> = {
             jpg: 'image/jpeg',
             jpeg: 'image/jpeg',
             png: 'image/png',
@@ -2077,12 +2459,13 @@ function loadDrawings(sh, relsXml, sheetPath, unzip, get) {
             tif: 'image/tiff',
             tiff: 'image/tiff'
         };
-        const num = (src, tag, dflt) => {
+        const num = (src: string, tag: string, dflt: number) => {
             const m = new RegExp('<' + tag + '>([^<]*)</' + tag + '>').exec(src);
-            const v = m && parseInt(m[1], 10);
+            // a missing tag counted as position 0 in the JS original (null >= 0 is true there)
+            const v = m ? parseInt(m[1], 10) : 0;
             return v >= 0 ? v : dflt;
         };
-        const metas = [];
+        const metas: PicMeta[] = [];
         for (const an of anchors) {
             if (metas.length >= 30) break;
             const inner = an.split('<a:').join('<').split('</a:').join('</'); // prep() only strips the root prefix; anchors start with <from>
@@ -2094,18 +2477,19 @@ function loadDrawings(sh, relsXml, sheetPath, unzip, get) {
             let cx = 0,
                 cy = 0;
             eachElem(inner, 'ext', ea => {
-                const x = parseInt(ea.cx, 10) || 0,
-                    y = parseInt(ea.cy, 10) || 0;
+                const x = parseInt(ea.cx ?? '', 10) || 0,
+                    y = parseInt(ea.cy ?? '', 10) || 0;
                 if (!cx && !cy && x > 0 && y > 0 && x <= 95250000 && y <= 95250000) {
                     cx = x;
                     cy = y;
                 }
             });
             if (!cx || !cy) continue;
-            let embed = null;
+            const blip: { embed: string | null } = { embed: null };
             eachElem(inner, 'blip', ba => {
-                if (!embed) embed = ba['r:embed'] || ba.embed || null;
+                if (!blip.embed) blip.embed = ba['r:embed'] || ba.embed || null;
             });
+            const embed = blip.embed;
             if (!embed || !drels[embed] || drels[embed].external) continue;
             const ipath = drels[embed].target;
             const mt = MIME[(ipath.split('.').pop() || '').toLowerCase()];
@@ -2122,17 +2506,17 @@ function loadDrawings(sh, relsXml, sheetPath, unzip, get) {
             });
         }
         if (!metas.length) return;
-        let imgFiles;
+        let imgFiles: FileMap;
         try {
             imgFiles = unzip(
                 metas.map(m => m.ipath),
                 32 * 1024 * 1024
             );
         } catch (e) {
-            if (e && e.code === 'ZIPBOMB') throw e;
+            if (isZipBomb(e)) throw e;
             return;
         }
-        const rawOf = name => {
+        const rawOf = (name: string): Uint8Array | null => {
             if (Object.prototype.hasOwnProperty.call(imgFiles, name)) return imgFiles[name];
             const lc = name.toLowerCase();
             for (const k in imgFiles) if (k.toLowerCase() === lc) return imgFiles[k];
@@ -2151,14 +2535,20 @@ function loadDrawings(sh, relsXml, sheetPath, unzip, get) {
                 url: 'data:' + m.mt + ';base64,' + b64(raw)
             });
         }
-    } catch (e) {
+    } catch {
         /* pictures are best-effort display only */
     }
     if (pics.length) sh.pictures = pics;
 }
 
 // first bytes of selected zip entries via the central directory (partial inflate); stops after maxOut bytes
-function zipHeads(bytes, wanted, fl, maxOut, cb) {
+function zipHeads(
+    bytes: Uint8Array,
+    wanted: Map<string, SheetInfo>,
+    fl: typeof fflate,
+    maxOut: number,
+    cb: (target: SheetInfo, head: string) => void
+) {
     const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     let e = bytes.length - 22;
     const lim = Math.max(0, e - 65535);
@@ -2184,12 +2574,12 @@ function zipHeads(bytes, wanted, fl, maxOut, cb) {
         if (!target || csize === 0xffffffff || lho === 0xffffffff || lho + 30 > bytes.length) continue;
         const ds = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true),
             de = Math.min(bytes.length, ds + csize);
-        let head = '';
+        let head: string;
         if (method === 0) head = td.decode(bytes.subarray(ds, Math.min(de, ds + maxOut)));
         else if (method === 8) {
-            const parts = [];
+            const parts: Uint8Array[] = [];
             let got = 0;
-            const inf = new fl.Inflate(c => {
+            const inf = new fl.Inflate((c: Uint8Array) => {
                 if (got < maxOut) {
                     parts.push(c);
                     got += c.length;
@@ -2213,19 +2603,109 @@ function zipHeads(bytes, wanted, fl, maxOut, cb) {
     }
 }
 
-function readXlsx(input, opts) {
-    const bytes = toU8(input);
+/** Options of readXlsx. */
+export interface ReadXlsxOptions {
+    /** overrides for the zip-bomb limits (merged over zipLimits) */
+    limits?: Partial<ZipLimits> | undefined;
+}
+
+/** Progress report of an asynchronous sheet load. */
+export interface SheetProgress {
+    /** the live (still partial) sheet */
+    sheet: Sheet;
+    partial: boolean;
+    /** rows parsed so far */
+    rows: number;
+    /** compressed bytes consumed (estimated for native streams) / total compressed bytes */
+    loaded: number;
+    total: number;
+    /** loaded / total, 0 when unknown */
+    fraction: number;
+}
+
+/** Options of Workbook.loadSheetAsync. */
+export interface LoadSheetOptions {
+    /** called between time slices while sheet.partial is true; errors are swallowed */
+    onProgress?: ((info: SheetProgress) => void) | null | undefined;
+    signal?: AbortSignal | null | undefined;
+}
+
+/** A loaded workbook: sheet list, shared styles, and on-demand sheet loading. */
+export interface Workbook {
+    sheets: SheetInfo[];
+    /** cellXfs, indexed by Cell.s */
+    styles: CellStyle[];
+    date1904: boolean;
+    defaultFont: DefaultFont;
+    /** parses a sheet synchronously (cached) */
+    loadSheet(i: number): Sheet;
+    /** streams a sheet in time slices (cached; concurrent calls share one job) */
+    loadSheetAsync(i: number, opts?: LoadSheetOptions): Promise<Sheet>;
+}
+
+/** Central-directory entry of a stored/deflated part. */
+interface ZipEntry {
+    method: number;
+    /** data start / end offsets in the file */
+    ds: number;
+    de: number;
+    /** declared uncompressed size */
+    us: number;
+}
+
+/** A sheet load that has nothing to stream. */
+interface LoadReady {
+    sheet: Sheet;
+    step?: undefined;
+    stepAsync?: undefined;
+    cancel?: undefined;
+}
+interface LoadStreamBase {
+    sheet: StoreSheet;
+    /** bytes of compressed input consumed so far */
+    pos(): number;
+    total: number;
+    finish(): Sheet;
+    cancel?: (() => void) | undefined;
+}
+/** A load driven by synchronous step(maxBytes) calls; step returns true when done. */
+interface LoadSync extends LoadStreamBase {
+    step(max: number): boolean;
+    stepAsync?: undefined;
+}
+/** A load whose inflate runs off the main thread; stepAsync returns true when done. */
+interface LoadAsync extends LoadStreamBase {
+    stepAsync(): Promise<boolean>;
+    step?: undefined;
+}
+type SheetLoad = LoadReady | LoadSync | LoadAsync;
+
+interface JobSub {
+    onProgress: ((info: SheetProgress) => void) | null;
+    resolve: (sheet: Sheet) => void;
+    reject: (err: Error) => void;
+}
+interface Job {
+    subs: JobSub[];
+    last: SheetProgress | null;
+    result: { sheet: Sheet } | { err: Error } | null;
+}
+
+/** Opens an XLSX package (bytes) and returns the workbook model; sheets are parsed lazily. Throws on invalid or bomb-like input. */
+function readXlsx(input: XlsxInput, opts?: ReadXlsxOptions): Workbook {
+    const input8 = toU8(input);
     const bad = () => new Error('Not a valid XLSX file');
-    if (!bytes || bytes.length < 22 || bytes[0] !== 0x50 || bytes[1] !== 0x4b) throw bad();
+    if (!input8 || input8.length < 22 || input8[0] !== 0x50 || input8[1] !== 0x4b) throw bad();
+    const bytes: Uint8Array = input8;
     const fl = fflate;
-    const L = Object.assign({}, zipLimits, opts && opts.limits);
+    const L: ZipLimits = Object.assign({}, zipLimits, opts && opts.limits);
     checkZipDir(bytes, L);
     // bounded inflate of one raw-deflate payload; the ratio rule only applies once the output is large
-    const capInflate = (data, limit) => {
-        const parts = [];
+    const capInflate = (data: Uint8Array, limit: number) => {
+        const parts: Uint8Array[] = [];
         let got = 0,
             fed = 0;
-        const inf = new fl.Inflate(c => {
+        const inf = new fl.Inflate((c: Uint8Array) => {
             got += c.length;
             if (got > limit || (got > L.ratioMin && got > L.ratio * Math.max(1, fed))) throw bombErr();
             parts.push(c);
@@ -2245,10 +2725,10 @@ function readXlsx(input, opts) {
         }
         return out;
     };
-    let dirMap = null,
+    let dirMap: Map<string, ZipEntry> | null = null,
         dirSkipped = false;
     // central directory: lower-cased entry name -> data range (entries needing the generic unzip are skipped)
-    function zipDir() {
+    function zipDir(): Map<string, ZipEntry> {
         if (dirMap) return dirMap;
         dirMap = new Map();
         try {
@@ -2307,8 +2787,9 @@ function readXlsx(input, opts) {
         return dirMap;
     }
     // inflate entries accepted by pred(lowerName); sizes are enforced while inflating, never trusted from headers
-    const unzipWhere = (pred, limit) => {
-        const out = Object.create(null);
+    const unzipWhere = (pred: (lowerName: string) => boolean, limit: number): FileMap => {
+        // null-prototype map so entry names like '__proto__' stay plain keys (Object.create is untyped)
+        const out = Object.create(null) as FileMap;
         for (const [name, ent] of zipDir()) {
             if (!pred(name)) continue;
             if (ent.us > limit) throw bombErr();
@@ -2328,17 +2809,17 @@ function readXlsx(input, opts) {
         }
         return out;
     };
-    const unzip = (names, limit) => {
+    const unzip: Unzip = (names, limit) => {
         const set = new Set(names.map(n => n.toLowerCase().replace(/\\/g, '/')));
         return unzipWhere(n => set.has(n), limit || L.maxPart);
     };
-    let first;
+    let first: FileMap;
     try {
         first = unzipWhere(n => /(^|\/)(_rels\/\.rels|workbook\.xml|workbook\.xml\.rels)$/.test(n), L.maxPart);
     } catch (e) {
-        throw e && e.code === 'ZIPBOMB' ? e : bad();
+        throw isZipBomb(e) ? e : bad();
     }
-    const get = (files, name) => {
+    const get: GetText = (files, name) => {
         if (files[name]) return toText(files[name]);
         const lc = name.toLowerCase();
         for (const k in files) if (k.toLowerCase() === lc) return toText(files[k]);
@@ -2368,11 +2849,11 @@ function readXlsx(input, opts) {
     const sstPath = relOfType(wbRels, '/sharedStrings') || 'xl/sharedStrings.xml';
     const stylesPath = relOfType(wbRels, '/styles') || 'xl/styles.xml';
     const themePath = relOfType(wbRels, '/theme') || 'xl/theme/theme1.xml';
-    let meta;
+    let meta: FileMap;
     try {
         meta = unzip([stylesPath, themePath]);
     } catch (e) {
-        throw e && e.code === 'ZIPBOMB' ? e : bad();
+        throw isZipBomb(e) ? e : bad();
     }
 
     const date1904 = (() => {
@@ -2381,7 +2862,7 @@ function readXlsx(input, opts) {
     })();
 
     const theme = parseTheme(get(meta, themePath));
-    const indexedCustom = [];
+    const indexedCustom: (string | null)[] = [];
     const stylesXml = get(meta, stylesPath);
     if (stylesXml) {
         const ic = block(prep(stylesXml), 'indexedColors');
@@ -2395,7 +2876,7 @@ function readXlsx(input, opts) {
     const resolve = makeColorResolver(theme, indexedCustom);
     const ps = parseStyles(stylesXml, resolve);
 
-    let sst = null;
+    let sst: Sst | null = null;
     const sstEnt = zipDir().get(sstPath.toLowerCase().replace(/\\/g, '/'));
     if (
         sstEnt &&
@@ -2407,20 +2888,20 @@ function readXlsx(input, opts) {
     )
         sst = makeLazySst(bytes.subarray(sstEnt.ds, sstEnt.de), L, fl);
     if (!sst) {
-        let sstXml;
+        let sstXml: string | null;
         try {
             sstXml = get(unzip([sstPath]), sstPath);
         } catch (e) {
-            throw e && e.code === 'ZIPBOMB' ? e : bad();
+            throw isZipBomb(e) ? e : bad();
         }
         sst = makeSst(sstXml ? prep(sstXml) : '');
     }
 
-    const sheets = [];
-    const sheetRels = [];
+    const sheets: SheetInfo[] = [];
+    const sheetRels: (Rel | undefined)[] = [];
     eachElem(block(wbXml, 'sheets'), 'sheet', a => {
         const rid = relId(a);
-        const rel = rid !== undefined ? wbRels[rid] : null;
+        const rel: Rel | undefined = rid !== undefined ? wbRels[rid] : undefined;
         const i = sheets.length;
         sheets.push({
             index: i,
@@ -2439,7 +2920,7 @@ function readXlsx(input, opts) {
     });
 
     try {
-        const wanted = new Map();
+        const wanted = new Map<string, SheetInfo>();
         sheets.forEach(si => {
             if (si.path) wanted.set(si.path.toLowerCase(), si);
         });
@@ -2451,9 +2932,9 @@ function readXlsx(input, opts) {
         /* tab colors fall back to sheet load */
     }
 
-    const ctx = { sst, resolve };
-    const cache = new Map();
-    const jobs = new Map();
+    const ctx: ParserContext = { sst, resolve };
+    const cache = new Map<number, Sheet>();
+    const jobs = new Map<number, Job>();
 
     const abortErr = () => {
         const e = new Error('Loading cancelled');
@@ -2463,7 +2944,7 @@ function readXlsx(input, opts) {
     const now = () => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now());
     let yields = 0;
     function yieldNow() {
-        return new Promise(res => {
+        return new Promise<void>(res => {
             if (++yields % 2 !== 0 && typeof MessageChannel !== 'undefined') {
                 const ch = new MessageChannel();
                 ch.port1.onmessage = () => {
@@ -2477,17 +2958,17 @@ function readXlsx(input, opts) {
 
     // prepare a sheet load: { sheet } when nothing to stream, else { sheet (live), step(maxBytes)->done, pos, total, finish() }
     // native: the async job loop may take a stepAsync() source (inflate runs off the main thread)
-    function begin(i, native) {
+    function begin(i: number, native?: boolean): SheetLoad {
         const info = sheets[i];
         if (!info) throw new Error('No such sheet: ' + i);
         const rel = sheetRels[i];
         if (!info.path || (rel && /\/(chartsheet|dialogsheet)$/.test(rel.type))) return { sheet: emptySheet(info) };
         const rp = relsPathOf(info.path);
-        let files;
+        let files: FileMap;
         try {
             files = unzip([rp]);
         } catch (e) {
-            if (e && e.code === 'ZIPBOMB') throw e;
+            if (isZipBomb(e)) throw e;
             files = {};
         }
         const relsXml = get(files, rp);
@@ -2501,11 +2982,11 @@ function readXlsx(input, opts) {
         };
         if (!ent) {
             // not addressable through the central directory: generic unzip, one chunk
-            let x = null;
+            let x: string | null = null;
             try {
                 x = get(unzip([info.path], L.maxSheet), info.path);
             } catch (e) {
-                if (e && e.code === 'ZIPBOMB') throw e;
+                if (isZipBomb(e)) throw e;
                 x = null;
             }
             if (x === null) {
@@ -2537,7 +3018,7 @@ function readXlsx(input, opts) {
             typeof Blob === 'function'
         ) {
             const csize = ent.de - ent.ds;
-            let reader = null,
+            let reader: ReadableStreamDefaultReader<Uint8Array> | null = null,
                 nGot = 0,
                 fin = false;
             return {
@@ -2547,7 +3028,7 @@ function readXlsx(input, opts) {
                 pos: () => (fin ? csize : ent.us > 0 ? Math.min(csize - 1, Math.floor((csize * nGot) / ent.us)) : 0),
                 async stepAsync() {
                     if (reader === null)
-                        reader = new Blob([bytes.subarray(ent.ds, ent.de)])
+                        reader = new Blob([blobPart(bytes.subarray(ent.ds, ent.de))])
                             .stream()
                             .pipeThrough(new DecompressionStream('deflate-raw'))
                             .getReader();
@@ -2572,7 +3053,7 @@ function readXlsx(input, opts) {
         let got = 0;
         const inf =
             ent.method === 8 && ent.de > ent.ds
-                ? new fl.Inflate(d => {
+                ? new fl.Inflate((d: Uint8Array) => {
                       got += d.length;
                       if (got > L.maxSheet || (got > L.ratioMin && got > L.ratio * Math.max(1, off - ent.ds)))
                           throw bombErr();
@@ -2583,7 +3064,7 @@ function readXlsx(input, opts) {
             sheet: sh,
             total: ent.de - ent.ds,
             pos: () => off - ent.ds,
-            step(max) {
+            step(max: number) {
                 const end = Math.min(ent.de, off + max),
                     last = end >= ent.de;
                 const part = bytes.subarray(off, end);
@@ -2597,10 +3078,10 @@ function readXlsx(input, opts) {
         };
     }
 
-    function startJob(i) {
-        const job = { subs: [], last: null, result: null };
+    function startJob(i: number) {
+        const job: Job = { subs: [], last: null, result: null };
         jobs.set(i, job);
-        const emit = info => {
+        const emit = (info: SheetProgress) => {
             job.last = info;
             for (const s of job.subs.slice())
                 if (s.onProgress) {
@@ -2611,8 +3092,8 @@ function readXlsx(input, opts) {
                     }
                 }
         };
-        (async () => {
-            let b = null;
+        void (async () => {
+            let b: SheetLoad | null = null;
             try {
                 b = begin(i, true);
                 if (!b.step && !b.stepAsync) {
@@ -2671,21 +3152,22 @@ function readXlsx(input, opts) {
             } catch (err) {
                 if (b && b.cancel) b.cancel();
                 jobs.delete(i);
-                job.result = { err };
+                const failure = err instanceof Error ? err : new Error(String(err));
+                job.result = { err: failure };
                 const subs = job.subs.slice();
                 job.subs.length = 0;
-                for (const s of subs) s.reject(err);
+                for (const s of subs) s.reject(failure);
             }
         })();
         return job;
     }
 
-    const wb = {
+    const wb: Workbook = {
         sheets,
         styles: ps.styles,
         date1904,
         defaultFont: ps.defaultFont,
-        loadSheet(i) {
+        loadSheet(i: number) {
             let sh = cache.get(i);
             if (sh) return sh;
             const b = begin(i);
@@ -2699,16 +3181,17 @@ function readXlsx(input, opts) {
             return sh;
         },
         // Promise<Sheet>; onProgress({sheet, partial, rows, loaded, total, fraction}) runs between time slices while sheet.partial is true
-        loadSheetAsync(i, opts) {
-            opts = opts || {};
+        loadSheetAsync(i: number, optsIn?: LoadSheetOptions) {
+            const opts = optsIn || {};
             const hit = cache.get(i);
             if (hit) return Promise.resolve(hit);
             if (!sheets[i]) return Promise.reject(new Error('No such sheet: ' + i));
             if (opts.signal && opts.signal.aborted) return Promise.reject(abortErr());
             const job = jobs.get(i) || startJob(i);
-            if (job.result) return job.result.err ? Promise.reject(job.result.err) : Promise.resolve(job.result.sheet);
-            return new Promise((resolve, reject) => {
-                const sub = { onProgress: opts.onProgress || null, resolve, reject };
+            if (job.result)
+                return 'err' in job.result ? Promise.reject(job.result.err) : Promise.resolve(job.result.sheet);
+            return new Promise<Sheet>((resolve, reject) => {
+                const sub: JobSub = { onProgress: opts.onProgress || null, resolve, reject };
                 job.subs.push(sub);
                 const sig = opts.signal;
                 if (sig && sig.addEventListener) {
@@ -2737,6 +3220,7 @@ function readXlsx(input, opts) {
     return wb;
 }
 
+export type { SheetStore, ColorResolver };
 export {
     readXlsx,
     createSheetParser,

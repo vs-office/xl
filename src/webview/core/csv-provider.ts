@@ -1,20 +1,97 @@
-import { csvLineBreaks, serializeCsvRow, csvToBytes, csvNumBytes } from './csv-parser.js';
+import { csvLineBreaks, serializeCsvRow, csvToBytes, csvNumBytes } from './csv-parser.ts';
+import type { CsvIndex, CsvScalar } from './csv-parser.ts';
+import type { Range } from './grid-core.ts';
+import type { Border } from './xlsx-reader.ts';
+
+export type FormatValuesMode = 'never' | 'unquoted' | 'always';
+export type LineNumbersMode = 'none' | 'ordinal' | 'source';
+
+export interface CsvProviderOptions {
+    hasHeaders?: boolean | undefined;
+    capitalizeHeaders?: boolean | undefined;
+    formatValues?: FormatValuesMode | undefined;
+    numberFormat?: string | undefined;
+    lineNumbers?: LineNumbersMode | undefined;
+    measure?: ((text: string) => number) | undefined;
+    wrapMultiline?: boolean | undefined;
+    rowHeight?: number | undefined;
+    dark?: boolean | undefined;
+    headerBg?: string | undefined;
+}
+
+export interface CsvCellStyle {
+    fmt: string;
+    b: boolean;
+    i: boolean;
+    u: boolean;
+    strike: boolean;
+    color: string | null;
+    size: number;
+    font: string;
+    bg: string | null;
+    h: string;
+    v: string;
+    wrap: boolean;
+    indent: number;
+    bl: Border | null;
+    br: Border | null;
+    bt: Border | null;
+    bb: Border | null;
+}
+
+export interface CsvCell {
+    text: string;
+    kind: 'number' | 'text';
+    style: CsvCellStyle | null;
+}
+
+export interface CsvSourceRange {
+    start: number;
+    end: number;
+}
+
+// Order-preserving sort keys per provider row: cat 0 number (hi/lo = uint64), 1 text (lo = index into strs), 2 blank.
+export interface CsvSortKeys {
+    cat: Uint8Array;
+    hi: Uint32Array;
+    lo: Uint32Array;
+    strs: string[];
+}
+
+// Distinct display values of a column; ids/values/counts are null when truncated.
+export interface CsvColumnIds {
+    ids: Int32Array | null;
+    values: string[] | null;
+    counts: Int32Array | null;
+    truncated: boolean;
+    max: number;
+}
+
+export interface CsvStatsAcc {
+    cnt: number;
+    nums: number;
+    sum: number;
+    min: number;
+    max: number;
+}
+
+export type CsvProgress = Generator<number, CsvStatsAcc, undefined>;
 
 const lineBreaks = csvLineBreaks;
 
-function groupInt(s) {
+function groupInt(s: string): string {
     let out = '';
     for (let i = s.length; i > 0; i -= 3) out = s.slice(Math.max(0, i - 3), i) + (out ? ',' + out : '');
     return out;
 }
 
 // Small .NET-style numeric format strings: g n f d c p e x
-function formatNumberNet(v, fmt) {
+function formatNumberNet(v: unknown, fmt?: string | null): string {
     const m = /^([a-zA-Z])(\d*)$/.exec(fmt || '');
     if (!m || typeof v !== 'number' || !isFinite(v)) return String(v);
     const p = m[2] === '' ? null : parseInt(m[2], 10);
     const kind = m[1];
-    const grouped = (x, d) => {
+    const grouped = (x: number, d: number): string => {
         const s = Math.abs(x).toFixed(d);
         const dot = s.indexOf('.');
         const body = dot < 0 ? groupInt(s) : groupInt(s.slice(0, dot)) + s.slice(dot);
@@ -51,7 +128,7 @@ function formatNumberNet(v, fmt) {
 }
 
 // [+-]?(int[.frac?]|.frac)([eE][+-]?d+)?, no leading zeros on multi-digit ints, <=15 integer digits.
-function isNumeric(s) {
+function isNumeric(s: string): boolean {
     const n = s.length;
     if (n === 0 || n > 40) return false;
     let i = 0,
@@ -82,13 +159,13 @@ function isNumeric(s) {
     return i === n;
 }
 
-function toHeaderCase(t) {
+function toHeaderCase(t: string): string {
     t = t.replace(/([a-z])([A-Z])/g, '$1 $2');
     return t.length ? t.charAt(0).toUpperCase() + t.slice(1) : t;
 }
 
-function mkStyle(o) {
-    return Object.assign(
+function mkStyle(o: Partial<CsvCellStyle>): CsvCellStyle {
+    return Object.assign<CsvCellStyle, Partial<CsvCellStyle>>(
         {
             fmt: 'General',
             b: false,
@@ -121,7 +198,7 @@ const LE = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 const f64 = new Float64Array(1),
     u32 = new Uint32Array(f64.buffer);
 
-function growI32(a, cap) {
+function growI32(a: Int32Array, cap: number): Int32Array {
     const b = new Int32Array(cap);
     b.set(a);
     return b;
@@ -129,7 +206,16 @@ function growI32(a, cap) {
 
 // Open-addressing hash of byte ranges of the source buffer -> dense ids (no per-value allocation).
 class Interner {
-    constructor(ix, max) {
+    ix: CsvIndex;
+    max: number;
+    tab: Int32Array;
+    mask: number;
+    cap: number;
+    ss: Int32Array;
+    ee: Int32Array;
+    hh: Int32Array;
+    count: number;
+    constructor(ix: CsvIndex, max?: number) {
         this.ix = ix;
         this.max = max || 0x7fffffff;
         this.tab = new Int32Array(1 << 12);
@@ -141,7 +227,7 @@ class Interner {
         this.count = 0;
     }
     // id, or -1 when the distinct limit is exceeded
-    intern(s, e) {
+    intern(s: number, e: number): number {
         const b = this.ix.bytes;
         let h = 0x811c9dc5 | 0;
         for (let i = s; i < e; i++) h = Math.imul(h ^ b[i], 16777619);
@@ -178,7 +264,7 @@ class Interner {
         if (this.count * 2 > tab.length) this._rehash();
         return id;
     }
-    _rehash() {
+    _rehash(): void {
         const nt = new Int32Array(this.tab.length * 2),
             mask = nt.length - 1;
         for (let id = 0; id < this.count; id++) {
@@ -192,20 +278,67 @@ class Interner {
 }
 
 class CsvProvider {
+    opts: CsvProviderOptions;
+    ix: CsvIndex;
+    hasHeaders: boolean;
+    header: string[] | null;
+    headerLine: number;
+    headerSpan: number;
+    capitalizeHeaders: boolean;
+    formatValues: FormatValuesMode;
+    numberFormat: string;
+    lineNumbers: LineNumbersMode;
+    measure: (text: string) => number;
+    wrapMultiline: boolean;
+    defaultRowHeight: number;
+    sep: string;
+    quote: string;
+    literalText: boolean;
+    merges: Range[];
+    frozenRows: number;
+    frozenCols: number;
+    showGridLines: boolean;
+    off: number;
+    dataVersion: number;
+    dark = false;
+    headerStyle: CsvCellStyle = mkStyle({});
+    _colCount: number;
+    _wrapStyle: CsvCellStyle = mkStyle({});
+    _gap: Int32Array | null;
+    _ov: Map<number, string>;
+    _scanD: number;
+    _scanN: number;
+    _lines: Uint8Array | null;
+    _cache: Map<number, CsvCell>;
+    _colCache: Map<number, CsvColumnIds>;
+    _agg: Map<number, CsvStatsAcc>;
+    _widths: (number | undefined)[];
+    _widthsFilled: boolean;
+    _userWidths: Map<number, number>;
+    _userHeights: Map<number, number>;
+    _n: number;
+    _dirty: number;
+    _start: Int32Array;
+    _line: Int32Array;
+    _span: Int32Array;
+    _docLines = 0;
+    _lastEmpty = false;
+
     // ix: CsvIndex (may still be indexing; call sync() as rows arrive)
-    constructor(ix, o) {
-        o = o || {};
+    constructor(ix: CsvIndex, optsIn?: CsvProviderOptions | null) {
+        const o: CsvProviderOptions = optsIn || {};
         this.opts = o;
         this.ix = ix;
-        this.hasHeaders = !!(o.hasHeaders && ix.header);
-        this.header = this.hasHeaders ? ix.header.slice() : null;
+        const ixHeader = o.hasHeaders ? ix.header : null;
+        this.hasHeaders = !!ixHeader;
+        this.header = ixHeader ? ixHeader.slice() : null;
         this.headerLine = ix.headerLine;
         this.headerSpan = ix.headerSpan || 1;
         this.capitalizeHeaders = !!o.capitalizeHeaders;
         this.formatValues = o.formatValues || 'never';
         this.numberFormat = o.numberFormat || '';
         this.lineNumbers = o.lineNumbers || 'none';
-        this.measure = o.measure || (s => s.length * 7.2);
+        this.measure = o.measure || ((s: string) => s.length * 7.2);
         this.wrapMultiline = !!o.wrapMultiline;
         this.defaultRowHeight = o.rowHeight || 24;
         this.sep = ix.sep || ',';
@@ -233,13 +366,16 @@ class CsvProvider {
         this.dataVersion = 0;
         this._n = 0;
         this._dirty = 0;
+        this._start = ix.start;
+        this._line = ix.lineAt;
+        this._span = ix.span;
         this.sync();
         this.setDark(!!o.dark);
         if (o.headerBg) this.headerStyle.bg = o.headerBg;
     }
 
     // Picks up rows indexed since the last call (only valid before the first edit).
-    sync() {
+    sync(): void {
         const ix = this.ix;
         this._start = ix.start;
         this._line = ix.lineAt;
@@ -260,41 +396,51 @@ class CsvProvider {
         if (ix.done) {
             this._docLines = ix.lineCount;
             this._lastEmpty = ix.endsWithNewline !== false;
-            if (this.hasHeaders && ix.header.length > this.header.length) {
-                for (let i = this.header.length; i < ix.header.length; i++) this.header.push(ix.header[i]);
+            const ixh = ix.header;
+            if (this.hasHeaders && ixh) {
+                const hdr = this._hdrArr();
+                if (ixh.length > hdr.length) {
+                    for (let i = hdr.length; i < ixh.length; i++) hdr.push(ixh[i]);
+                }
             }
         }
         if (this._lines && this._lines.length < this._n) this._lines = null;
     }
 
-    get dataRowCount() {
+    // Header cells; present whenever hasHeaders (guaranteed by the constructor).
+    _hdrArr(): string[] {
+        if (!this.header) throw new TypeError('CsvProvider: header is not available');
+        return this.header;
+    }
+
+    get dataRowCount(): number {
         return this._n;
     }
 
-    setDark(dark) {
+    setDark(dark: boolean): void {
         this.dark = dark;
         this.headerStyle = mkStyle({ b: true, bg: this.opts.headerBg || (dark ? '#2b3140' : '#e6ebf3') });
         this._wrapStyle = mkStyle({ wrap: true, v: 'top' });
         this._cache.clear();
     }
 
-    get rowCount() {
+    get rowCount(): number {
         return this._n + this.off;
     }
-    get colCount() {
+    get colCount(): number {
         return this._colCount;
     }
-    isColHidden() {
+    isColHidden(): boolean {
         return false;
     }
-    isRowHidden() {
+    isRowHidden(): boolean {
         return false;
     }
-    dataRow(r) {
+    dataRow(r: number): number {
         return r - this.off;
     }
 
-    rowName(r) {
+    rowName(r: number): string {
         if (this.lineNumbers === 'none') return '';
         if (this.hasHeaders && r === 0)
             return this.lineNumbers === 'source' && this.headerLine >= 0 ? String(this.headerLine + 1) : '';
@@ -306,7 +452,7 @@ class CsvProvider {
     }
 
     // Single-row cache over the shared ix.fs/fe scratch; every other scanRow user must go through _rawScan.
-    _scan(d) {
+    _scan(d: number): number {
         if (this._scanD === d) return this._scanN;
         const st = this._start[d];
         const nf = st < 0 ? 0 : this.ix.scanRow(st);
@@ -316,21 +462,21 @@ class CsvProvider {
     }
 
     // Scans a row into the scratch without trusting/keeping the _scan cache (it is invalidated, the scratch is overwritten).
-    _rawScan(st, upto) {
+    _rawScan(st: number, upto?: number): number {
         this._scanD = -1;
         return this.ix.scanRow(st, upto);
     }
 
-    _src(d, c) {
+    _src(d: number, c: number): string {
         const nf = this._scan(d);
         if (c >= nf) return '';
         const ix = this.ix;
         return ix.field(ix.fs[c], ix.fe[c]);
     }
 
-    getRaw(r, c) {
+    getRaw(r: number, c: number): string {
         if (this.hasHeaders && r === 0) {
-            const h = this.header[c];
+            const h = this._hdrArr()[c];
             return h === undefined ? '' : h;
         }
         const d = r - this.off;
@@ -342,17 +488,17 @@ class CsvProvider {
         return this._src(d, c);
     }
 
-    _wantsQ(q) {
+    _wantsQ(q: boolean): boolean {
         const f = this.formatValues;
         return f === 'always' || (f === 'unquoted' && !q);
     }
 
-    _wantsNumber(d, c) {
+    _wantsNumber(d: number, c: number): boolean {
         const f = this.formatValues;
         return f === 'always' || (f === 'unquoted' && !this.isQuoted(d, c));
     }
 
-    isQuoted(d, c) {
+    isQuoted(d: number, c: number): boolean {
         if (d < 0 || d >= this._n) return false;
         const nf = this._scan(d);
         if (c >= nf) return false;
@@ -360,7 +506,7 @@ class CsvProvider {
         return ix.isQuotedRange(ix.fs[c], ix.fe[c]);
     }
 
-    _view(text, wantsNum) {
+    _view(text: string, wantsNum: boolean): CsvCell {
         if (wantsNum && isNumeric(text)) {
             return {
                 text: this.numberFormat ? formatNumberNet(Number(text), this.numberFormat) : text,
@@ -377,10 +523,10 @@ class CsvProvider {
         return { text, kind: 'text', style: multi && this.wrapMultiline ? this._wrapStyle : null };
     }
 
-    getCell(r, c) {
-        let text;
+    getCell(r: number, c: number): CsvCell | undefined {
+        let text: string;
         if (this.hasHeaders && r === 0) {
-            text = this.header[c];
+            text = this._hdrArr()[c];
             if (text === undefined || text === '') return undefined;
             const hk = -1 - c;
             let hv = this._cache.get(hk);
@@ -408,15 +554,15 @@ class CsvProvider {
         return v;
     }
 
-    searchText(r, c) {
+    searchText(r: number, c: number): string {
         return this.getRaw(r, c);
     }
 
-    setRowHeight(r, h) {
+    setRowHeight(r: number, h: number): void {
         this._userHeights.set(r, Math.max(8, h));
     }
 
-    rowHeight(r) {
+    rowHeight(r: number): number {
         if (this._userHeights.size) {
             const u = this._userHeights.get(r);
             if (u !== undefined) return u;
@@ -447,14 +593,14 @@ class CsvProvider {
     }
 
     // Materialized fields of a data row (source + edits), length colCount.
-    _rowStrings(d) {
+    _rowStrings(d: number): string[] {
         const n = this._colCount,
-            out = new Array(n),
+            out = new Array<string>(n),
             ov = this._ov;
         const nf = this._scan(d),
             ix = this.ix;
         for (let c = 0; c < n; c++) {
-            let v;
+            let v: string | undefined;
             if (ov.size && (v = ov.get(d * OVK + c)) !== undefined) {
                 out[c] = v;
                 continue;
@@ -465,7 +611,7 @@ class CsvProvider {
     }
 
     // ---- widths ----
-    colWidth(c) {
+    colWidth(c: number): number {
         const u = this._userWidths.get(c);
         if (u !== undefined) return u;
         if (c >= this._colCount) return 48;
@@ -478,22 +624,22 @@ class CsvProvider {
         return w;
     }
 
-    setColWidth(c, w) {
+    setColWidth(c: number, w: number): void {
         this._userWidths.set(c, Math.max(8, w));
     }
 
     // Recompute from content (rows sampled from the start); clears any user width.
-    autosizeCol(c, maxRows) {
+    autosizeCol(c: number, maxRows?: number): number {
         this._userWidths.delete(c);
         return (this._widths[c] = this._compute(c, maxRows || 1000));
     }
 
-    autosizeAll(maxRows) {
+    autosizeAll(maxRows?: number): void {
         this._userWidths.clear();
         this._fillWidths(maxRows || 1000, 64);
     }
 
-    _compute(c, maxRows) {
+    _compute(c: number, maxRows: number): number {
         let mx = 0;
         if (this.hasHeaders) {
             const hv = this.getCell(0, c);
@@ -511,7 +657,7 @@ class CsvProvider {
     }
 
     // One pass over the sample rows for all columns; columns >= realCols use a byte-length estimate.
-    _fillWidths(maxRows, realCols) {
+    _fillWidths(maxRows: number, realCols: number): void {
         this._widthsFilled = true;
         const cc = this._colCount,
             mx = new Float64Array(cc),
@@ -546,36 +692,37 @@ class CsvProvider {
     }
 
     // ---- editing ----
-    _ensureGap() {
-        if (this._gap) return;
+    _ensureGap(): Int32Array {
+        if (this._gap) return this._gap;
         const n = this._n,
             L = this._line,
             S = this._span,
             G = (this._gap = new Int32Array(this._start.length));
         for (let i = 0; i < n; i++) G[i] = i ? L[i] - L[i - 1] - S[i - 1] : L[0];
         this._dirty = n;
+        return G;
     }
 
-    _ensure(d) {
+    _ensure(d: number): void {
         if (this._dirty > d) return;
         const L = this._line,
             S = this._span,
-            G = this._gap;
+            G = this._ensureGap();
         for (let i = this._dirty; i <= d; i++) L[i] = i ? L[i - 1] + S[i - 1] + G[i] : G[0];
         this._dirty = d + 1;
     }
 
-    _touch(d) {
+    _touch(d: number): void {
         if (d + 1 < this._dirty) this._dirty = d + 1;
     }
 
-    _edited() {
+    _edited(): void {
         this.dataVersion++;
         if (this._colCache.size) this._colCache.clear();
         if (this._agg.size) this._agg.clear();
     }
 
-    getSourceRange(r) {
+    getSourceRange(r: number): CsvSourceRange {
         // Header without a source line (empty / blank-only / comment-only file): empty range at line 0 = insert there.
         if (this.hasHeaders && r === 0)
             return this.headerLine < 0
@@ -587,15 +734,16 @@ class CsvProvider {
         return { start: this._line[d], end: this._line[d] + this._span[d] };
     }
 
-    setCell(r, c, text) {
+    setCell(r: number, c: number, textIn: CsvScalar): void {
         if (!this.ix.done) return;
-        text = text == null ? '' : String(text);
+        const text = textIn === null || textIn === undefined ? '' : String(textIn);
         if (this.hasHeaders && r === 0) {
-            const old = this.header[c] || '';
+            const hdr = this._hdrArr();
+            const old = hdr[c] || '';
             if (old === text) return;
-            this._ensureGap();
-            while (this.header.length <= c) this.header.push('');
-            this.header[c] = text;
+            const gap = this._ensureGap();
+            while (hdr.length <= c) hdr.push('');
+            hdr[c] = text;
             if (c >= this._colCount) this._growCols(c + 1);
             let delta = lineBreaks(text) - lineBreaks(old);
             if (this.headerLine < 0) {
@@ -607,7 +755,7 @@ class CsvProvider {
             if (delta) {
                 this._docLines += delta;
                 if (this._n) {
-                    this._gap[0] += delta;
+                    gap[0] += delta;
                     this._dirty = 0;
                 }
             }
@@ -634,20 +782,20 @@ class CsvProvider {
         this._edited();
     }
 
-    _growCols(n) {
+    _growCols(n: number): void {
         this._colCount = n;
         this._cache.clear();
     }
 
     // Deletes provider rows (header ignored); returns pre-deletion source ranges, ascending.
-    deleteRows(indices) {
-        const ranges = [];
+    deleteRows(indices: readonly number[]): CsvSourceRange[] {
+        const ranges: CsvSourceRange[] = [];
         if (!this.ix.done) return ranges;
         const del = Array.from(
             new Set(indices.filter(r => r >= this.off && r < this.rowCount).map(r => r - this.off))
         ).sort((a, b) => a - b);
         if (!del.length) return ranges;
-        this._ensureGap();
+        const gap = this._ensureGap();
         this._ensure(del[del.length - 1]);
         for (const d of del) {
             ranges.push({ start: this._line[d], end: this._line[d] + this._span[d] });
@@ -659,7 +807,7 @@ class CsvProvider {
             carry = 0;
         const L = this._line,
             S = this._span,
-            G = this._gap,
+            G = gap,
             T = this._start;
         for (let i = 0; i < n; i++) {
             if (k < del.length && del[k] === i) {
@@ -676,7 +824,7 @@ class CsvProvider {
         }
         this._n = j;
         if (this._ov.size) {
-            const nov = new Map();
+            const nov = new Map<number, string>();
             this._ov.forEach((v, key) => {
                 const d = Math.floor(key / OVK);
                 let lo = 0,
@@ -695,7 +843,7 @@ class CsvProvider {
         this._dirty = Math.min(this._dirty, del[0]);
         if (this._userHeights.size) {
             const delSet = new Set(del.map(d => d + this.off)),
-                nh = new Map();
+                nh = new Map<number, number>();
             this._userHeights.forEach((h, r) => {
                 if (delSet.has(r)) return;
                 let shift = 0;
@@ -713,21 +861,21 @@ class CsvProvider {
     }
 
     // Returns the new provider row index.
-    appendRow() {
+    appendRow(): number {
         if (!this.ix.done) return -1;
-        this._ensureGap();
+        let gap = this._ensureGap();
         const n = this._n;
         if (n >= this._start.length) {
             const cap = Math.max(16, this._start.length * 2);
             this._line = growI32(this._line, cap);
             this._span = growI32(this._span, cap);
-            this._gap = growI32(this._gap, cap);
+            gap = this._gap = growI32(gap, cap);
             this._start = growI32(this._start, cap);
         }
         this._ensure(n - 1);
         const newLine = this._lastEmpty ? Math.max(this._docLines - 1, 0) : this._docLines;
         const end = n ? this._line[n - 1] + this._span[n - 1] : 0;
-        this._gap[n] = newLine - end;
+        gap[n] = newLine - end;
         this._line[n] = newLine;
         this._span[n] = 1;
         this._start[n] = -1;
@@ -740,14 +888,15 @@ class CsvProvider {
         return n + this.off;
     }
 
-    serializeRow(r) {
+    serializeRow(r: number): string {
         const isHdr = this.hasHeaders && r === 0;
         const cc = this._colCount,
-            out = new Array(cc),
-            fl = new Array(cc);
+            out = new Array<string>(cc),
+            fl = new Array<boolean>(cc);
         if (isHdr) {
+            const hdr = this._hdrArr();
             for (let c = 0; c < cc; c++) {
-                out[c] = this.header[c] !== undefined ? this.header[c] : '';
+                out[c] = hdr[c] !== undefined ? hdr[c] : '';
                 fl[c] = false;
             }
         } else {
@@ -764,12 +913,12 @@ class CsvProvider {
     }
 
     // ---- column analytics (generators: iterate with next(); a yielded number is a progress fraction) ----
-    _fast() {
+    _fast(): boolean {
         return this.ix.qlen === 1;
     }
 
     // Sort keys per provider row: cat 0 number (hi/lo = order-preserving uint64), 1 text (lo = index into strs), 2 blank.
-    *sortKeyColumn(c) {
+    *sortKeyColumn(c: number): Generator<number, CsvSortKeys, undefined> {
         const R = this.rowCount,
             off = this.off,
             n = this._n,
@@ -783,12 +932,12 @@ class CsvProvider {
             q0 = ix.q0,
             fast = this._fast();
         const it = new Interner(ix),
-            eMap = new Map(),
-            eList = [];
+            eMap = new Map<string, number>(),
+            eList: string[] = [];
         const hiI = LE ? 1 : 0,
             loI = LE ? 0 : 1,
             EBASE = 0x40000000;
-        const setNum = (r, x) => {
+        const setNum = (r: number, x: number): void => {
             f64[0] = x === 0 ? 0 : x;
             let h = u32[hiI],
                 l = u32[loI];
@@ -800,7 +949,7 @@ class CsvProvider {
             hi[r] = h >>> 0;
             lo[r] = l >>> 0;
         };
-        const setStr = (v, r) => {
+        const setStr = (v: string, r: number): void => {
             if (v === '') return;
             const bb = csvToBytes(v),
                 x = csvNumBytes(bb, 0, bb.length, false);
@@ -869,7 +1018,7 @@ class CsvProvider {
             lo[r] = it.intern(s, e);
         }
         const base = it.count,
-            strs = new Array(base + eList.length);
+            strs = new Array<string>(base + eList.length);
         for (let id = 0; id < base; id++) {
             if ((id & 4095) === 4095) yield 0.6 + (0.1 * id) / base;
             strs[id] = ix.field(it.ss[id], it.ee[id]).toLowerCase();
@@ -881,8 +1030,8 @@ class CsvProvider {
     }
 
     // Per-row ids into the distinct display values of column c; ids/values null when more than maxDistinct values.
-    *columnIds(c, maxDistinct, raw) {
-        maxDistinct = maxDistinct || 50000;
+    *columnIds(c: number, maxDistinctIn?: number, raw?: boolean): Generator<number, CsvColumnIds, undefined> {
+        const maxDistinct = maxDistinctIn || 50000;
         const ck = c * 4 + (raw ? 2 : 1),
             cached = this._colCache.get(ck);
         if (cached && cached.max >= maxDistinct) return cached;
@@ -895,13 +1044,13 @@ class CsvProvider {
             hasOv = ov.size > 0,
             T = this._start;
         const it = new Interner(ix, maxDistinct + 1),
-            eMap = new Map(),
-            eList = [];
+            eMap = new Map<string, number>(),
+            eList: { v: string; q: boolean }[] = [];
         const BLANK = 0x20000000,
             EBASE = 0x40000000;
         let sawBlank = false,
             mark = 0;
-        const res = { ids: null, values: null, counts: null, truncated: false, max: maxDistinct };
+        const res: CsvColumnIds = { ids: null, values: null, counts: null, truncated: false, max: maxDistinct };
         for (let d = 0; d < n; d++) {
             const st = T[d],
                 r = d + off;
@@ -943,10 +1092,10 @@ class CsvProvider {
             }
             ids[r] = id;
         }
-        const map = new Map(),
-            values = [],
-            cnt = [];
-        const dense = text => {
+        const map = new Map<string, number>(),
+            values: string[] = [],
+            cnt: number[] = [];
+        const dense = (text: string): number => {
             let k = map.get(text);
             if (k === undefined) {
                 k = values.length;
@@ -986,7 +1135,14 @@ class CsvProvider {
 
     // Accumulates count/sum/min/max (acc: {cnt,nums,sum,min,max}) over a rectangle; `rows` optionally maps view rows to
     // provider rows. Whole data columns are cached until the next edit.
-    *rangeStats(acc, rows, r1, r2, c1, c2) {
+    *rangeStats(
+        acc: CsvStatsAcc,
+        rows: ArrayLike<number> | null | undefined,
+        r1: number,
+        r2: number,
+        c1: number,
+        c2In: number
+    ): CsvProgress {
         const off = this.off,
             n = this._n,
             ix = this.ix,
@@ -997,7 +1153,7 @@ class CsvProvider {
             q0 = ix.q0,
             fast = this._fast(),
             wantNum = fmt !== 'never';
-        c2 = Math.min(c2, this._colCount - 1);
+        const c2 = Math.min(c2In, this._colCount - 1);
         const nc = c2 - c1 + 1;
         const reset = () => {
             acc.cnt = 0;
@@ -1049,7 +1205,7 @@ class CsvProvider {
             const r = rows ? rows[r1 + i] : r1 + i;
             if (this.hasHeaders && r === 0) {
                 for (let c = c1; c <= c2; c++) {
-                    const h = this.header[c];
+                    const h = this._hdrArr()[c];
                     if (h !== undefined && h !== '') hc[c - c1] = 1;
                 }
                 continue;
@@ -1087,10 +1243,10 @@ class CsvProvider {
             for (let c = c1; c <= hi; c++) {
                 const k = c - c1;
                 if (have[k]) continue;
-                let s = 0,
-                    e = 0,
+                let s: number,
+                    e: number,
                     quoted = false,
-                    v;
+                    v: string | undefined;
                 if (hasOv && (v = ov.get(d * OVK + c)) !== undefined) {
                     if (v === '') continue;
                     cnt[k]++;
@@ -1138,7 +1294,7 @@ class CsvProvider {
                     this._agg.set(c1 + k, { cnt: cnt[k], nums: nums[k], sum: sum[k], min: mn[k], max: mx[k] });
             if (this.hasHeaders && r1 === 0)
                 for (let c = c1; c <= c2; c++) {
-                    const h = this.header[c];
+                    const h = this._hdrArr()[c];
                     if (h !== undefined && h !== '') hc[c - c1] = 1;
                 }
         }

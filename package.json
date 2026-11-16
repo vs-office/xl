@@ -351,7 +351,7 @@
     }
   },
   "scripts": {
-    "check": "npm run fmt-check && npm run lint && npm run tsc && npm run test",
+    "check": "npm run fmt-check && npm run lint && npm run tsc && npm run test && npm run compile",
     "fmt": "prettier -w .",
     "fmt-check": "prettier --check .",
     "lint": "eslint . --max-warnings=0",

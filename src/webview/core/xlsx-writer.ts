@@ -1,5 +1,137 @@
 import * as fflate from 'fflate';
-import { zipLimits } from './xlsx-reader.js';
+import { zipLimits } from './xlsx-reader.ts';
+import type { Attrs, ZipLimits } from './xlsx-reader.ts';
+
+// ---- public types ----
+
+/** Value of an edit cell (validated against the tag by `patchXlsx`). */
+export type EditValue = string | number | boolean | null;
+
+/** Cell payload of an edit as produced by the page (untrusted: validated and normalized by `patchXlsx`). */
+export interface EditCell {
+    /** value type tag: 'n' number, 's' string, 'b' boolean, 'e' error; any other tag is rejected */
+    t: string;
+    /** the value; may be omitted for a formula cell (its cached value is then dropped) */
+    v?: EditValue | undefined;
+    /** formula text with or without the leading '='; empty/null/undefined for a plain value */
+    f?: string | null | undefined;
+    /** number format code; null/undefined/'General' keep the existing style */
+    fmt?: string | null | undefined;
+}
+
+/** One edit inside a sheet; r and c are 0-based. cell === null (or omitted) clears the cell. */
+export interface SheetEdit {
+    r: number;
+    c: number;
+    cell?: EditCell | null | undefined;
+}
+
+/** One edit addressed to a sheet by its 0-based index in the workbook. */
+export interface CellEdit extends SheetEdit {
+    sheet: number;
+}
+
+/** Edits grouped by 0-based sheet index. */
+export type EditsBySheet = Record<number, readonly SheetEdit[]>;
+
+export interface PatchOptions {
+    /** set fullCalcOnLoad and drop calcChain after patching (default true; only `false` disables it) */
+    fullCalcOnLoad?: boolean | undefined;
+}
+
+/** Validated edit cell; the tag selects the value type. v is null/undefined when only a formula is written. */
+export interface NormNumberCell {
+    readonly t: 'n';
+    readonly v: number | null | undefined;
+    readonly f: string | null;
+    readonly fmt: string | null;
+}
+export interface NormStringCell {
+    readonly t: 's';
+    readonly v: string | null | undefined;
+    readonly f: string | null;
+    readonly fmt: string | null;
+}
+export interface NormBooleanCell {
+    readonly t: 'b';
+    readonly v: boolean | null | undefined;
+    readonly f: string | null;
+    readonly fmt: string | null;
+}
+export interface NormErrorCell {
+    readonly t: 'e';
+    readonly v: string | null | undefined;
+    readonly f: string | null;
+    readonly fmt: string | null;
+}
+export type NormCell = NormNumberCell | NormStringCell | NormBooleanCell | NormErrorCell;
+
+/** column (1-based) -> cell; null clears the cell */
+export type CellMap = Map<number, NormCell | null>;
+/** row (1-based) -> cells */
+export type RowsMap = Map<number, CellMap>;
+/** 1-based inclusive rectangle */
+export interface A1Range {
+    r1: number;
+    c1: number;
+    r2: number;
+    c2: number;
+}
+/** package parts by name; entries are inflated lazily on first read */
+export type Files = Record<string, Uint8Array>;
+export interface Relationship {
+    id: string | undefined;
+    type: string;
+    target: string;
+    mode: string;
+}
+interface SheetRef {
+    name: string | undefined;
+    rel: Relationship | null;
+    path: string | null;
+}
+interface RewrittenPart {
+    key: string;
+    xml: string;
+}
+interface Styler {
+    derive(base: number, code: string): number;
+    finalize(): RewrittenPart;
+}
+/** piece of a rewritten part: binary string, raw bytes, or a [from, to) byte range of the original */
+type Piece = string | Uint8Array | readonly [number, number];
+/** parts list of a patched worksheet: binary strings and [from, to) byte ranges of the original */
+type SheetPart = string | [number, number];
+/** result of recompressing a part */
+export interface PackedPart {
+    data: Uint8Array;
+    crc: number;
+    usize: number;
+}
+/** central directory entry of the source zip (plus lazy-read state) */
+export interface ZipEntry {
+    madeBy: number;
+    need: number;
+    flag: number;
+    method: number;
+    time: number;
+    date: number;
+    crc: number;
+    csize: number;
+    usize: number;
+    iattr: number;
+    eattr: number;
+    lho: number;
+    nameBytes: Uint8Array;
+    comment: Uint8Array;
+    extra: Uint8Array[];
+    cache: Uint8Array | undefined;
+    mod: Uint8Array | undefined;
+    name: string;
+}
+interface CodedError extends Error {
+    code?: string;
+}
 
 // Seam for tests: they swap Inflate to observe which zip parts get inflated (bindings of an imported module cannot be patched).
 const writerDeps = { Inflate: fflate.Inflate };
@@ -8,9 +140,9 @@ const MAXR = 1048576,
     MAXC = 16384;
 const ERRORS = new Set(['#NULL!', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#N/A', '#SPILL!', '#CALC!']);
 
-const isWs = k => k === 32 || k === 9 || k === 10 || k === 13;
+const isWs = (k: number) => k === 32 || k === 9 || k === 10 || k === 13;
 
-function colName(c) {
+function colName(c: number) {
     let s = '';
     c++;
     while (c > 0) {
@@ -20,7 +152,7 @@ function colName(c) {
     }
     return s;
 }
-function colOfRef(ref) {
+function colOfRef(ref: string) {
     // 1-based column from "AB12"
     let c = 0;
     for (let i = 0; i < ref.length; i++) {
@@ -31,7 +163,7 @@ function colOfRef(ref) {
     }
     return c;
 }
-function rowOfRef(ref) {
+function rowOfRef(ref: string) {
     let i = 0;
     while (i < ref.length) {
         const k = ref.charCodeAt(i);
@@ -46,7 +178,7 @@ function rowOfRef(ref) {
     }
     return r;
 }
-function parseRange(ref) {
+function parseRange(ref: string) {
     // "A1:B3" -> {r1,c1,r2,c2} 1-based
     const p = ref.replace(/\$/g, '').split(':');
     const a = p[0],
@@ -55,7 +187,7 @@ function parseRange(ref) {
 }
 
 // ---- escaping ----
-function escapeXml(s) {
+function escapeXml(s: string) {
     s = String(s);
     if (/[&<>"\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF\uD800-\uDFFF]/.test(s)) {
         s = s
@@ -65,9 +197,9 @@ function escapeXml(s) {
     }
     return s;
 }
-function unescapeXml(s) {
+function unescapeXml(s: string) {
     if (s.indexOf('&') < 0) return s;
-    return s.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (m, e) => {
+    return s.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (m: string, e: string) => {
         switch (e) {
             case 'amp':
                 return '&';
@@ -88,9 +220,9 @@ function unescapeXml(s) {
         }
     });
 }
-const hex4 = k => '_x' + k.toString(16).toUpperCase().padStart(4, '0') + '_';
+const hex4 = (k: number) => '_x' + k.toString(16).toUpperCase().padStart(4, '0') + '_';
 // Text content (ST_Xstring): control chars become _xHHHH_ like Excel; literal "_xHHHH_" gets its underscore escaped.
-function escapeText(s) {
+function escapeText(s: string) {
     if (/[&<>\x00-\x08\x0B\x0C\x0E-\x1F\r\uD800-\uDFFF\uFFFE\uFFFF_]/.test(s)) {
         s = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         if (s.indexOf('_x') >= 0) s = s.replace(/_(x[0-9A-Fa-f]{4}_)/g, '_x005F_$1');
@@ -101,7 +233,7 @@ function escapeText(s) {
     }
     return s;
 }
-function escapeFormula(f) {
+function escapeFormula(f: string) {
     f = f.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\r\uFFFE\uFFFF]/g, '');
     return f.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -110,7 +242,7 @@ function escapeFormula(f) {
 const CELL_RE = /^(\$?)([A-Za-z]{1,3})(\$?)(\d+)$/;
 const COL_RE = /^(\$?)([A-Za-z]{1,3})$/;
 const ROW_RE = /^(\$?)(\d+)$/;
-const isRunCh = k =>
+const isRunCh = (k: number) =>
     (k >= 48 && k <= 57) ||
     (k >= 65 && k <= 90) ||
     (k >= 97 && k <= 122) ||
@@ -118,20 +250,21 @@ const isRunCh = k =>
     k === 46 ||
     k === 36 ||
     k === 92;
-const wrap = (x, n) => ((((x - 1) % n) + n) % n) + 1;
+const wrap = (x: number, n: number) => ((((x - 1) % n) + n) % n) + 1;
 
-function shiftFormula(f, dr, dc) {
+function shiftFormula(f: string, dr: number, dc: number) {
     if (!dr && !dc) return f;
     let out = '',
         i = 0,
         last = 0;
     const n = f.length;
-    const shiftCol = (abs, letters) => {
+    const shiftCol = (abs: string, letters: string) => {
         if (abs) return '$' + letters;
         return colName(wrap(colOfRef(letters) + dc, MAXC) - 1);
     };
-    const shiftRow = (abs, digits) => (abs ? '$' + digits : String(wrap(parseInt(digits, 10) + dr, MAXR)));
-    const runEnd = j => {
+    const shiftRow = (abs: string, digits: string) =>
+        abs ? '$' + digits : String(wrap(parseInt(digits, 10) + dr, MAXR));
+    const runEnd = (j: number) => {
         while (j < n && isRunCh(f.charCodeAt(j))) j++;
         return j;
     };
@@ -169,9 +302,9 @@ function shiftFormula(f, dr, dc) {
         const j = runEnd(i + 1);
         const tok = f.slice(i, j),
             nx = f.charCodeAt(j);
-        let rep = null,
+        let rep: string | null = null,
             endAt = j,
-            m;
+            m: RegExpExecArray | null;
         if ((m = CELL_RE.exec(tok)) && nx !== 40 && nx !== 33) {
             const col = colOfRef(m[2]),
                 row = parseInt(m[4], 10);
@@ -203,7 +336,7 @@ function shiftFormula(f, dr, dc) {
 }
 
 // ---- small xml helpers ----
-function attr(tag, name) {
+function attr(tag: string, name: string): string | null {
     // tag is a short tag-text slice: search stays bounded
     const p = ' ' + name + '=';
     let i = tag.indexOf(p + '"');
@@ -218,20 +351,20 @@ function attr(tag, name) {
     }
     return null;
 }
-function parseAttrs(tag) {
-    const o = {};
+function parseAttrs(tag: string) {
+    const o: Attrs = {};
     const re = /([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
-    let m;
+    let m: RegExpExecArray | null;
     while ((m = re.exec(tag))) o[m[1]] = unescapeXml(m[2] !== undefined ? m[2] : m[3]);
     return o;
 }
 const dec = () => new TextDecoder('utf-8');
-function decodeXml(u8, name) {
+function decodeXml(u8: Uint8Array, name: string) {
     if (u8.length >= 2 && ((u8[0] === 0xff && u8[1] === 0xfe) || (u8[0] === 0xfe && u8[1] === 0xff)))
         throw new Error('UTF-16 XML part not supported: ' + name);
     return dec().decode(u8);
 }
-function resolveTarget(baseDir, target) {
+function resolveTarget(baseDir: string, target: string) {
     if (target.charCodeAt(0) === 47) return target.slice(1);
     const parts = baseDir ? baseDir.split('/') : [];
     for (const seg of target.split('/')) {
@@ -240,26 +373,26 @@ function resolveTarget(baseDir, target) {
     }
     return parts.join('/');
 }
-const relsOf = p =>
+const relsOf = (p: string) =>
     (p.lastIndexOf('/') >= 0 ? p.slice(0, p.lastIndexOf('/') + 1) : '') +
     '_rels/' +
     p.slice(p.lastIndexOf('/') + 1) +
     '.rels';
-const dirOf = p => (p.lastIndexOf('/') >= 0 ? p.slice(0, p.lastIndexOf('/')) : '');
-const baseOf = p => p.slice(p.lastIndexOf('/') + 1);
-function findFile(files, path) {
+const dirOf = (p: string) => (p.lastIndexOf('/') >= 0 ? p.slice(0, p.lastIndexOf('/')) : '');
+const baseOf = (p: string) => p.slice(p.lastIndexOf('/') + 1);
+function findFile(files: Files, path: string): string | null {
     if (path in files) return path;
     const lp = path.toLowerCase();
     for (const k in files) if (k.toLowerCase() === lp) return k;
     return null;
 }
-function readRels(files, relPath) {
+function readRels(files: Files, relPath: string) {
     const k = findFile(files, relPath);
-    const out = [];
+    const out: Relationship[] = [];
     if (!k) return out;
     const x = decodeXml(files[k], k);
     const re = /<(?:[\w.-]+:)?Relationship\b[^>]*>/g;
-    let m;
+    let m: RegExpExecArray | null;
     while ((m = re.exec(x))) {
         const a = parseAttrs(m[0]);
         out.push({ id: a.Id, type: a.Type || '', target: a.Target || '', mode: a.TargetMode || '' });
@@ -267,7 +400,7 @@ function readRels(files, relPath) {
     return out;
 }
 
-function locateSheets(files) {
+function locateSheets(files: Files) {
     let wbPath = 'xl/workbook.xml';
     const root = readRels(files, '_rels/.rels');
     for (const r of root)
@@ -279,18 +412,18 @@ function locateSheets(files) {
     if (!wbKey) throw new Error('workbook.xml not found');
     const wb = decodeXml(files[wbKey], wbKey);
     const rels = readRels(files, relsOf(wbKey));
-    const byId = {};
-    for (const r of rels) byId[r.id] = r;
+    const byId: Record<string, Relationship> = {};
+    for (const r of rels) byId[String(r.id)] = r;
     const s0 = wb.search(/<(?:[\w.-]+:)?sheets[\s>]/);
     const s1 = wb.search(/<\/(?:[\w.-]+:)?sheets>/);
     if (s0 < 0 || s1 < 0) throw new Error('workbook has no <sheets>');
     const region = wb.slice(s0, s1);
     const re = /<(?:[\w.-]+:)?sheet\b[^>]*>/g;
-    const sheets = [];
-    let m;
+    const sheets: SheetRef[] = [];
+    let m: RegExpExecArray | null;
     while ((m = re.exec(region))) {
         const a = parseAttrs(m[0]);
-        let rid = null;
+        let rid: string | undefined | null = null;
         for (const k in a) if (k === 'id' || k.endsWith(':id')) rid = a[k];
         const rel = rid && byId[rid];
         sheets.push({ name: a.name, rel: rel || null, path: rel ? resolveTarget(dirOf(wbKey), rel.target) : null });
@@ -299,12 +432,12 @@ function locateSheets(files) {
 }
 
 // ---- cell encoding ----
-function numStr(v) {
-    if (typeof v !== 'number' || !isFinite(v)) throw new Error('Invalid number value: ' + v);
+function numStr(v: number | null | undefined) {
+    if (typeof v !== 'number' || !isFinite(v)) throw new Error('Invalid number value: ' + String(v));
     return v === 0 ? '0' : String(v);
 }
 // returns a reason string when the formula text cannot be written safely, else null
-function formulaError(f) {
+function formulaError(f: string) {
     const n = f.length;
     if (!n) return 'the formula is empty';
     if (n > 8192) return 'the formula is longer than 8192 characters';
@@ -398,14 +531,15 @@ function formulaError(f) {
 }
 
 // functions Excel stores with a prefix (post-2007); value = prefix
-const XLFN = new Map();
+const XLFN = new Map<string, string>();
 'ACOT ACOTH ARABIC ARRAYTOTEXT BASE BETA.DIST BETA.INV BINOM.DIST BINOM.DIST.RANGE BINOM.INV BITAND BITLSHIFT BITOR BITRSHIFT BITXOR BYCOL BYROW CEILING.MATH CEILING.PRECISE CHISQ.DIST CHISQ.DIST.RT CHISQ.INV CHISQ.INV.RT CHISQ.TEST CHOOSECOLS CHOOSEROWS COMBINA CONCAT CONFIDENCE.NORM CONFIDENCE.T COT COTH COVARIANCE.P COVARIANCE.S CSC CSCH DAYS DECIMAL DROP ERF.PRECISE ERFC.PRECISE EXPAND EXPON.DIST F.DIST F.DIST.RT F.INV F.INV.RT F.TEST FILTERXML FLOOR.MATH FLOOR.PRECISE FORECAST.ETS FORECAST.ETS.CONFINT FORECAST.ETS.SEASONALITY FORECAST.ETS.STAT FORECAST.LINEAR FORMULATEXT GAMMA GAMMA.DIST GAMMA.INV GAMMALN.PRECISE GAUSS HSTACK HYPGEOM.DIST IFNA IFS IMAGE IMCOSH IMCOT IMCSC IMCSCH IMSEC IMSECH IMSINH IMTAN ISFORMULA ISOMITTED ISOWEEKNUM LAMBDA LET LOGNORM.DIST LOGNORM.INV MAKEARRAY MAP MAXIFS MINIFS MODE.MULT MODE.SNGL MUNIT NEGBINOM.DIST NETWORKDAYS.INTL NORM.DIST NORM.INV NORM.S.DIST NORM.S.INV NUMBERVALUE PDURATION PERCENTILE.EXC PERCENTILE.INC PERCENTRANK.EXC PERCENTRANK.INC PERMUTATIONA PHI POISSON.DIST QUARTILE.EXC QUARTILE.INC QUERYSTRING RANDARRAY RANK.AVG RANK.EQ REDUCE RRI SCAN SEC SECH SEQUENCE SHEET SHEETS SINGLE SKEW.P SORTBY STDEV.P STDEV.S SWITCH T.DIST T.DIST.2T T.DIST.RT T.INV T.INV.2T T.TEST TAKE TEXTAFTER TEXTBEFORE TEXTJOIN TEXTSPLIT TOCOL TOROW UNICHAR UNICODE UNIQUE VALUETOTEXT VAR.P VAR.S VSTACK WEBSERVICE WEIBULL.DIST WORKDAY.INTL WRAPCOLS WRAPROWS XLOOKUP XMATCH XOR Z.TEST'
     .split(' ')
     .forEach(n => XLFN.set(n, '_xlfn.'));
 XLFN.set('FILTER', '_xlfn._xlws.');
 XLFN.set('SORT', '_xlfn._xlws.');
-const isNameCh = k => (k >= 48 && k <= 57) || (k >= 65 && k <= 90) || (k >= 97 && k <= 122) || k === 95 || k === 46;
-function addXlfn(f) {
+const isNameCh = (k: number) =>
+    (k >= 48 && k <= 57) || (k >= 65 && k <= 90) || (k >= 97 && k <= 122) || k === 95 || k === 46;
+function addXlfn(f: string) {
     let out = '',
         last = 0;
     const n = f.length;
@@ -455,55 +589,66 @@ function addXlfn(f) {
     return last === 0 ? f : out + f.slice(last);
 }
 // user-facing message for an unwritable formula (text without or with leading '='), else null
-function validateFormula(f) {
+function validateFormula(f: string) {
     f = String(f);
     if (f.charCodeAt(0) === 61) f = f.slice(1);
     const err = formulaError(f);
     return err ? 'Invalid formula "=' + (f.length > 60 ? f.slice(0, 60) + '...' : f) + '": ' + err + '.' : null;
 }
-function normFormula(f) {
+function normFormula(f: string) {
     f = String(f);
     if (f.charCodeAt(0) === 61) f = f.slice(1);
     const err = validateFormula(f);
     if (err) throw new Error(err);
     return addXlfn(f);
 }
-function checkStr(s) {
+function checkStr(s: string) {
     if (s.length > 32767) throw new Error('Text exceeds 32767 characters');
     return s;
 }
 // Validates/normalizes an edit cell once up front so errors surface before any patching.
-function normCell(cell) {
+function normCell(cell: EditCell | null): NormCell | null {
     if (cell === null) return null;
     if (!cell || typeof cell !== 'object') throw new Error('Invalid cell');
     const t = cell.t;
     if (t !== 'n' && t !== 's' && t !== 'b' && t !== 'e') throw new Error('Invalid cell type: ' + t);
-    const o = { t, v: cell.v, f: null, fmt: null };
-    if (cell.fmt !== undefined && cell.fmt !== null && cell.fmt !== 'General') {
-        if (typeof cell.fmt !== 'string' || !cell.fmt || cell.fmt.length > 255 || /[\x00-\x1F]/.test(cell.fmt))
-            throw new Error('Invalid number format: ' + cell.fmt);
-        o.fmt = cell.fmt;
+    let fmt: string | null = null,
+        f: string | null = null;
+    const rawFmt = cell.fmt;
+    if (rawFmt !== undefined && rawFmt !== null && rawFmt !== 'General') {
+        if (typeof rawFmt !== 'string' || !rawFmt || rawFmt.length > 255 || /[\x00-\x1F]/.test(rawFmt))
+            throw new Error('Invalid number format: ' + String(rawFmt));
+        fmt = rawFmt;
     }
-    if (cell.f !== undefined && cell.f !== null && cell.f !== '') o.f = normFormula(cell.f);
-    const hasV = cell.v !== undefined && cell.v !== null;
-    if (!hasV && !o.f) throw new Error('Cell value missing');
-    if (hasV) {
-        if (t === 'n') {
-            const n = typeof cell.v === 'number' ? cell.v : Number(cell.v);
+    if (cell.f !== undefined && cell.f !== null && cell.f !== '') f = normFormula(cell.f);
+    const raw = cell.v;
+    const hasV = raw !== undefined && raw !== null;
+    if (!hasV && !f) throw new Error('Cell value missing');
+    // without a value the original null/undefined is carried through
+    const none = raw === null ? null : undefined;
+    if (t === 'n') {
+        let v: number | null | undefined = none;
+        if (hasV) {
+            const n = typeof raw === 'number' ? raw : Number(raw);
             if (!isFinite(n)) {
-                if (o.f) o.v = undefined;
-                else throw new Error('Invalid number value: ' + cell.v);
-            } else o.v = n;
-        } else if (t === 's') o.v = checkStr(String(cell.v));
-        else if (t === 'b') o.v = !!cell.v;
-        else if (!ERRORS.has(String(cell.v))) {
-            if (o.f) o.v = undefined;
-            else throw new Error('Invalid error value: ' + cell.v);
-        } else o.v = String(cell.v);
+                if (f) v = undefined;
+                else throw new Error('Invalid number value: ' + String(raw));
+            } else v = n;
+        }
+        return { t, v, f, fmt };
     }
-    return o;
+    if (t === 's') return { t, v: hasV ? checkStr(String(raw)) : none, f, fmt };
+    if (t === 'b') return { t, v: hasV ? !!raw : none, f, fmt };
+    let v: string | null | undefined = none;
+    if (hasV) {
+        if (!ERRORS.has(String(raw))) {
+            if (f) v = undefined;
+            else throw new Error('Invalid error value: ' + String(raw));
+        } else v = String(raw);
+    }
+    return { t, v, f, fmt };
 }
-function buildCellU(ref, s, cell) {
+function buildCellU(ref: string, s: string | number | null | undefined, cell: NormCell | null) {
     const sa = s !== null && s !== undefined ? ' s="' + s + '"' : '';
     if (cell === null) return sa ? '<c r="' + ref + '"' + sa + '/>' : '';
     const hasV = cell.v !== undefined && cell.v !== null;
@@ -539,14 +684,14 @@ function buildCellU(ref, s, cell) {
                 '"' +
                 sa +
                 ' t="inlineStr"><is><t xml:space="preserve">' +
-                escapeText(cell.v) +
+                escapeText(String(cell.v)) +
                 '</t></is></c>'
             );
     }
 }
 
 // ---- styles.xml patching: derive cellXfs entries that differ only by number format ----
-const BUILTIN_IDS = {
+const BUILTIN_IDS: Record<string, number> = {
     General: 0,
     0: 1,
     '0.00': 2,
@@ -569,49 +714,51 @@ const BUILTIN_IDS = {
 };
 const DEFAULT_XF = '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>';
 
-function createStyler(files, wbKey, rels) {
-    let path = null;
+function createStyler(files: Files, wbKey: string, rels: Relationship[]): Styler {
+    let path: string | null = null;
     for (const r of rels)
         if (/\/styles$/.test(r.type) && r.mode !== 'External') {
             path = resolveTarget(dirOf(wbKey), r.target);
             break;
         }
-    const key = findFile(files, path || 'xl/styles.xml');
-    if (!key) throw new Error('styles.xml not found; cannot save number formats');
+    const found = findFile(files, path || 'xl/styles.xml');
+    if (!found) throw new Error('styles.xml not found; cannot save number formats');
+    const key: string = found; // finalize() is hoisted, where the narrowing above does not apply
     let xml = decodeXml(files[key], key);
     const rm = /<((?:[\w.-]+:)?)styleSheet[\s>]/.exec(xml);
     if (!rm) throw new Error('styles.xml is not a style sheet');
     const pre = rm[1];
+    const rmIndex = rm.index;
     const xfOpen = new RegExp('<' + pre + 'cellXfs\\b[^>]*>'),
         nfOpen = new RegExp('<' + pre + 'numFmts\\b[^>]*>');
     const xfClose = '</' + pre + 'cellXfs>',
         nfClose = '</' + pre + 'numFmts>';
     // number formats
-    const codes = new Map();
+    const codes = new Map<string, number>();
     let maxId = 163,
         nfCount = 0;
     const nm = nfOpen.exec(xml);
     if (nm && xml.charCodeAt(nm.index + nm[0].length - 2) !== 47) {
         const body = xml.slice(nm.index, xml.indexOf(nfClose, nm.index));
         const re = new RegExp('<' + pre + 'numFmt\\b[^>]*>', 'g');
-        let m;
+        let m: RegExpExecArray | null;
         while ((m = re.exec(body))) {
             const a = parseAttrs(m[0]);
             nfCount++;
-            const id = parseInt(a.numFmtId, 10);
+            const id = parseInt(String(a.numFmtId), 10);
             if (id > maxId) maxId = id;
             if (a.formatCode !== undefined && !codes.has(a.formatCode)) codes.set(a.formatCode, id);
         }
     }
-    const newFmts = [];
+    const newFmts: string[] = [];
     // cellXfs
-    const xfs = [];
+    const xfs: string[] = [];
     const xm = xfOpen.exec(xml);
     if (xm && xml.charCodeAt(xm.index + xm[0].length - 2) !== 47) {
         const end = xml.indexOf(xfClose, xm.index);
         const body = xml.slice(xm.index + xm[0].length, end < 0 ? xml.length : end);
         const re = new RegExp('<' + pre + 'xf\\b', 'g');
-        let m;
+        let m: RegExpExecArray | null;
         while ((m = re.exec(body))) {
             const gt = body.indexOf('>', m.index);
             const e = body.charCodeAt(gt - 1) === 47 ? gt + 1 : body.indexOf('</' + pre + 'xf>', gt) + pre.length + 5;
@@ -621,15 +768,15 @@ function createStyler(files, wbKey, rels) {
     }
     const baseCount = xfs.length;
     if (!xfs.length) xfs.push(pre ? DEFAULT_XF.replace('<xf', '<' + pre + 'xf') : DEFAULT_XF);
-    const known = new Map();
+    const known = new Map<string, number>();
     xfs.forEach((x, i) => {
         if (!known.has(x)) known.set(x, i);
     });
-    const cache = new Map();
+    const cache = new Map<string, number>();
     const nfAttr = /\snumFmtId\s*=\s*(?:"[^"]*"|'[^']*')/,
         apAttr = /\sapplyNumberFormat\s*=\s*(?:"[^"]*"|'[^']*')/;
 
-    function fmtId(code) {
+    function fmtId(code: string) {
         const b = BUILTIN_IDS[code];
         if (b !== undefined) return b;
         let id = codes.get(code);
@@ -640,7 +787,7 @@ function createStyler(files, wbKey, rels) {
         }
         return id;
     }
-    function derive(base, code) {
+    function derive(base: number, code: string) {
         const ck = base + '|' + code;
         let idx = cache.get(ck);
         if (idx !== undefined) return idx;
@@ -697,7 +844,7 @@ function createStyler(files, wbKey, rels) {
         if (newFmts.length) {
             const m = nfOpen.exec(xml);
             if (!m) {
-                const gt = xml.indexOf('>', rm.index);
+                const gt = xml.indexOf('>', rmIndex);
                 xml =
                     xml.slice(0, gt + 1) +
                     '<' +
@@ -734,10 +881,10 @@ function createStyler(files, wbKey, rels) {
 }
 
 // ---- table header edits: keep <tableColumn name> in sync with the header cells ----
-function patchTables(files, sheetKey, rowsMap, sheetName) {
+function patchTables(files: Files, sheetKey: string, rowsMap: RowsMap, sheetName: string) {
     const rk = findFile(files, dirOf(sheetKey) + '/_rels/' + baseOf(sheetKey) + '.rels');
     if (!rk) return [];
-    const out = [];
+    const out: RewrittenPart[] = [];
     for (const rel of readRels(files, rk)) {
         if (!/\/table$/.test(rel.type) || rel.mode === 'External') continue;
         const tk = findFile(files, resolveTarget(dirOf(sheetKey), rel.target));
@@ -748,13 +895,13 @@ function patchTables(files, sheetKey, rowsMap, sheetName) {
         const ta = parseAttrs(tm[0]);
         const rg = ta.ref ? parseRange(ta.ref) : null;
         const hdr = ta.headerRowCount === undefined ? 1 : parseInt(ta.headerRowCount, 10);
-        if (!rg || !(hdr >= 1) || !rowsMap.has(rg.r1)) continue;
-        const row = rowsMap.get(rg.r1);
+        const row = rg ? rowsMap.get(rg.r1) : undefined;
+        if (!rg || !(hdr >= 1) || row === undefined) continue;
         const tcRe = /<(?:[\w.-]+:)?tableColumn\b[^>]*>/g;
-        const cols = [];
-        let m;
+        const cols: { at: number; tag: string; name: string | undefined }[] = [];
+        let m: RegExpExecArray | null;
         while ((m = tcRe.exec(xml))) cols.push({ at: m.index, tag: m[0], name: parseAttrs(m[0]).name });
-        const renamed = [];
+        const renamed: { col: (typeof cols)[number]; from: string | undefined; to: string }[] = [];
         for (const [c, cell] of row) {
             if (c < rg.c1 || c > rg.c2) continue;
             const where = colName(c - 1) + rg.r1 + ' on ' + sheetName;
@@ -774,32 +921,33 @@ function patchTables(files, sheetKey, rowsMap, sheetName) {
         if (!renamed.length) continue;
         const names = cols.map(x => x.name);
         for (const r of renamed) names[cols.indexOf(r.col)] = r.to;
-        const seen = new Set();
+        const seen = new Set<string>();
         for (const n of names) {
             const k = String(n).toLowerCase();
             if (seen.has(k))
-                throw new Error('Table header names must be unique ("' + n + '" is used twice on ' + sheetName + ')');
+                throw new Error(
+                    'Table header names must be unique ("' + String(n) + '" is used twice on ' + sheetName + ')'
+                );
             seen.add(k);
         }
         let res = '',
-            last = 0,
-            y = xml;
+            last = 0;
         for (const r of renamed) {
             const nt = r.col.tag.replace(
                 /(\sname\s*=\s*)(?:"[^"]*"|'[^']*')/,
-                (mm, a) => a + '"' + escapeXml(r.to).replace(/\r?\n/g, '_x000a_') + '"'
+                (_mm: string, a: string) => a + '"' + escapeXml(r.to).replace(/\r?\n/g, '_x000a_') + '"'
             );
             res += xml.slice(last, r.col.at) + nt;
             last = r.col.at + r.col.tag.length;
         }
-        y = res + xml.slice(last);
+        let y = res + xml.slice(last);
         const swaps = renamed.filter(r => r.from);
         if (swaps.length && y.indexOf('calculatedColumnFormula') >= 0) {
             y = y.replace(
                 /(<(?:[\w.-]+:)?calculatedColumnFormula\b[^>]*>)([\s\S]*?)(<\/(?:[\w.-]+:)?calculatedColumnFormula>)/g,
-                (mm, a, b, c) => {
+                (_mm: string, a: string, b: string, c: string) => {
                     for (const r of swaps)
-                        b = b.split('[' + escapeFormula(r.from) + ']').join('[' + escapeFormula(r.to) + ']');
+                        b = b.split('[' + escapeFormula(String(r.from)) + ']').join('[' + escapeFormula(r.to) + ']');
                     return a + b + c;
                 }
             );
@@ -813,25 +961,32 @@ function patchTables(files, sheetKey, rowsMap, sheetName) {
 const AFTER_SHEETDATA =
     /<(?:sheetCalcPr|sheetProtection|protectedRanges|scenarios|autoFilter|sortState|dataConsolidate|customSheetViews|mergeCells|phoneticPr|conditionalFormatting|dataValidations|hyperlinks|printOptions|pageMargins|pageSetup|headerFooter|rowBreaks|colBreaks|customProperties|cellWatches|ignoredErrors|smartTags|drawing|legacyDrawing|legacyDrawingHF|drawingHF|picture|oleObjects|controls|webPublishItems|tableParts)[\s/>]/;
 
-function parseCols(head) {
-    const out = [];
+function parseCols(head: string) {
+    const out: { min: number; max: number; style: string }[] = [];
     const a = head.indexOf('<cols>'),
         b = head.indexOf('</cols>');
     if (a < 0 || b < 0) return out;
     const re = /<col\b[^>]*>/g;
     const reg = head.slice(a, b);
-    let m;
+    let m: RegExpExecArray | null;
     while ((m = re.exec(reg))) {
         const at = parseAttrs(m[0]);
-        if (at.style !== undefined) out.push({ min: +at.min, max: +at.max, style: at.style });
+        if (at.style !== undefined) out.push({ min: +String(at.min), max: +String(at.max), style: at.style });
     }
     return out;
 }
 
 // xml is a latin1 "binary string" (1 char = 1 byte) so offsets are byte offsets; returns a parts list
 // (binary strings and [from, to) byte ranges of the original) or null when nothing changed.
-function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
-    const buildCell = (ref, s, cl) => strToBin(buildCellU(ref, s, cl));
+function patchSheetXml(
+    xml: string,
+    rowsMap: RowsMap,
+    bbox: A1Range | null,
+    sheetName: string,
+    derive: (base: number, code: string) => number
+): SheetPart[] | null {
+    const buildCell = (ref: string, s: string | null | undefined, cl: NormCell | null) =>
+        strToBin(buildCellU(ref, s, cl));
     const hs = xml.slice(0, 4096);
     if (/<[A-Za-z_][\w.-]*:worksheet[\s>]/.test(hs))
         throw new Error('Prefixed worksheet XML (' + sheetName + ') is not supported for editing');
@@ -839,8 +994,8 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
 
     // locate sheetData
     let sdStart = -1,
-        gt = -1,
-        selfClosed = false,
+        gt: number,
+        selfClosed: boolean,
         openTag = '<sheetData>';
     for (let p = 0; ;) {
         const i = xml.indexOf('<sheetData', p);
@@ -852,7 +1007,7 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
         }
         p = i + 10;
     }
-    let dataStart, dataEnd;
+    let dataStart: number, dataEnd: number;
     if (sdStart < 0) {
         let at = xml.search(AFTER_SHEETDATA);
         if (at < 0) at = xml.lastIndexOf('<extLst');
@@ -885,43 +1040,43 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
 
     const erows = Array.from(rowsMap.keys()).sort((a, b) => a - b);
     let ep = 0;
-    const parts = [];
+    const parts: SheetPart[] = [];
     let head = xml.slice(0, sdStart);
     head = fixDimension(head, bbox, !hasRows);
     parts.push(head, openTag);
 
-    let colStyles = null;
-    const colStyle = c => {
+    let colStyles: ReturnType<typeof parseCols> | null = null;
+    const colStyle = (c: number) => {
         if (colStyles === null) colStyles = parseCols(head);
         for (const s of colStyles) if (c >= s.min && c <= s.max) return s.style;
         return null;
     };
-    const sFor = (s, cell) =>
+    const sFor = (s: string | null | undefined, cell: NormCell | null) =>
         cell !== null && cell.fmt
             ? String(derive(s === null || s === undefined ? 0 : parseInt(s, 10) || 0, cell.fmt))
             : s;
-    const killed = new Map();
-    const killRanges = [];
+    const killed = new Map<string, { text: string; mr: number; mc: number }>();
+    const killRanges: A1Range[] = [];
     let killMin = Infinity,
         killMax = -1;
-    const inKill = rn => {
+    const inKill = (rn: number) => {
         if (rn < killMin || rn > killMax) return false;
         for (const k of killRanges) if (rn >= k.r1 && rn <= k.r2) return true;
         return false;
     };
-    const sortedCols = cmap => Array.from(cmap.keys()).sort((a, b) => a - b);
+    const sortedCols = (cmap: CellMap) => Array.from(cmap.keys()).sort((a, b) => a - b);
 
-    function newRow(rn, cmap) {
+    function newRow(rn: number, cmap: CellMap) {
         let cells = '';
         for (const c of sortedCols(cmap)) {
-            const cl = cmap.get(c);
+            const cl = cmap.get(c) ?? null; // sortedCols only yields existing keys
             cells += buildCell(colName(c - 1) + rn, sFor(colStyle(c), cl), cl);
         }
         return cells ? '<row r="' + rn + '">' + cells + '</row>' : '';
     }
 
     // f element info within a cell slice (offsets relative to the slice), or null
-    function findF(cs) {
+    function findF(cs: string) {
         const fi = cs.indexOf('<f');
         if (fi < 0) return null;
         const ch = cs.charCodeAt(fi + 2);
@@ -932,7 +1087,7 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
         return { fi, fe, tag: cs.slice(fi, fg + 1), text: fsc ? '' : binToStr(cs.slice(fg + 1, fe - 4)) };
     }
 
-    function rebuildRow(i, rgt, rsc, rowEnd, rn, cmap) {
+    function rebuildRow(i: number, rgt: number, rsc: boolean, rowEnd: number, rn: number, cmap: CellMap | undefined) {
         let open = xml.slice(i, rgt + 1);
         const rtag = xml.slice(i, rgt),
             rowS = attr(rtag, 's'),
@@ -947,8 +1102,8 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
             dirty = false,
             prevCol = 0;
         const end = rsc ? rgt + 1 : rowEnd - 6;
-        const emitNew = c => {
-            const cl = cmap.get(c);
+        const emitNew = (c: number) => {
+            const cl = cmap?.get(c) ?? null; // only called while cols (hence cmap) exist
             const s = buildCell(colName(c - 1) + rn, sFor(rowStyle !== null ? rowStyle : colStyle(c), cl), cl);
             if (s) {
                 out.push(s);
@@ -974,7 +1129,7 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
             prevCol = col;
             while (cols && ci < cols.length && cols[ci] < col) emitNew(cols[ci++]);
             if (cols && ci < cols.length && cols[ci] === col) {
-                const ed = cmap.get(col);
+                const ed = cmap?.get(col) ?? null; // cols non-null implies cmap exists
                 ci++;
                 const cs = csc ? '' : xml.slice(j, cend);
                 if (cs.indexOf('shared') >= 0) {
@@ -984,7 +1139,7 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
                             si = fa.si;
                         if (si !== undefined && !killed.has(si)) {
                             const ra = fa.ref;
-                            const rg = ra ? parseRange(ra) : { r1: rn, c1: col, r2: MAXR, c2: MAXC };
+                            const rg: A1Range = ra ? parseRange(ra) : { r1: rn, c1: col, r2: MAXR, c2: MAXC };
                             killed.set(si, { text: unescapeXml(f.text), mr: rn, mc: col });
                             killRanges.push(rg);
                             killMin = Math.min(killMin, rg.r1);
@@ -1006,7 +1161,7 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
                 const f = cs.indexOf('shared') >= 0 ? findF(cs) : null;
                 if (f && /\st\s*=\s*["']shared["']/.test(f.tag)) {
                     const si = parseAttrs(f.tag).si,
-                        k = killed.get(si);
+                        k = si === undefined ? undefined : killed.get(si);
                     if (k) {
                         const txt = shiftFormula(k.text, rn - k.mr, col - k.mc);
                         out.push(cs.slice(0, f.fi) + '<f>' + strToBin(escapeFormula(txt)) + '</f>' + cs.slice(f.fe));
@@ -1035,12 +1190,12 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
     // gallop over untouched rows: binary-search the byte range for the last row numbered below the next edit
     let canJump = true,
         needJump = true;
-    const rowNo = q => {
+    const rowNo = (q: number) => {
         const g = xml.indexOf('>', q);
         const a = g < 0 ? null : attr(xml.slice(q, g), 'r');
         return a === null ? -1 : parseInt(a, 10);
     };
-    const jump = (from, t) => {
+    const jump = (from: number, t: number) => {
         let lo = from,
             hi = dataEnd,
             best = -1;
@@ -1073,7 +1228,7 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
         }
         return best < 0 ? from : best;
     };
-    const flush = i => {
+    const flush = (i: number) => {
         if (i > copyFrom) {
             parts.push([copyFrom, i]);
             copyFrom = i;
@@ -1096,7 +1251,7 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
         const rn = ra !== null ? parseInt(ra, 10) : lastRn + 1;
         lastRn = rn;
         while (ep < erows.length && erows[ep] < rn) {
-            const s = newRow(erows[ep], rowsMap.get(erows[ep]));
+            const s = newRow(erows[ep], rowsMap.get(erows[ep]) ?? new Map<number, NormCell | null>());
             ep++;
             if (s) {
                 flush(i);
@@ -1106,7 +1261,7 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
             needJump = true;
         }
         const rsc = xml.charCodeAt(rgt - 1) === 47;
-        let cmap;
+        let cmap: CellMap | undefined;
         if (ep < erows.length && erows[ep] === rn) {
             cmap = rowsMap.get(rn);
             ep++;
@@ -1126,7 +1281,7 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
     }
     flush(dataEnd);
     while (ep < erows.length) {
-        const s = newRow(erows[ep], rowsMap.get(erows[ep]));
+        const s = newRow(erows[ep], rowsMap.get(erows[ep]) ?? new Map<number, NormCell | null>());
         ep++;
         if (s) {
             parts.push(s);
@@ -1139,27 +1294,22 @@ function patchSheetXml(xml, rowsMap, bbox, sheetName, derive) {
     return parts;
 }
 
-function checkArrays(xml, rowsMap, sheetName) {
+function checkArrays(xml: string, rowsMap: RowsMap, sheetName: string) {
     const re = /<f\b[^>]*\st\s*=\s*["']array["'][^>]*>/g;
-    const arrays = [];
-    let m;
+    const arrays: (A1Range & { mr: number; mc: number; text: string })[] = [];
+    let m: RegExpExecArray | null;
     while ((m = re.exec(xml))) {
         const cs = xml.lastIndexOf('<c', m.index);
         if (cs < 0) continue;
         const ref = attr(xml.slice(cs, xml.indexOf('>', cs)), 'r');
         const fa = parseAttrs(m[0]);
         if (!ref || !fa.ref) continue;
-        const rg = parseRange(fa.ref);
-        rg.mr = rowOfRef(ref);
-        rg.mc = colOfRef(ref);
-        rg.text = fa.ref;
-        arrays.push(rg);
+        arrays.push({ ...parseRange(fa.ref), mr: rowOfRef(ref), mc: colOfRef(ref), text: fa.ref });
     }
     if (!arrays.length) return;
-    const hit = (r, c) => {
+    const hit = (r: number, c: number) => {
         for (const a of arrays) {
-            if (r < a.r1 || r > a.r2 || c < a.c1 || c > a.c2 || (rowsMap.has(a.mr) && rowsMap.get(a.mr).has(a.mc)))
-                continue;
+            if (r < a.r1 || r > a.r2 || c < a.c1 || c > a.c2 || rowsMap.get(a.mr)?.has(a.mc)) continue;
             throw new Error(
                 'Cannot change part of an array formula: ' +
                     colName(c - 1) +
@@ -1178,7 +1328,7 @@ function checkArrays(xml, rowsMap, sheetName) {
     for (const [r, cm] of rowsMap) for (const c of cm.keys()) hit(r, c);
 }
 
-function fixDimension(head, bbox, empty) {
+function fixDimension(head: string, bbox: A1Range | null, empty: boolean) {
     const i = head.indexOf('<dimension');
     if (i < 0 || !bbox) return head;
     const gt = head.indexOf('>', i);
@@ -1202,7 +1352,7 @@ function fixDimension(head, bbox, empty) {
 }
 
 // ---- workbook-level ----
-function setFullCalc(wb) {
+function setFullCalc(wb: string) {
     const re = /<((?:[\w.-]+:)?)calcPr\b([^>]*?)(\/?)>/;
     const m = re.exec(wb);
     if (m) {
@@ -1226,14 +1376,14 @@ function setFullCalc(wb) {
     return wb.slice(0, at) + el + wb.slice(at);
 }
 
-function dropCalcChain(files, wbKey, rels) {
-    const paths = new Set();
+function dropCalcChain(files: Files, wbKey: string, rels: Relationship[]) {
+    const paths = new Set<string>();
     for (const r of rels)
         if (/\/calcChain$/.test(r.type) || /(^|\/)calcChain\.xml$/i.test(r.target))
             paths.add(resolveTarget(dirOf(wbKey), r.target));
     const dflt = findFile(files, 'xl/calcChain.xml');
     if (dflt) paths.add(dflt);
-    const found = [];
+    const found: string[] = [];
     for (const p of paths) {
         const k = findFile(files, p);
         if (k) {
@@ -1268,13 +1418,13 @@ function dropCalcChain(files, wbKey, rels) {
         if (y !== x) files[rk] = enc(y);
     }
 }
-const enc = s => new TextEncoder().encode(s);
+const enc = (s: string) => new TextEncoder().encode(s);
 
 // ---- binary-string helpers (latin1: 1 char = 1 byte) ----
 const MAXSTR = 0x1fffffe8;
 const TOO_BIG = 'sheet too large to edit';
 const ZIP_BOMB = 'File is too large or looks like a zip bomb';
-const ZL = () =>
+const ZL = (): ZipLimits =>
     Object.assign(
         {
             maxEntries: 100000,
@@ -1287,21 +1437,20 @@ const ZL = () =>
         zipLimits
     );
 const bombErr = () => {
-    const e = new Error(ZIP_BOMB);
+    const e: CodedError = new Error(ZIP_BOMB);
     e.code = 'ZIPBOMB';
     return e;
 };
-function latin1(u8) {
-    if (typeof Buffer !== 'undefined')
-        return Buffer.from(u8.buffer, u8.byteOffset, u8.length).latin1Slice(0, u8.length);
+function latin1(u8: Uint8Array) {
+    if (typeof Buffer !== 'undefined') return Buffer.from(u8.buffer, u8.byteOffset, u8.length).toString('latin1');
     let s = '';
-    for (let i = 0; i < u8.length; i += 16384) s += String.fromCharCode.apply(null, u8.subarray(i, i + 16384));
+    for (let i = 0; i < u8.length; i += 16384) s += String.fromCharCode(...u8.subarray(i, i + 16384));
     return s;
 }
-function strToBin(s) {
+function strToBin(s: string) {
     return /[^\x00-\x7f]/.test(s) ? latin1(enc(s)) : s;
 }
-function binToStr(s) {
+function binToStr(s: string) {
     if (!/[\x80-\xff]/.test(s)) return s;
     const u = new Uint8Array(s.length);
     for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);
@@ -1309,8 +1458,8 @@ function binToStr(s) {
 }
 
 // ---- crc32 (slice-by-8) ----
-let CRC_T = null;
-function crc32(c, b, i, end) {
+let CRC_T: Int32Array | null = null;
+function crc32(c: number, b: Uint8Array, i: number, end: number) {
     if (!CRC_T) {
         CRC_T = new Int32Array(2048);
         for (let n = 0; n < 256; n++) {
@@ -1344,12 +1493,12 @@ function crc32(c, b, i, end) {
 }
 
 // ---- zip container: central-directory reader / raw-copy writer ----
-const u16 = (b, o) => b[o] | (b[o + 1] << 8);
-const u32 = (b, o) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
-const u64 = (b, o) => u32(b, o) + u32(b, o + 4) * 4294967296;
-const badZip = m => new Error('Corrupt or unsupported zip: ' + m);
+const u16 = (b: Uint8Array, o: number) => b[o] | (b[o + 1] << 8);
+const u32 = (b: Uint8Array, o: number) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
+const u64 = (b: Uint8Array, o: number) => u32(b, o) + u32(b, o + 4) * 4294967296;
+const badZip = (m: string) => new Error('Corrupt or unsupported zip: ' + m);
 
-function zipName(nb, flag) {
+function zipName(nb: Uint8Array, flag: number) {
     let ascii = true;
     for (let i = 0; i < nb.length; i++)
         if (nb[i] > 127) {
@@ -1365,7 +1514,7 @@ function zipName(nb, flag) {
     }
 }
 
-function readZip(b) {
+function readZip(b: Uint8Array) {
     const n = b.length;
     let eo = -1;
     for (let i = n - 22, lim = Math.max(0, n - 22 - 65535); i >= lim; i--) {
@@ -1399,7 +1548,7 @@ function readZip(b) {
             cdOff = alt;
         } else if (cnt) throw badZip('bad central directory offset');
     }
-    const ents = [],
+    const ents: ZipEntry[] = [],
         LM = ZL();
     let p = cdOff,
         declared = 0;
@@ -1410,7 +1559,7 @@ function readZip(b) {
             el = u16(b, p + 30),
             cl = u16(b, p + 32);
         if (p + 46 + nl + el + cl > n) throw badZip('truncated central directory');
-        const e = {
+        const e: ZipEntry = {
             madeBy: u16(b, p + 4),
             need: u16(b, p + 6),
             flag: u16(b, p + 8),
@@ -1425,7 +1574,7 @@ function readZip(b) {
             lho: u32(b, p + 42),
             nameBytes: b.subarray(p + 46, p + 46 + nl),
             comment: b.subarray(p + 46 + nl + el, p + 46 + nl + el + cl),
-            extra: null,
+            extra: [],
             cache: undefined,
             mod: undefined,
             name: ''
@@ -1433,7 +1582,7 @@ function readZip(b) {
         e.name = zipName(e.nameBytes, e.flag);
         // extra fields: zip64 values are folded in; the rest is kept when well formed
         const ex = b.subarray(p + 46 + nl, p + 46 + nl + el);
-        const keep = [];
+        const keep: Uint8Array[] = [];
         let ok = true;
         for (let q = 0; q < ex.length;) {
             if (q + 4 > ex.length) {
@@ -1470,7 +1619,7 @@ function readZip(b) {
 }
 
 // start of an entry's data, validated against the local header
-function dataStart(b, e) {
+function dataStart(b: Uint8Array, e: ZipEntry) {
     const o = e.lho;
     if (o + 30 > b.length || u32(b, o) !== 0x04034b50) throw badZip('bad local header for ' + e.name);
     const ds = o + 30 + u16(b, o + 26) + u16(b, o + 28);
@@ -1478,7 +1627,7 @@ function dataStart(b, e) {
     return ds;
 }
 
-function inflateEntry(b, e) {
+function inflateEntry(b: Uint8Array, e: ZipEntry) {
     if (e.flag & 1) throw new Error('Encrypted zip entry: ' + e.name);
     if (e.method !== 0 && e.method !== 8)
         throw new Error('Unsupported zip compression method ' + e.method + ' for ' + e.name);
@@ -1489,10 +1638,10 @@ function inflateEntry(b, e) {
     const LM = ZL();
     const limit = /(^|\/)worksheets\/[^/]*\.xml$/i.test(e.name) ? Math.min(LM.maxSheet, MAXSTR * 2) : LM.maxPart;
     if (e.usize > limit) throw limit === MAXSTR * 2 && e.usize <= LM.maxSheet ? new Error(TOO_BIG) : bombErr();
-    const parts = [];
+    const parts: Uint8Array[] = [];
     let got = 0,
         fed = 0;
-    const inf = new writerDeps.Inflate(c => {
+    const inf = new writerDeps.Inflate((c: Uint8Array) => {
         got += c.length;
         if (got > limit || (got > LM.ratioMin && got > LM.ratio * Math.max(1, fed))) throw bombErr();
         parts.push(c);
@@ -1514,9 +1663,10 @@ function inflateEntry(b, e) {
 }
 
 // lazy name -> bytes view of the package (entries are inflated on first read)
-function openZip(b) {
+function openZip(b: Uint8Array) {
     const entries = readZip(b);
-    const files = Object.create(null);
+    // prototype-less on purpose (names like 'constructor'); Object.create is typed any
+    const files = Object.create(null) as Files;
     for (const e of entries) {
         Object.defineProperty(files, e.name, {
             enumerable: true,
@@ -1524,7 +1674,7 @@ function openZip(b) {
             get() {
                 return e.mod !== undefined ? e.mod : e.cache !== undefined ? e.cache : (e.cache = inflateEntry(b, e));
             },
-            set(v) {
+            set(v: Uint8Array) {
                 e.mod = v;
             }
         });
@@ -1533,12 +1683,16 @@ function openZip(b) {
 }
 
 // piece = binary string | Uint8Array | [from, to) range of base. Returns raw-deflated data, crc, size.
-function packParts(parts, base, level) {
+function packParts(
+    parts: readonly Piece[],
+    base: Uint8Array,
+    level: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9
+): PackedPart {
     const F = fflate;
-    const out = [];
+    const out: Uint8Array[] = [];
     let olen = 0;
     const d = new F.Deflate({ level });
-    d.ondata = c => {
+    d.ondata = (c: Uint8Array) => {
         out.push(c);
         olen += c.length;
     };
@@ -1546,7 +1700,7 @@ function packParts(parts, base, level) {
         usize = 0,
         buf = new Uint8Array(1 << 20),
         bl = 0;
-    const push = u => {
+    const push = (u: Uint8Array) => {
         crc = crc32(crc, u, 0, u.length);
         usize += u.length;
         d.push(u, false);
@@ -1558,7 +1712,7 @@ function packParts(parts, base, level) {
             bl = 0;
         }
     };
-    const put = u => {
+    const put = (u: Uint8Array) => {
         if (u.length < 65536) {
             if (bl + u.length > buf.length) flushBuf();
             buf.set(u, bl);
@@ -1593,11 +1747,11 @@ function packParts(parts, base, level) {
     return { data, crc: (crc ^ -1) >>> 0, usize };
 }
 
-function w16(b, o, v) {
+function w16(b: Uint8Array, o: number, v: number) {
     b[o] = v & 255;
     b[o + 1] = (v >>> 8) & 255;
 }
-function w32(b, o, v) {
+function w32(b: Uint8Array, o: number, v: number) {
     b[o] = v & 255;
     b[o + 1] = (v >>> 8) & 255;
     b[o + 2] = (v >>> 16) & 255;
@@ -1605,13 +1759,13 @@ function w32(b, o, v) {
 }
 
 // order: entries to emit; repl: Map(entry -> packed) for rewritten ones, the rest are copied as raw compressed bytes
-function writeZip(src, order, repl) {
+function writeZip(src: Uint8Array, order: ZipEntry[], repl: Map<ZipEntry, PackedPart>) {
     const LIM = 0xffffffff;
-    const pieces = [],
-        central = [];
+    const pieces: Uint8Array[] = [],
+        central: Uint8Array[] = [];
     let pos = 0,
         cdSize = 0;
-    const push = u => {
+    const push = (u: Uint8Array) => {
         if (u.length) {
             pieces.push(u);
             pos += u.length;
@@ -1620,13 +1774,13 @@ function writeZip(src, order, repl) {
     for (const e of order) {
         const rp = repl.get(e);
         const nb = e.nameBytes;
-        let flag,
-            method,
-            crc,
-            csize,
-            usize,
-            body,
-            hdr = null;
+        let flag: number,
+            method: number,
+            crc: number,
+            csize: number,
+            usize: number,
+            body: Uint8Array,
+            hdr: Uint8Array | null = null;
         const off = pos;
         if (rp) {
             flag = e.flag & 0x800;
@@ -1735,17 +1889,27 @@ function writeZip(src, order, repl) {
     return out;
 }
 
+// latin1 view of a part; a string too long for the engine is reported as an oversized sheet
+function toBinary(base: Uint8Array) {
+    try {
+        return latin1(base);
+    } catch (e) {
+        if (e instanceof RangeError) throw new Error(TOO_BIG, { cause: e });
+        throw e;
+    }
+}
+
 // ---- public API ----
-function patchXlsxSheets(original, editsBySheet, options) {
+function patchXlsxSheets(original: Uint8Array, editsBySheet: EditsBySheet, options?: PatchOptions | null): Uint8Array {
     options = options || {};
     const idxs = Object.keys(editsBySheet)
         .map(Number)
         .sort((a, b) => a - b);
     // validate and normalize before touching anything
-    const norm = new Map();
+    const norm = new Map<number, RowsMap>();
     for (const si of idxs) {
         if (!Number.isInteger(si) || si < 0) throw new Error('Invalid sheet index ' + si);
-        const rows = new Map();
+        const rows: RowsMap = new Map();
         for (const e of editsBySheet[si]) {
             if (
                 !e ||
@@ -1756,10 +1920,10 @@ function patchXlsxSheets(original, editsBySheet, options) {
                 e.r >= MAXR ||
                 e.c >= MAXC
             )
-                throw new Error('Cell out of range: r=' + (e && e.r) + ' c=' + (e && e.c));
+                throw new Error('Cell out of range: r=' + String(e && e.r) + ' c=' + String(e && e.c));
             const cell = normCell(e.cell === undefined ? null : e.cell);
             let rm = rows.get(e.r + 1);
-            if (!rm) rows.set(e.r + 1, (rm = new Map()));
+            if (!rm) rows.set(e.r + 1, (rm = new Map<number, NormCell | null>()));
             rm.set(e.c + 1, cell);
         }
         if (rows.size) norm.set(si, rows);
@@ -1768,13 +1932,15 @@ function patchXlsxSheets(original, editsBySheet, options) {
 
     const zip = openZip(original);
     const files = zip.files;
-    const entryOf = new Map();
+    const entryOf = new Map<string, ZipEntry>();
     for (const e of zip.entries) entryOf.set(e.name, e);
     const info = locateSheets(files);
-    const sheetPacked = new Map();
-    let styler = null,
-        changed = false;
-    const derive = (base, code) => (styler || (styler = createStyler(files, info.wbKey, info.rels))).derive(base, code);
+    const sheetPacked = new Map<string, PackedPart>();
+    // boxed: assigned from a closure, which flow analysis cannot see
+    const styler: { current: Styler | null } = { current: null };
+    let changed = false;
+    const derive = (base: number, code: string) =>
+        (styler.current || (styler.current = createStyler(files, info.wbKey, info.rels))).derive(base, code);
     for (const [si, rowsMap] of norm) {
         if (si >= info.sheets.length) throw new Error('Sheet index out of range: ' + si);
         const sh = info.sheets[si];
@@ -1796,31 +1962,24 @@ function patchXlsxSheets(original, editsBySheet, options) {
         const bbox = r2 ? { r1, c1, r2, c2 } : null;
         const tables = patchTables(files, key, rowsMap, sh.name || String(si));
         const ent = entryOf.get(key);
+        if (ent === undefined) throw new Error('Worksheet part not found for sheet ' + si);
         if (ent.method === 8 && ent.usize > MAXSTR) throw new Error(TOO_BIG);
-        let base = files[key];
+        const base = files[key];
         if (base.length > MAXSTR) throw new Error(TOO_BIG);
         if (base.length >= 2 && ((base[0] === 0xff && base[1] === 0xfe) || (base[0] === 0xfe && base[1] === 0xff)))
             throw new Error('UTF-16 XML part not supported: ' + key);
-        let bin;
-        try {
-            bin = latin1(base);
-        } catch (e) {
-            if (e instanceof RangeError) throw new Error(TOO_BIG);
-            throw e;
-        }
-        const parts = patchSheetXml(bin, rowsMap, bbox, sh.name || String(si), derive);
-        bin = null;
+        // the binary string is only held by patchSheetXml while it runs
+        const parts = patchSheetXml(toBinary(base), rowsMap, bbox, sh.name || String(si), derive);
         if (parts !== null) {
             sheetPacked.set(key, packParts(parts, base, base.length > 4e6 ? 1 : 6));
             for (const t of tables) files[t.key] = enc(t.xml);
             changed = true;
         }
         ent.cache = undefined;
-        base = null;
     }
     if (!changed) return original;
-    if (styler) {
-        const st = styler.finalize();
+    if (styler.current) {
+        const st = styler.current.finalize();
         files[st.key] = enc(st.xml);
     }
     if (options.fullCalcOnLoad !== false) {
@@ -1828,14 +1987,15 @@ function patchXlsxSheets(original, editsBySheet, options) {
         dropCalcChain(files, info.wbKey, info.rels);
     }
     // emit: [Content_Types].xml first, original order, removed entries dropped, rewritten ones recompressed
-    const repl = new Map(),
-        order = [];
+    const repl = new Map<ZipEntry, PackedPart>(),
+        order: ZipEntry[] = [];
     const ctKey = findFile(files, '[Content_Types].xml');
-    const emit = name => {
+    const emit = (name: string) => {
         const e = entryOf.get(name);
         if (!e || !(name in files)) return;
-        if (sheetPacked.has(name)) repl.set(e, sheetPacked.get(name));
-        else if (e.mod !== undefined) repl.set(e, packParts([e.mod], null, e.mod.length > 4e6 ? 3 : 6));
+        const sp = sheetPacked.get(name);
+        if (sp !== undefined) repl.set(e, sp);
+        else if (e.mod !== undefined) repl.set(e, packParts([e.mod], e.mod, e.mod.length > 4e6 ? 3 : 6));
         order.push(e);
     };
     if (ctKey) emit(ctKey);
@@ -1843,11 +2003,16 @@ function patchXlsxSheets(original, editsBySheet, options) {
     return writeZip(original, order, repl);
 }
 
-function patchXlsx(original, edits, options) {
+function patchXlsx(
+    original: Uint8Array,
+    edits?: readonly CellEdit[] | null,
+    options?: PatchOptions | null
+): Uint8Array {
     if (!(original instanceof Uint8Array)) throw new Error('originalBytes must be a Uint8Array');
-    const by = {};
+    const by: Record<number, SheetEdit[]> = {};
     for (const e of edits || []) {
-        if (!e || !Number.isInteger(e.sheet) || e.sheet < 0) throw new Error('Invalid sheet index ' + (e && e.sheet));
+        if (!e || !Number.isInteger(e.sheet) || e.sheet < 0)
+            throw new Error('Invalid sheet index ' + String(e && e.sheet));
         (by[e.sheet] || (by[e.sheet] = [])).push(e);
     }
     return patchXlsxSheets(original, by, options);

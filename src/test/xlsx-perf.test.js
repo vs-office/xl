@@ -1,10 +1,11 @@
 'use strict';
+const webview = require('./helpers/webview.js');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const OX = {
-    ...require('../webview/core/xlsx-reader.js'),
-    ...require('../webview/core/format.js'),
-    ...require('../webview/core/xlsx-provider.js')
+    ...webview('core/xlsx-reader'),
+    ...webview('core/format'),
+    ...webview('core/xlsx-provider')
 };
 const F = require('./helpers/xlsx-fixtures.js');
 

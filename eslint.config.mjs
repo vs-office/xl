@@ -3,7 +3,7 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 import { importX } from 'eslint-plugin-import-x';
 
-// Legacy JS (webview + tests) keeps the old rule set until each file becomes TS; new ESLint 10 recommended rules are off here only.
+// Legacy JS (tests, scripts) keeps the old rule set until it becomes TS; new ESLint 10 recommended rules are off here only.
 const jsRules = {
     eqeqeq: ['error', 'smart'],
     'no-useless-assignment': 'off',
@@ -32,7 +32,7 @@ export default tseslint.config(
     js.configs.recommended,
     importX.flatConfigs.recommended,
 
-    // Host extension and (soon) everything else: strict, type-aware, no `any` in any form.
+    // Host extension and webview: strict, type-aware, no `any` in any form.
     {
         files: ['src/**/*.ts'],
         extends: [...tseslint.configs.recommendedTypeChecked, importX.flatConfigs.typescript],
@@ -69,26 +69,19 @@ export default tseslint.config(
                 }
             ],
             eqeqeq: ['error', 'always'],
+            // control characters are matched on purpose (XML escaping, number format code checks), as in the JS config
+            'no-control-regex': 'off',
             'no-console': 'error',
             'import-x/no-unresolved': 'off'
         }
     },
 
-    // Webview pages and core modules: ES modules bundled by webpack for the browser (JS until they are converted to TS).
     {
-        files: ['src/webview/**/*.js'],
-        languageOptions: {
-            ecmaVersion: 2022,
-            sourceType: 'module',
-            globals: {
-                ...globals.browser,
-                Buffer: 'readonly',
-                acquireVsCodeApi: 'readonly',
-                __webpack_public_path__: 'writable'
-            }
-        },
-        rules: { ...jsRules, 'no-console': 'off' }
+        // the webview logs timings to the webview devtools console
+        files: ['src/webview/**/*.ts'],
+        rules: { 'no-console': 'off' }
     },
+
     {
         files: ['src/test/**/*.js', 'scripts/**/*.js', 'webpack.config.js'],
         languageOptions: {
