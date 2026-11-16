@@ -8,7 +8,7 @@ tsconfig.json
 webpack.config.js
 data/**
 out/**
-!out/vendor/LICENSE.*
+!src/webview/vendor/LICENSE.*
 scripts/**
 node_modules/**
 CLAUDE.md
@@ -22,6 +22,11 @@ docs/**
 .editorconfig
 .prettierrc.json
 .prettierignore
-eslint.config.js
+eslint.config.mjs
 .github/**
 img/icon-*
+.npmrc
+.gitattributes
+CONTRIBUTING.md
+package-lock.json
+.vscode-test/**

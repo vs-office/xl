@@ -5,7 +5,7 @@ const path = require('path');
 const { minify } = require('terser');
 
 const ROOT = path.resolve(__dirname, '..');
-const SRC = path.join(ROOT, 'out');
+const SRC = path.join(ROOT, 'src', 'webview');
 
 const BUNDLES = {
     excel: [

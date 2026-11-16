@@ -1,26 +1,27 @@
 'use strict';
-import { window, workspace, commands, ExtensionContext, Uri, ViewColumn, TextDocument } from 'vscode';
-import CsvDocumentView from './csvDocumentView';
-import ExcelDocumentView from './excelDocumentView';
-import { documentViewManager } from './documentViewManager';
+import type { ExtensionContext, TextDocument } from 'vscode';
+import { window, workspace, commands, Uri, ViewColumn } from 'vscode';
+import CsvDocumentView from './csv/csvDocumentView';
+import ExcelDocumentView from './excel/excelDocumentView';
+import { documentViewManager } from './common/documentViewManager';
 import { Utils } from 'vscode-uri';
 import { CsvSerializer, ExcelSerializer } from './serializer';
-import { CsvEditorProvider } from './csvEditor';
-import { ExcelEditorProvider } from './excelEditor';
+import { CsvEditorProvider } from './csv/csvEditor';
+import { ExcelEditorProvider } from './excel/excelEditor';
 
 export function activate(context: ExtensionContext) {
     // CSV: Open Preview
-    let csvCommand = commands.registerCommand('csv.preview', uri => {
-        let resource = uri;
-        let viewColumn = getViewColumn();
-        if (!(resource instanceof Uri)) {
-            if (window.activeTextEditor) {
-                resource = window.activeTextEditor.document.uri;
-                viewColumn = window.activeTextEditor.viewColumn;
-            } else {
-                window.showInformationMessage('Open a CSV file first to show a preview.');
-                return;
-            }
+    const csvCommand = commands.registerCommand('csv.preview', (uri: unknown) => {
+        let resource: Uri;
+        let viewColumn: ViewColumn = getViewColumn();
+        if (uri instanceof Uri) {
+            resource = uri;
+        } else if (window.activeTextEditor) {
+            resource = window.activeTextEditor.document.uri;
+            viewColumn = window.activeTextEditor.viewColumn ?? ViewColumn.One;
+        } else {
+            void window.showInformationMessage('Open a CSV file first to show a preview.');
+            return;
         }
         let preview = documentViewManager.find(resource, false);
         if (preview) {
@@ -32,11 +33,13 @@ export function activate(context: ExtensionContext) {
     });
 
     // Excel: Open Preview
-    let excelCommand = commands.registerCommand('excel.preview', uri => {
-        let resource = uri;
-        let viewColumn = getViewColumn();
+    const excelCommand = commands.registerCommand('excel.preview', (uri: unknown) => {
+        const resource = uri;
+        const viewColumn = getViewColumn();
         if (!(resource instanceof Uri)) {
-            window.showInformationMessage('Use the explorer context menu or editor title menu to preview Excel files.');
+            void window.showInformationMessage(
+                'Use the explorer context menu or editor title menu to preview Excel files.'
+            );
             return;
         }
         let preview = documentViewManager.find(resource, false);
@@ -49,16 +52,16 @@ export function activate(context: ExtensionContext) {
     });
 
     // CSV: Clear Preview State
-    let clearCommand = commands.registerCommand('csv.clearState', () => {
-        let preview = documentViewManager.active();
+    const clearCommand = commands.registerCommand('csv.clearState', () => {
+        const preview = documentViewManager.active();
         if (preview) {
             preview.clearState();
         }
     });
 
     // CSV: Refresh
-    let refreshCommand = commands.registerCommand('csv.refresh', () => {
-        let preview = documentViewManager.active();
+    const refreshCommand = commands.registerCommand('csv.refresh', () => {
+        const preview = documentViewManager.active();
         if (preview) {
             preview.userRefresh();
         }
@@ -89,28 +92,28 @@ export function activate(context: ExtensionContext) {
     context.subscriptions.push(
         workspace.onDidOpenTextDocument(document => {
             if (isStdinFile(document)) {
-                commands.executeCommand('csv.preview', document.uri);
+                void commands.executeCommand('csv.preview', document.uri);
             }
         })
     );
 
     // Automatically preview content piped from stdin (when VSCode first starts up)
     if (window.activeTextEditor) {
-        let document = window.activeTextEditor.document;
+        const document = window.activeTextEditor.document;
         if (isStdinFile(document)) {
-            commands.executeCommand('csv.preview', document.uri);
+            void commands.executeCommand('csv.preview', document.uri);
         }
     }
 }
 
 export function deactivate() {}
 
-function isStdinFile(document: TextDocument) {
-    let allowed = <boolean>workspace.getConfiguration('csv-preview').get('openStdin');
-    return allowed && document ? Utils.basename(document.uri).match('code-stdin-[^.]+.txt') : false;
+function isStdinFile(document: TextDocument): boolean {
+    const allowed = workspace.getConfiguration('csv-preview').get<boolean>('openStdin', false);
+    return allowed && new RegExp('code-stdin-[^.]+.txt').test(Utils.basename(document.uri));
 }
 
 function getViewColumn(): ViewColumn {
     const active = window.activeTextEditor;
-    return active ? active.viewColumn : ViewColumn.One;
+    return active?.viewColumn ?? ViewColumn.One;
 }
