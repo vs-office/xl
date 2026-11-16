@@ -64,19 +64,19 @@ jobs:
       - name: Package extension
         run: |
           mkdir -p dist
-          npx vsce package -o "./dist/vxl.vsix"
+          npx vsce package -o "./dist/xlv.vsix"
 
       - name: Attach VSIX to GitHub Release
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" "./dist/vxl.vsix" --clobber
+          gh release upload "${{ github.event.release.tag_name }}" "./dist/xlv.vsix" --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifact for publishing
         uses: actions/upload-artifact@v4
         with:
-          name: vxl-vsix
-          path: ./dist/vxl.vsix
+          name: xlv-vsix
+          path: ./dist/xlv.vsix
 
   # Phase 2: Publish to VS Code Marketplace via OIDC Trusted Publishing
   publish-marketplace:
@@ -100,7 +100,7 @@ jobs:
       - name: Download VSIX artifact
         uses: actions/download-artifact@v4
         with:
-          name: vxl-vsix
+          name: xlv-vsix
           path: dist
 
       - name: Publish to Marketplace
@@ -109,4 +109,4 @@ jobs:
           if [ "${{ github.event.release.prerelease }}" = "true" ]; then
             prerelease_flag="--pre-release"
           fi
-          npx @vscode/vsce publish --oidc --packagePath "./dist/vxl.vsix" $prerelease_flag --skip-duplicate
+          npx @vscode/vsce publish --oidc --packagePath "./dist/xlv.vsix" $prerelease_flag --skip-duplicate
