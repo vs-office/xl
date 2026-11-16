@@ -1,0 +1,112 @@
+# Publish extension to VS Code Marketplace and attach VSIX when a GitHub Release is published.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Phase 1: Build universal VSIX and attach to GitHub Release
+  build:
+    name: Build and attach VSIX
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Parse and validate version
+        id: version
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Tag '${TAG}' does not contain a valid SemVer version (${VERSION})"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version ${VERSION} for release ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync package version
+        run: |
+          node -e '
+            const fs = require("fs");
+            const pkg = require("./package.json");
+            pkg.version = process.env.VERSION;
+            fs.writeFileSync("./package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Package extension
+        run: |
+          mkdir -p dist
+          npx vsce package -o "./dist/vxl.vsix"
+
+      - name: Attach VSIX to GitHub Release
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" "./dist/vxl.vsix" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifact for publishing
+        uses: actions/upload-artifact@v4
+        with:
+          name: vxl-vsix
+          path: ./dist/vxl.vsix
+
+  # Phase 2: Publish to VS Code Marketplace via OIDC Trusted Publishing
+  publish-marketplace:
+    name: Publish to VS Code Marketplace
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download VSIX artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vxl-vsix
+          path: dist
+
+      - name: Publish to Marketplace
+        run: |
+          prerelease_flag=""
+          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+            prerelease_flag="--pre-release"
+          fi
+          npx @vscode/vsce publish --oidc --packagePath "./dist/vxl.vsix" $prerelease_flag --skip-duplicate
