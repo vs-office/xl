@@ -357,9 +357,9 @@
     "lint": "eslint . --max-warnings=0",
     "tsc": "tsc --noEmit",
     "test": "node --test src/test/*.test.js",
-    "compile": "webpack --mode none && node scripts/build-webview.js",
-    "watch": "node scripts/build-webview.js && webpack --mode none --watch",
-    "package": "webpack --mode production && node scripts/build-webview.js",
+    "compile": "webpack --mode none && node scripts/build-styles.js",
+    "watch": "node scripts/build-styles.js && webpack --mode none --watch",
+    "package": "webpack --mode production && node scripts/build-styles.js",
     "vsce-package": "vsce package --no-dependencies -o xl.vsix",
     "vscode:prepublish": "npm run package"
   },
@@ -377,7 +377,6 @@
     "globals": "^17.0.0",
     "prettier": "^3.0.0",
     "process": "^0.11.10",
-    "terser": "^5.0.0",
     "ts-loader": "^9.0.0",
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.0.0",
@@ -386,6 +385,7 @@
     "xlsx": "^0.18.5"
   },
   "dependencies": {
+    "fflate": "^0.8.3",
     "path-browserify": "^1.0.1",
     "vscode-uri": "^3.0.2"
   }

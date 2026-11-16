@@ -1,13 +1,14 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-globalThis.fflate = require('../webview/vendor/fflate.js');
-globalThis.SSF = require('../webview/vendor/ssf.js');
-const OX = require('../webview/core/xlsx-reader.js');
-require('../webview/core/format.js');
-require('../webview/core/xlsx-writer.js');
-require('../webview/core/xlsx-provider.js');
-const fl = globalThis.fflate;
+const fflate = require('fflate');
+const OX = {
+    ...require('../webview/core/xlsx-reader.js'),
+    ...require('../webview/core/format.js'),
+    ...require('../webview/core/xlsx-writer.js'),
+    ...require('../webview/core/xlsx-provider.js')
+};
+const fl = fflate;
 const enc = s => new TextEncoder().encode(s);
 const BOMB = /too large or looks like a zip bomb/;
 

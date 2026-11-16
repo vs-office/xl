@@ -74,39 +74,27 @@ export default tseslint.config(
         }
     },
 
-    // Webview and core modules: plain browser scripts that also load under node for tests (until they become TS modules).
+    // Webview pages and core modules: ES modules bundled by webpack for the browser (JS until they are converted to TS).
     {
         files: ['src/webview/**/*.js'],
         languageOptions: {
             ecmaVersion: 2022,
-            sourceType: 'script',
+            sourceType: 'module',
             globals: {
                 ...globals.browser,
-                module: 'writable',
-                require: 'readonly',
-                OX: 'writable',
                 Buffer: 'readonly',
-                fflate: 'readonly',
-                SSF: 'readonly',
                 acquireVsCodeApi: 'readonly',
-                // defined by the inline script that the extension host injects into the page
-                getOptions: 'readonly',
-                ignoreState: 'readonly'
+                __webpack_public_path__: 'writable'
             }
         },
         rules: { ...jsRules, 'no-console': 'off' }
-    },
-    {
-        // Top-level functions of the page scripts are called from the injected inline script.
-        files: ['src/webview/csv.js', 'src/webview/excel.js'],
-        rules: { 'no-unused-vars': ['error', { args: 'none', caughtErrors: 'none', vars: 'local' }] }
     },
     {
         files: ['src/test/**/*.js', 'scripts/**/*.js', 'webpack.config.js'],
         languageOptions: {
             ecmaVersion: 2022,
             sourceType: 'commonjs',
-            globals: { ...globals.node, SSF: 'readonly', fflate: 'readonly' }
+            globals: { ...globals.node }
         },
         // Tests are rewritten in TS in phase 4; until then they keep the pre-migration leniency.
         rules: { ...jsRules, 'no-console': 'off', 'no-unused-vars': 'off', 'no-useless-escape': 'off', eqeqeq: 'off' }

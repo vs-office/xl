@@ -3,10 +3,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const zlib = require('node:zlib');
-globalThis.fflate = require('../webview/vendor/fflate.js');
-globalThis.SSF = require('../webview/vendor/ssf.js');
 const OX = require('../webview/core/xlsx-writer.js');
-const fflate = globalThis.fflate;
+const fflate = require('fflate');
 const XLSX = require('xlsx');
 
 const u8 = fflate.strToU8;
@@ -497,8 +495,8 @@ test('big untouched entries are never inflated', () => {
     p.entries.push({ name: 'xl/media/big.dat', data: big, method: 8, level: 1 });
     const orig = buildZip(p.entries);
     const calls = [];
-    const real = fflate.Inflate;
-    fflate.Inflate = function (cb) {
+    const real = OX.writerDeps.Inflate;
+    OX.writerDeps.Inflate = function (cb) {
         const inf = new real(cb);
         const push = inf.push.bind(inf);
         let n = 0;
@@ -513,7 +511,7 @@ test('big untouched entries are never inflated', () => {
     try {
         out = OX.patchXlsx(orig, [{ sheet: 0, r: 2, c: 1, cell: { t: 'n', v: 7 } }]);
     } finally {
-        fflate.Inflate = real;
+        OX.writerDeps.Inflate = real;
     }
     const bigC = verifyZip(orig, true).find(e => e.name === 'xl/media/big.dat').csize;
     assert.ok(calls.length > 0 && calls.every(n => n < bigC / 2), 'only small parts were inflated: ' + calls.join(','));

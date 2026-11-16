@@ -1,8 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const OX = require('../webview/core/csv-parser.js');
-require('../webview/core/csv-provider.js');
+const OX = { ...require('../webview/core/csv-parser.js'), ...require('../webview/core/csv-provider.js') };
 
 let seed = 20240607;
 const rnd = n => {

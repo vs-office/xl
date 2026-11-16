@@ -1,6 +1,6 @@
 # План перевода проекта на TypeScript
 
-Статус: фаза 1 выполнена в ветке `ts-migration` (не закоммичено), дальше фаза 2. Отклонения от плана описаны в конце файла.
+Статус: фаза 1 закоммичена, фаза 2 выполнена в ветке `ts-migration` (не закоммичено), дальше фаза 3. Отклонения от плана описаны в конце файла.
 
 Образец организации репозитория и кодовой базы: [astral-sh/ruff-vscode](https://github.com/astral-sh/ruff-vscode). Берём оттуда структуру, набор скриптов, подход к проверкам и защите цепочки поставок. Правила против `any` у нас строже (см. раздел 3).
 
@@ -262,3 +262,19 @@ npm i -D typescript typescript-eslint eslint @eslint/js globals eslint-plugin-im
 - **Линт для старого JS мягче:** `no-useless-assignment`, `preserve-caught-error` выключены для `src/webview/**/*.js`, а `no-unused-vars`, `no-useless-escape`, `eqeqeq` для `src/test/**/*.js`. Это временно, пока файлы не станут TS.
 - **`lint` запускается как `eslint .`**, а не `eslint src`, чтобы покрыть конфиги и `scripts/`.
 - **Кэш npm пользователя повреждён** (root-owned файлы в `~/.npm`). Установку я делал с временным кэшем `/tmp/xl-npm-cache`. Починить: `sudo chown -R 501:20 ~/.npm`.
+
+### Фаза 2 (готово, не закоммичено)
+
+- Глобального `OX` больше нет. Каждый модуль в `src/webview/core` это ES-модуль с именованными экспортами (имена те же, что были у `OX.*`). `SSF` и `fflate` импортируются (`fflate` из npm, `ssf.js` остался вендоренным).
+- Вебвью собирает webpack (конфиг `webview` в `webpack.config.js`), `scripts/build-webview.js` с terser удалён, остался `scripts/build-styles.js` только для CSS. Страницы `csv.js` и `excel.js` публикуют `xlPage` (`webpack library type: var`), inline-скрипт хоста вызывает `xlPage.start(options, ignoreState)` вместо глобальных `getOptions`/`ignoreState`/`handleEvents`/`initPage`.
+- Ленивый чанк редактирования: `import('./edit.js')` (Calc + writer) в `excel.js`, файл `excel-edit.js`, `__webpack_public_path__` берётся из опции `scriptUri`. Формулы проверяются через опцию `validateFormula` у `XlsxProvider`, которую страница подставляет после загрузки чанка.
+- `src/webview/package.json` (`type: module`) и `src/webview/vendor/package.json` (`type: commonjs`) нужны, чтобы Node загружал эти файлы без предупреждения о типе модуля.
+- Тесты: заголовки переведены с `OX`-глобалей на `require` модулей, `csv-host-sim` запускает страницу в процессе теста (раньше в `vm`) с фейковым `Shell` через параметр `createShell` у `initPage`. `webview-bundle.test.js` собирает бандлы через webpack, проверяет, что `xlPage` доступен и что writer лежит только в чанке `excel-edit`.
+- Проверено: `npm run check` (244 теста, 7 с), `npm run package`. Размеры production-бандлов: `excel.js` 239000 (было 239016), `excel-edit.js` 89181 (было 88270), `csv.js` 169550 (было 158579).
+
+### Известные отклонения и риски фазы 2
+
+- `csv.js` вырос на ~11 КБ: `format.js` теперь импортирует `ssf.js` статически, и он попал в CSV-страницу, где его раньше не было (CSV его не использует). Решение отложено на фазу 3: разделить `format.js` на ссылки на ячейки (`colName`, `cellRef`, ...) и форматирование чисел.
+- В `xlsx-writer.js` добавлен тестовый шов `writerDeps.Inflate`: тест «big untouched entries are never inflated» раньше подменял `fflate.Inflate` глобально, а с модулями привязку импорта подменить нельзя.
+- Не проверено вручную: загрузка чанка `excel-edit.js` в настоящем VS Code (CSP, `scriptUri`), открытие CSV/XLSX, редактирование и сохранение. Это обязательная ручная проверка перед коммитом фазы 2.
+- Урок: тестовый хелпер сначала зависал, потому что страница выбирает `MessageChannel`, если он есть, а в `vm`-песочнице его не было. В хелпере теперь `delete globalThis.MessageChannel`.

@@ -106,7 +106,7 @@ test('a newer refresh cancels the transfer in flight; the webview ends up with t
 test('stale or out-of-order chunks are ignored and trigger a resync request', async () => {
     const w = sim.makeWebview('a\n1\n', 1);
     await settle(w);
-    const o = w.vctx.window.oxCsv;
+    const o = w.win.oxCsv;
     o.chunk({ refreshChunk: 'start', id: 5, chars: 100 });
     o.chunk({ refreshChunk: 'data', id: 4, seq: 0, text: 'zzz\n' }); // stale id
     o.chunk({ refreshChunk: 'data', id: 5, seq: 0, text: 'h\n1\n' });

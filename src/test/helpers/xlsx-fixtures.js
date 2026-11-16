@@ -1,6 +1,6 @@
 'use strict';
 // Builders for realistic XLSX packages (written the way Excel lays them out).
-const fflate = globalThis.fflate || (globalThis.fflate = require('../../webview/vendor/fflate.js'));
+const fflate = require('fflate');
 
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';

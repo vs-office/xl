@@ -1,10 +1,8 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-globalThis.fflate = require('../webview/vendor/fflate.js');
-globalThis.SSF = require('../webview/vendor/ssf.js');
 const OX = require('../webview/core/xlsx-writer.js');
-const fflate = globalThis.fflate;
+const fflate = require('fflate');
 const XLSX = require('xlsx');
 
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';

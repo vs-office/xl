@@ -2,11 +2,16 @@ const fs = require('fs'),
     path = require('path'),
     vm = require('vm'),
     Module = require('module');
+// The page schedules work through MessageChannel when it sees one; real ports would keep the test process alive,
+// and the sandboxed page used to have none, so it falls back to timers here too.
+delete globalThis.MessageChannel;
 const R = path.resolve(__dirname, '../../..');
 const ts = require(R + '/node_modules/typescript');
-globalThis.fflate = require(R + '/src/webview/vendor/fflate.js');
-const OX = require(R + '/src/webview/core/csv-parser.js');
-require(R + '/src/webview/core/csv-provider.js');
+const OX = {
+    ...require(R + '/src/webview/core/csv-parser.js'),
+    ...require(R + '/src/webview/core/csv-provider.js')
+};
+const csvPage = require(R + '/src/webview/csv.js');
 const { URI } = require(R + '/node_modules/vscode-uri');
 // ---- fake vscode
 class Position {
@@ -212,33 +217,29 @@ function makeWebview(text, eol, optsOver) {
     view.panel = panel;
     view.initialize();
     view.enableEditing(currentDoc);
-    // sandbox
+    // the page runs in this process against fake browser globals; each call gets a fresh window
     let msgL = [];
-    const ctx = {
-        console,
-        performance,
-        setTimeout,
-        TextEncoder,
-        TextDecoder,
-        window: {
-            addEventListener(n, f) {
-                if (n === 'message') msgL.push(f);
-            }
+    const win = {
+        addEventListener(n, f) {
+            if (n === 'message') msgL.push(f);
+        }
+    };
+    globalThis.window = win;
+    globalThis.acquireVsCodeApi = () => ({
+        postMessage(m) {
+            for (const h of hostHandlers) h(m);
         },
-        acquireVsCodeApi: () => ({
-            postMessage(m) {
-                for (const h of hostHandlers) h(m);
-            },
-            getState: () => null,
-            setState() {}
-        }),
-        document: { getElementById: () => ({}), createElement: () => ({ addEventListener() {}, style: {} }) }
+        getState: () => null,
+        setState() {}
+    });
+    globalThis.document = {
+        getElementById: () => ({}),
+        createElement: () => ({ addEventListener() {}, style: {} })
     };
     function deliver(m) {
         for (const f of msgL) f({ data: m });
     }
     const shellObj = {};
-    ctx.OX = Object.assign(Object.create(null), OX);
     class Grid {
         constructor() {
             this.h = {};
@@ -254,7 +255,7 @@ function makeWebview(text, eol, optsOver) {
             return { ranges: [] };
         }
     }
-    ctx.OX.Shell = class {
+    class FakeShell {
         constructor(app, o) {
             this.o = o;
             this.grid = new Grid();
@@ -275,23 +276,15 @@ function makeWebview(text, eol, optsOver) {
             return false;
         }
         clearView() {}
-    };
-    ctx.document.createElement = () => ({ addEventListener() {}, style: {} });
-    const vctx = vm.createContext(ctx);
-    ctx.globalThis = ctx;
-    vm.runInContext(
-        fs.readFileSync(R + '/src/webview/csv.js', 'utf8') + '\nthis.initPage=initPage;this.handleEvents=handleEvents;',
-        vctx
-    );
-    vctx.getOptions = () => view.getOptions();
-    vctx.ignoreState = () => false;
-    vm.runInContext('handleEvents();initPage();', vctx);
+    }
+    csvPage.handleEvents();
+    csvPage.initPage(view.getOptions(), false, (app, o) => new FakeShell(app, o));
     return {
         view,
-        vctx,
+        win,
         shell: () => shellObj.shell,
         doc: currentDoc,
-        provider: () => vctx.window.oxCsv && vm.runInContext('window.oxCsv', vctx)
+        provider: () => win.oxCsv
     };
 }
 module.exports = {

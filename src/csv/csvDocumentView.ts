@@ -369,14 +369,7 @@ export default class CsvDocumentView extends BaseDocumentView {
             <div id="app"></div>
             <script nonce="${nonce}" src="${s.toString()}/csv.js"></script>
             <script nonce="${nonce}" type="text/javascript">
-                function ignoreState() {
-                    return ${ignoreState === true};
-                }
-                function getOptions() {
-                    return ${safeJson(this.getOptions())};
-                }
-                handleEvents();
-                initPage();
+                xlPage.start(${safeJson(this.getOptions())}, ${ignoreState === true});
             </script>
         </body>
         </html>`;

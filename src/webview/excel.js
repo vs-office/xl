@@ -1,9 +1,14 @@
-var sendMessage;
-var oxApp = null;
+import { Shell } from './core/app-shell.js';
+import { XlsxProvider } from './core/xlsx-provider.js';
+import { readXlsx } from './core/xlsx-reader.js';
 
-function initPage() {
+let sendMessage;
+
+export function initPage(options, ignoreState) {
     const vscode = acquireVsCodeApi();
-    const options = getOptions();
+    // the lazily loaded editing chunk is fetched next to the page script
+    if (typeof __webpack_public_path__ !== 'undefined' && options.scriptUri)
+        __webpack_public_path__ = options.scriptUri + '/';
     const STATE_VERSION = '6';
     const readOnly = !options.customEditor;
     sendMessage = function (m) {
@@ -15,6 +20,7 @@ function initPage() {
         bytes = null,
         active = 0;
     let calc = null;
+    let edit = null; // editing chunk namespace once loaded: { Calc, patchXlsx, validateFormula }
     const providers = new Map();
     const views = {};
     let undoStack = [],
@@ -25,7 +31,7 @@ function initPage() {
         cancelBtn = null;
 
     const saved = (function () {
-        if (ignoreState()) return null;
+        if (ignoreState) return null;
         const s = vscode.getState() || options.state;
         return s && s.version === STATE_VERSION ? s : null;
     })();
@@ -41,7 +47,7 @@ function initPage() {
     }
 
     function createShell() {
-        shell = new OX.Shell(app, {
+        shell = new Shell(app, {
             readOnly: readOnly,
             tabs: true,
             headerRows: function () {
@@ -56,7 +62,6 @@ function initPage() {
             },
             onLink: onLink
         });
-        oxApp = shell;
         const picLayer = document.createElement('div');
         picLayer.className = 'ox-pics';
         shell.grid.el.appendChild(picLayer);
@@ -179,7 +184,12 @@ function initPage() {
     }
 
     function newProvider(sheet) {
-        return new OX.XlsxProvider(wb, sheet, { measure: measure });
+        return new XlsxProvider(wb, sheet, {
+            measure: measure,
+            validateFormula: function (f) {
+                return edit ? edit.validateFormula(f) : null;
+            }
+        });
     }
 
     function loadError(i, err) {
@@ -310,7 +320,7 @@ function initPage() {
         let nb, nbytes;
         try {
             nbytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
-            nb = OX.readXlsx(nbytes);
+            nb = readXlsx(nbytes);
         } catch (err) {
             const why = err && err.message ? err.message : String(err);
             shell.setMessage(
@@ -366,7 +376,7 @@ function initPage() {
 
     function getCalc() {
         if (calc) return calc;
-        calc = new OX.Calc({
+        calc = new edit.Calc({
             sheetNames: wb.sheets.map(function (x) {
                 return x.name;
             }),
@@ -433,7 +443,7 @@ function initPage() {
     }
 
     function recalculate(q, si, items) {
-        if (!OX.Calc) return 0;
+        if (!edit) return 0;
         let n = 0;
         staleArrays = 0;
         try {
@@ -469,26 +479,23 @@ function initPage() {
         return n;
     }
 
-    // the formula engine and the writer are a separate script, fetched once editing is possible
+    // the formula engine and the writer are a separate chunk, fetched once editing is possible
     let editReady = null;
     function hasEditModule() {
-        return !!(OX.Calc && OX.patchXlsx);
+        return edit !== null;
     }
     function ensureEdit() {
-        if (hasEditModule()) return Promise.resolve();
+        if (edit) return Promise.resolve();
         if (!editReady)
-            editReady = new Promise(function (resolve, reject) {
-                const s = document.createElement('script');
-                s.src = options.editScript;
-                s.onload = function () {
-                    resolve();
-                };
-                s.onerror = function () {
+            editReady = import(/* webpackChunkName: "excel-edit" */ './edit.js').then(
+                function (m) {
+                    edit = m;
+                },
+                function () {
                     editReady = null;
-                    reject(new Error('Cannot load the editing module'));
-                };
-                document.head.appendChild(s);
-            });
+                    throw new Error('Cannot load the editing module');
+                }
+            );
         return editReady;
     }
 
@@ -597,7 +604,7 @@ function initPage() {
         });
         if (!edits.length) return bytes;
         try {
-            return OX.patchXlsx(bytes, edits);
+            return edit.patchXlsx(bytes, edits);
         } catch (err) {
             const msg = 'Could not save your edits: ' + (err && err.message ? err.message : err);
             shell.setMessage(msg);
@@ -649,7 +656,7 @@ function initPage() {
     } else vscode.postMessage({ refresh: true });
 }
 
-function handleEvents() {
+export function handleEvents() {
     window.addEventListener('message', function (event) {
         const d = event.data,
             app = window.oxExcel;
@@ -672,4 +679,10 @@ function handleEvents() {
         else if (d.redo) app.redo();
         else if (d.content && !d.type) app.load(d.content);
     });
+}
+
+// Entry point called by the inline script of the page: xlPage.start(options, ignoreState)
+export function start(options, ignoreState) {
+    handleEvents();
+    initPage(options, ignoreState);
 }

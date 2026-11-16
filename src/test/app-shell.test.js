@@ -1,11 +1,13 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert');
-const OX = require('../webview/core/csv-parser.js');
-require('../webview/core/csv-provider.js');
-require('../webview/core/format.js');
-require('../webview/core/grid-core.js');
-require('../webview/core/app-shell.js');
+const OX = {
+    ...require('../webview/core/csv-parser.js'),
+    ...require('../webview/core/csv-provider.js'),
+    ...require('../webview/core/format.js'),
+    ...require('../webview/core/grid-core.js'),
+    ...require('../webview/core/app-shell.js')
+};
 const { budget } = require('./helpers/timing.js');
 
 let seed = 987654321;

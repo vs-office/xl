@@ -1,7 +1,6 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-globalThis.SSF = require('../webview/vendor/ssf.js');
 const OX = require('../webview/core/calc.js');
 const { budget } = require('./helpers/timing.js');
 const { Calc } = OX;

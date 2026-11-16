@@ -3,7 +3,8 @@
 const path = require('path');
 const webpack = require('webpack');
 
-const base = {
+const hostConfig = {
+    name: 'host',
     mode: 'none',
     entry: './src/extension.ts',
     output: {
@@ -24,11 +25,8 @@ const base = {
                 use: [{ loader: 'ts-loader' }]
             }
         ]
-    }
-};
-
-const webConfig = {
-    ...base,
+    },
+    // One bundle for desktop and web: the webworker build only uses workspace.fs and has no Node requires.
     target: 'webworker',
     resolve: {
         mainFields: ['browser', 'module', 'main'],
@@ -38,8 +36,32 @@ const webConfig = {
             path: require.resolve('path-browserify')
         }
     },
-    plugins: [new webpack.ProvidePlugin({ process: 'process/browser' })]
+    plugins: [new webpack.ProvidePlugin({ process: 'process/browser' })],
+    infrastructureLogging: {
+        level: 'log'
+    }
 };
 
-// One bundle for desktop and web: the webworker build only uses workspace.fs and has no Node requires.
-module.exports = webConfig;
+// Pages that run inside the webview. The inline script of each page calls xlPage.start(options, ignoreState).
+// excel-edit.js is the lazily loaded chunk behind import('./edit.js') in excel.js.
+const webviewConfig = {
+    name: 'webview',
+    mode: 'none',
+    target: 'web',
+    entry: {
+        excel: './src/webview/excel.js',
+        csv: './src/webview/csv.js'
+    },
+    output: {
+        path: path.resolve(__dirname, 'dist', 'webview'),
+        filename: '[name].js',
+        chunkFilename: '[name].js',
+        // excel.js sets __webpack_public_path__ from the host-provided script uri before loading the editing chunk
+        publicPath: '',
+        library: { name: 'xlPage', type: 'var' }
+    },
+    devtool: false,
+    performance: { hints: false }
+};
+
+module.exports = [hostConfig, webviewConfig];

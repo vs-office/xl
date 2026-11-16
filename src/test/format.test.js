@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-globalThis.SSF = require('../webview/vendor/ssf.js');
+const SSF = require('../webview/vendor/ssf.js');
 const OX = require('../webview/core/format.js');
 
 const fc = (v, fmt, d1904, t) => OX.formatCell({ t: t || 'n', v }, { fmt }, d1904);

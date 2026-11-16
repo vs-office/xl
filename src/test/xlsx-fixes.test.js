@@ -1,18 +1,19 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-globalThis.fflate = require('../webview/vendor/fflate.js');
-globalThis.SSF = require('../webview/vendor/ssf.js');
-const OX = require('../webview/core/xlsx-reader.js');
-require('../webview/core/format.js');
-require('../webview/core/xlsx-writer.js');
-require('../webview/core/xlsx-provider.js');
+const fflate = require('fflate');
+const OX = {
+    ...require('../webview/core/xlsx-reader.js'),
+    ...require('../webview/core/format.js'),
+    ...require('../webview/core/xlsx-writer.js'),
+    ...require('../webview/core/xlsx-provider.js')
+};
 const F = require('./helpers/xlsx-fixtures.js');
 
 const unz = b => {
-    const z = globalThis.fflate.unzipSync(b);
+    const z = fflate.unzipSync(b);
     const o = {};
-    for (const k in z) o[k] = globalThis.fflate.strFromU8(z[k]);
+    for (const k in z) o[k] = fflate.strFromU8(z[k]);
     return o;
 };
 const MIN_STYLES = extra =>
@@ -29,7 +30,7 @@ function book(data, o) {
 }
 function open(bytes) {
     const wb = OX.readXlsx(bytes);
-    return { wb, p: new OX.XlsxProvider(wb, wb.loadSheet(0)) };
+    return { wb, p: new OX.XlsxProvider(wb, wb.loadSheet(0), { validateFormula: OX.validateFormula }) };
 }
 function save(bytes, p) {
     return OX.patchXlsx(bytes, p.pendingEdits(0));
@@ -61,7 +62,7 @@ test('typed date/percent/time keep their number format through view and save', (
     assert.equal(wb2.styles[sh.rows[1][0].s].fmt, '0%');
     assert.equal(sh.rows[1][0].s, sh.rows[2][0].s);
     assert.equal(wb2.styles[sh.rows[3][0].s].fmt, 'h:mm');
-    const p2 = new OX.XlsxProvider(wb2, sh);
+    const p2 = new OX.XlsxProvider(wb2, sh, { validateFormula: OX.validateFormula });
     assert.equal(p2.getCell(0, 1).text, '2023-01-02');
 });
 
@@ -242,7 +243,7 @@ test('reader: tab colors up front, column/row styles, clearing keeps style, zero
         ['#ff0000', '#ed7d31']
     );
     const sh = wb.loadSheet(0),
-        p = new OX.XlsxProvider(wb, sh);
+        p = new OX.XlsxProvider(wb, sh, { validateFormula: OX.validateFormula });
     assert.equal(p.getCell(5, 1).style.bg, '#ffff00');
     assert.equal(p.getCell(5, 2).style.bg, '#ffff00');
     assert.equal(p.getCell(5, 3), undefined);
@@ -274,7 +275,7 @@ test('reader: part lookup is case-insensitive, hyperlinks sanitized, merges clam
     const rels =
         F.HDR +
         `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="${F.NS_R}/hyperlink" Target="javascript:alert(1)" TargetMode="External"/></Relationships>`;
-    const z = globalThis.fflate.unzipSync(
+    const z = fflate.unzipSync(
         F.buildPackage({ sheets: [{ name: 'S', xml: x, rels }], styles: MIN_STYLES({}), theme: F.THEME })
     );
     const o = {};

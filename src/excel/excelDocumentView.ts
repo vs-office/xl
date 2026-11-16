@@ -14,7 +14,7 @@ const DATA_TIMEOUT_MS = 60000;
 export interface ExcelOptions {
     customEditor: boolean;
     uri: string;
-    editScript: string;
+    scriptUri: string;
     directUrl: string | undefined;
     previewUri: string;
     state: unknown;
@@ -41,7 +41,7 @@ export default class ExcelDocumentView extends BaseDocumentView {
         return {
             customEditor: this.hasCustomEditor,
             uri: this.uri.toString(),
-            editScript: `${this.scriptUri.toString()}/excel-edit.js`,
+            scriptUri: this.scriptUri.toString(),
             // a clean, non-restored local file is fetched by the webview straight from disk (no host round trip)
             directUrl: this._direct && this._document && !this._document.dirty ? this.previewUri.toString() : undefined,
             previewUri: this.previewUri.toString(),
@@ -223,14 +223,7 @@ export default class ExcelDocumentView extends BaseDocumentView {
             <div id="app"></div>
             <script nonce="${nonce}" src="${s.toString()}/excel.js"></script>
             <script nonce="${nonce}" type="text/javascript">
-                function ignoreState() {
-                    return ${ignoreState === true};
-                }
-                function getOptions() {
-                    return ${safeJson(this.getOptions())};
-                }
-                handleEvents();
-                initPage();
+                xlPage.start(${safeJson(this.getOptions())}, ${ignoreState === true});
             </script>
         </body>
         </html>`;

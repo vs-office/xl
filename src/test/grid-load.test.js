@@ -1,7 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert');
-const OX = require('../webview/core/grid-core.js');
-require('../webview/core/grid.js');
+const OX = { ...require('../webview/core/grid-core.js'), ...require('../webview/core/grid.js') };
 
 test('Grid module loads headless and exposes API', () => {
     assert.equal(typeof OX.Grid, 'function');

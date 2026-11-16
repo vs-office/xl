@@ -1,8 +1,12 @@
-var sendMessage;
+import { Shell } from './core/app-shell.js';
+import { CsvIndex } from './core/csv-parser.js';
+import { CsvProvider } from './core/csv-provider.js';
 
-function initPage() {
+let sendMessage;
+
+// createShell is a seam for tests, which drive the page without a DOM
+export function initPage(options, ignoreState, createShell = (app, o) => new Shell(app, o)) {
     const vscode = acquireVsCodeApi();
-    const options = getOptions();
     const STATE_VERSION = '6';
     const readOnly = !options.customEditor;
     sendMessage = function (m) {
@@ -18,7 +22,7 @@ function initPage() {
         transferring = false;
 
     const saved = (function () {
-        if (ignoreState()) return null;
+        if (ignoreState) return null;
         const s = vscode.getState() || options.state;
         return s && s.version === STATE_VERSION ? s : null;
     })();
@@ -32,7 +36,7 @@ function initPage() {
         return c.measureText(text).width;
     }
 
-    shell = new OX.Shell(app, {
+    shell = createShell(app, {
         readOnly: readOnly,
         tabs: false,
         headerRows: function () {
@@ -239,7 +243,7 @@ function initPage() {
             buf: new Uint8Array(Math.max(1024, expectedChars | 0)),
             filled: 0,
             expected: expectedChars | 0,
-            ix: new OX.CsvIndex(parseOptions()),
+            ix: new CsvIndex(parseOptions()),
             t0: performance.now(),
             lastPos: -1,
             lastInv: 0,
@@ -271,7 +275,7 @@ function initPage() {
 
     function makeProvider(j) {
         const ix = j.ix;
-        provider = new OX.CsvProvider(ix, {
+        provider = new CsvProvider(ix, {
             hasHeaders: options.hasHeaders,
             capitalizeHeaders: options.capitalizeHeaders,
             formatValues: options.formatValues,
@@ -448,11 +452,17 @@ function initPage() {
     vscode.postMessage({ refresh: true });
 }
 
-function handleEvents() {
+export function handleEvents() {
     window.addEventListener('message', function (event) {
         const d = event.data;
         if (!d || !window.oxCsv) return;
         if (d.refreshChunk) window.oxCsv.chunk(d);
         else if (d.refresh) window.oxCsv.load(d.content, d.version);
     });
+}
+
+// Entry point called by the inline script of the page: xlPage.start(options, ignoreState)
+export function start(options, ignoreState) {
+    handleEvents();
+    initPage(options, ignoreState);
 }
