@@ -71,10 +71,12 @@ Open Settings and search for `csv-preview` to change the separator, header row, 
 
 ## Development
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
+
 ```bash
-npm install
-npm test
-npm run package   # builds xl.vsix
+npm ci --ignore-scripts
+npm run check          # format check, lint, type check, tests
+npm run vsce-package   # builds xl.vsix
 ```
 
 Press `F5` to debug.

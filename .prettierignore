@@ -1,7 +1,9 @@
 dist
 node_modules
-out/vendor
+src/webview/vendor
 docs
 *.vsix
 package-lock.json
 CLAUDE.md
+out
+.vscode-test

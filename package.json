@@ -2,7 +2,7 @@
   "name": "xl",
   "displayName": "xl",
   "description": "View and edit CSV, TSV and XLSX files in VS Code.",
-  "version": "2026.1.0",
+  "version": "2026.2.0",
   "publisher": "ilypopv",
   "icon": "img/icon.png",
   "author": {
@@ -19,7 +19,8 @@
   },
   "homepage": "https://github.com/vs-office/xl#readme",
   "engines": {
-    "vscode": "^1.63.0"
+    "vscode": "^1.63.0",
+    "node": ">=22.18"
   },
   "categories": [
     "Other"
@@ -350,35 +351,41 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "webpack --mode production && node scripts/build-webview.js",
-    "compile": "webpack --mode none && node scripts/build-webview.js",
-    "watch": "node scripts/build-webview.js && webpack --mode none --watch",
-    "package": "vsce package --no-dependencies -o xl.vsix",
-    "test": "node --test test/*.test.js",
-    "lint": "eslint .",
-    "format": "prettier --write .",
-    "format:check": "prettier --check .",
-    "typecheck": "tsc --noEmit",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm test"
+    "check": "npm run fmt-check && npm run lint && npm run tsc && npm run test && npm run compile",
+    "fmt": "prettier -w .",
+    "fmt-check": "prettier --check .",
+    "lint": "eslint . --max-warnings=0",
+    "tsc": "tsc --noEmit",
+    "test": "node --test src/test/*.test.ts",
+    "compile": "webpack --mode none && node scripts/build-styles.js",
+    "watch": "node scripts/build-styles.js && webpack --mode none --watch",
+    "package": "webpack --mode production && node scripts/build-styles.js",
+    "vsce-package": "vsce package --no-dependencies -o xl.vsix",
+    "vscode:prepublish": "npm run package"
   },
   "devDependencies": {
-    "@eslint/js": "^9.39.5",
-    "@types/node": "^11.15.54",
-    "@types/vscode": "^1.60.0",
-    "@types/webpack-env": "^1.16.2",
-    "@vscode/vsce": "^3.0.0",
+    "@eslint/js": "^10.0.0",
+    "@types/node": "^26.0.0",
+    "@types/vscode": "1.63.0",
+    "@types/webpack-env": "^1.0.0",
+    "@typescript/native": "npm:typescript@^7.0.2",
+    "@vscode/vsce": "^4.0.0",
     "assert": "^2.0.0",
-    "eslint": "^9.39.5",
-    "globals": "^17.13.0",
-    "prettier": "^3.9.10",
+    "eslint": "^10.0.0",
+    "eslint-import-resolver-typescript": "^4.0.0",
+    "eslint-plugin-import-x": "^4.0.0",
+    "globals": "^17.0.0",
+    "prettier": "^3.0.0",
     "process": "^0.11.10",
-    "ts-loader": "^9.2.5",
-    "typescript": "^4.4.3",
-    "webpack": "^5.52.1",
-    "webpack-cli": "^4.8.0",
+    "ts-loader": "^9.0.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2",
+    "typescript-eslint": "^8.0.0",
+    "webpack": "^5.0.0",
+    "webpack-cli": "^7.0.0",
     "xlsx": "^0.18.5"
   },
   "dependencies": {
+    "fflate": "^0.8.3",
     "path-browserify": "^1.0.1",
     "vscode-uri": "^3.0.2"
   }
