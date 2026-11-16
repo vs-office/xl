@@ -25,7 +25,7 @@ Individual steps: `npm run fmt-check`, `npm run lint`, `npm run tsc`, `npm test`
 ```bash
 npm run compile        # extension host (webpack) + webview bundles
 npm run watch          # rebuild on change
-npm run vsce-package   # builds xl.vsix
+npm run vsce-package   # builds vxl.vsix
 ```
 
 Press `F5` in VS Code to start an Extension Development Host.
