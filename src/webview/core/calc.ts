@@ -61,36 +61,40 @@ const MAXR = 1048575,
 
 // ---------- syntax tree ----------
 export type BinOp = '+' | '-' | '*' | '/' | '^' | '&' | '=' | '<>' | '<' | '>' | '<=' | '>=';
-export interface NumNode {
+/** Common part of every AST node: the root of a formula carries its cached analysis (a property, not a WeakMap: it is looked up 100k times per recalculation). */
+export interface AstBase {
+    analysis?: Analysis;
+}
+export interface NumNode extends AstBase {
     k: 'n';
     v: number;
 }
-export interface StrNode {
+export interface StrNode extends AstBase {
     k: 's';
     v: string;
 }
-export interface BoolNode {
+export interface BoolNode extends AstBase {
     k: 'b';
     v: boolean;
 }
 /** An error literal; a formula that fails to parse becomes `#NAME?` with `parseError` set. */
-export interface ErrNode {
+export interface ErrNode extends AstBase {
     k: 'e';
     v: string;
     parseError?: true;
     error?: string;
 }
 /** A defined name (not supported: evaluates to #NAME?). */
-export interface NameNode {
+export interface NameNode extends AstBase {
     k: 'name';
     v: string;
 }
 /** An omitted function argument, as in `IF(A1,,2)`. */
-export interface MissingNode {
+export interface MissingNode extends AstBase {
     k: 'missing';
 }
 /** A cell or range reference; `sheet` is the written sheet name or null for the formula's own sheet. */
-export interface RefNode {
+export interface RefNode extends AstBase {
     k: 'ref';
     sheet: string | null;
     r1: number;
@@ -99,31 +103,31 @@ export interface RefNode {
     c2: number;
 }
 /** An array constant such as `{1,2;3,4}`. */
-export interface ArrNode {
+export interface ArrNode extends AstBase {
     k: 'arr';
     v: Arr;
 }
-export interface ParenNode {
+export interface ParenNode extends AstBase {
     k: 'paren';
     a: AstNode;
 }
-export interface UnaryNode {
+export interface UnaryNode extends AstBase {
     k: 'neg' | 'pos' | 'pct';
     a: AstNode;
 }
-export interface BinNode {
+export interface BinNode extends AstBase {
     k: 'bin';
     op: BinOp;
     a: AstNode;
     b: AstNode;
 }
 /** The range operator `a:b` applied to two references (or reference-returning functions). */
-export interface RangeNode {
+export interface RangeNode extends AstBase {
     k: 'rng';
     a: AstNode;
     b: AstNode;
 }
-export interface FnNode {
+export interface FnNode extends AstBase {
     k: 'fn';
     name: string;
     args: AstNode[];
@@ -1013,14 +1017,12 @@ const KR = 1048576,
 const keyOf = (s: number, r: number, c: number): number => (s * KR + r) * KC + c;
 
 /** The references of a formula and whether it is volatile (depends on the clock, RAND, OFFSET, ...). */
-interface Analysis {
+export interface Analysis {
     refs: RefNode[];
     vol: boolean;
 }
-const ANALYSIS = new WeakMap<AstNode, Analysis>();
 function analyze(ast: AstNode): Analysis {
-    const hit = ANALYSIS.get(ast);
-    if (hit) return hit;
+    if (ast.analysis) return ast.analysis;
     const refs: RefNode[] = [];
     let vol = false;
     const seen = new Set<string>();
@@ -1064,7 +1066,7 @@ function analyze(ast: AstNode): Analysis {
         }
     }
     const out: Analysis = { refs, vol };
-    ANALYSIS.set(ast, out);
+    ast.analysis = out;
     return out;
 }
 

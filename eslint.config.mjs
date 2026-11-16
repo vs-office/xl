@@ -3,20 +3,6 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 import { importX } from 'eslint-plugin-import-x';
 
-// Legacy JS (tests, scripts) keeps the old rule set until it becomes TS; new ESLint 10 recommended rules are off here only.
-const jsRules = {
-    eqeqeq: ['error', 'smart'],
-    'no-useless-assignment': 'off',
-    'preserve-caught-error': 'off',
-    'no-unused-vars': ['error', { args: 'none', caughtErrors: 'none' }],
-    'no-empty': ['error', { allowEmptyCatch: true }],
-    'no-constant-condition': ['error', { checkLoops: false }],
-    'no-control-regex': 'off',
-    'no-prototype-builtins': 'off',
-    'no-useless-escape': 'error',
-    'import-x/no-unresolved': 'off'
-};
-
 export default tseslint.config(
     {
         ignores: [
@@ -112,6 +98,7 @@ export default tseslint.config(
             sourceType: 'commonjs',
             globals: { ...globals.node }
         },
-        rules: { ...jsRules, 'no-console': 'off' }
+        // build scripts: standard recommended rules, console output is their interface
+        rules: { eqeqeq: ['error', 'always'], 'no-console': 'off' }
     }
 );

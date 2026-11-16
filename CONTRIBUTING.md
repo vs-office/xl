@@ -2,7 +2,7 @@
 
 ## Setup
 
-Requires Node 22.18 or newer (see `engines` in `package.json`) and npm. Everything else is a dev dependency of the project, nothing is installed globally.
+Requires Node 22.18 or newer (see `engines` in `package.json`; `.node-version` pins the version used in CI) and npm. Everything else is a dev dependency of the project, nothing is installed globally.
 
 ```bash
 npm ci --ignore-scripts

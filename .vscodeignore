@@ -2,12 +2,10 @@
 .codemie/**
 .gitignore
 src/**
-test/**
 **/*.map
 tsconfig.json
 webpack.config.js
 data/**
-out/**
 !src/webview/vendor/LICENSE.*
 scripts/**
 node_modules/**
@@ -30,3 +28,4 @@ img/icon-*
 CONTRIBUTING.md
 package-lock.json
 .vscode-test/**
+.node-version
