@@ -2,7 +2,7 @@
 
 View and edit **Excel and CSV files** in VS Code. Fast on huge files, and it keeps your workbook's formatting intact.
 
-[![Install from the VS Code Marketplace](https://img.shields.io/badge/VS%20Code-Install%20from%20Marketplace-1f9d6b?logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=vs-office.vxl)
+[![Install from the VS Code Marketplace](https://img.shields.io/badge/VS%20Code-Install%20from%20Marketplace-1f9d6b?logo=visualstudiocode&logoColor=white)](https://marketplace.visualstudio.com/items?itemName=vs-office.xlv)
 
 <img src="docs/images/excel.png" alt="Excel Editor" width="49%"> <img src="docs/images/csv.png" alt="CSV Editor" width="49%">
 
@@ -17,7 +17,7 @@ View and edit **Excel and CSV files** in VS Code. Fast on huge files, and it kee
 
 ## Install
 
-Search for **xl** in the Extensions view, or run `ext install vs-office.vxl`.
+Search for **xl** in the Extensions view, or run `ext install vs-office.xlv`.
 If the older "Spreadsheet Viewer" extension is installed, disable it so the two do not compete for the same files.
 
 ## Use
@@ -76,7 +76,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
 ```bash
 npm ci --ignore-scripts
 npm run check          # format check, lint, type check, tests
-npm run vsce-package   # builds vxl.vsix
+npm run vsce-package   # builds xlv.vsix
 ```
 
 Press `F5` to debug.
