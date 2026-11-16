@@ -2,7 +2,7 @@
   "name": "xl",
   "displayName": "xl",
   "description": "View and edit CSV, TSV and XLSX files in VS Code.",
-  "version": "2026.1.0",
+  "version": "2026.2.0",
   "publisher": "ilypopv",
   "icon": "img/icon.png",
   "author": {
