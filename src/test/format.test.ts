@@ -1,12 +1,23 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const SSF = require('../webview/vendor/ssf.js');
-const OX = webview('core/format');
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import SSF from '../webview/vendor/ssf.js';
+import * as OX from '../webview/core/format.ts';
+import type { FormatCell, FormatStyle } from '../webview/core/format.ts';
 
-const fc = (v, fmt, d1904, t) => OX.formatCell({ t: t || 'n', v }, { fmt }, d1904);
-const txt = (v, fmt, d1904) => fc(v, fmt, d1904).text;
+/** parseInput result seen through the union's common fields, so tests can read `.fmt` / `.f` directly. */
+interface Loose {
+    t: string;
+    v: unknown;
+    f?: string | undefined;
+    fmt?: string | undefined;
+}
+const num = (x: unknown): number => {
+    assert.equal(typeof x, 'number');
+    return x as number;
+};
+
+const fc = (v: unknown, fmt: string, d1904?: boolean, t?: string) => OX.formatCell({ t: t || 'n', v }, { fmt }, d1904);
+const txt = (v: unknown, fmt: string, d1904?: boolean) => fc(v, fmt, d1904).text;
 
 test('column names and indexes', () => {
     assert.equal(OX.colName(0), 'A');
@@ -66,7 +77,7 @@ test('parseRange', () => {
 });
 
 test('serial/date conversion and 1900 bug', () => {
-    const iso = n => OX.serialToDate(n, false).toISOString().slice(0, 10);
+    const iso = (n: number) => OX.serialToDate(n, false).toISOString().slice(0, 10);
     assert.equal(iso(1), '1900-01-01');
     assert.equal(iso(59), '1900-02-28');
     assert.equal(iso(61), '1900-03-01');
@@ -90,7 +101,7 @@ test('serial/date conversion and 1900 bug', () => {
 });
 
 // [value, format, expected text]
-const TABLE = [
+const TABLE: [number, string, string][] = [
     // General
     [0, 'General', '0'],
     [1, 'General', '1'],
@@ -222,7 +233,7 @@ test('format table', () => {
 });
 
 test('builtin ids via SSF table resolve like Excel en-US', () => {
-    const T = SSF._table;
+    const T = SSF._table as Record<number, string>; // every builtin id used below is defined
     assert.equal(txt(1234.5, T[3]), '1,235');
     assert.equal(txt(1234.5, T[4]), '1,234.50');
     assert.equal(txt(0.5, T[9]), '50%');
@@ -347,7 +358,17 @@ test('fast paths match SSF (fuzz)', () => {
     let seed = 12345;
     const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
     const fmts = ['0', '0.0', '0.00', '0.000', '#,##0', '#,##0.00', '0%', '0.0%', '0.00%'];
-    const dec = { 0: 0, '0.0': 1, '0.00': 2, '0.000': 3, '#,##0': 0, '#,##0.00': 2, '0%': 0, '0.0%': 1, '0.00%': 2 };
+    const dec: Record<string, number> = {
+        0: 0,
+        '0.0': 1,
+        '0.00': 2,
+        '0.000': 3,
+        '#,##0': 0,
+        '#,##0.00': 2,
+        '0%': 0,
+        '0.0%': 1,
+        '0.00%': 2
+    };
     let n = 0;
     for (let i = 0; i < 60000; i++) {
         const f = fmts[i % fmts.length];
@@ -386,7 +407,7 @@ test('General vs SSF where both agree with Excel (fuzz)', () => {
 test('date fast path matches independent oracle (fuzz)', () => {
     let seed = 99;
     const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
-    const P2 = n => (n < 10 ? '0' : '') + n;
+    const P2 = (n: number) => (n < 10 ? '0' : '') + n;
     for (let i = 0; i < 20000; i++) {
         const secsTotal = Math.floor(rnd() * 86400);
         const day = 61 + Math.floor(rnd() * 800000);
@@ -403,13 +424,14 @@ test('date fast path matches independent oracle (fuzz)', () => {
 });
 
 test('parseInput basics', () => {
-    const P = (s, fmt, d) => OX.parseInput(s, undefined, fmt ? { fmt } : null, d);
+    const P = (s: string, fmt?: string | null, d?: boolean): Loose | null =>
+        OX.parseInput(s, undefined, fmt ? { fmt } : null, d);
     assert.equal(P(''), null);
     assert.deepEqual(P('=SUM(A1:A3)'), { t: 'n', v: null, f: 'SUM(A1:A3)' });
     assert.deepEqual(P('='), { t: 's', v: '=' });
     assert.deepEqual(P("'123"), { t: 's', v: '123' });
     assert.deepEqual(P("'=1+1"), { t: 's', v: '=1+1' });
-    for (const [s, v] of [
+    const NUMS: [string, number][] = [
         ['42', 42],
         ['-3.5', -3.5],
         ['+7', 7],
@@ -429,7 +451,8 @@ test('parseInput basics', () => {
         ['0.07%', 0.0007],
         ['1,000%', 10],
         ['$1,234.50', 1234.5]
-    ])
+    ];
+    for (const [s, v] of NUMS)
         assert.deepEqual(
             P(s, 'General'),
             { t: 'n', v, ...(s.endsWith('%') ? { fmt: /\./.test(s) ? '0.00%' : '0%' } : {}) },
@@ -471,65 +494,67 @@ test('parseInput basics', () => {
     assert.deepEqual(P('#hashtag'), { t: 's', v: '#hashtag' });
     assert.deepEqual(P('12', '@'), { t: 's', v: '12' });
     assert.deepEqual(P('=1', '@'), { t: 's', v: '=1' });
-    assert.equal(P('-0').v, 0);
-    assert.ok(!Object.is(P('-0').v, -0));
-    assert.equal(P('007', '@').v, '007');
+    assert.equal(P('-0')?.v, 0);
+    assert.ok(!Object.is(P('-0')?.v, -0));
+    assert.equal(P('007', '@')?.v, '007');
 });
 
 test('parseInput dates and times', () => {
-    const P = (s, fmt, d) => OX.parseInput(s, undefined, fmt ? { fmt } : null, d);
-    assert.equal(P('2023-03-15').v, 45000);
-    assert.equal(P('2023-03-15').fmt, 'yyyy-mm-dd');
-    assert.equal(P('2023-03-15', 'yyyy-mm-dd').fmt, undefined);
-    assert.equal(P('2023-3-5').v, 44990);
-    assert.equal(P('1900-01-01').v, 1);
-    assert.equal(P('1900-02-29').v, 60);
-    assert.equal(P('1900-03-01').v, 61);
-    assert.equal(P('9999-12-31').v, 2958465);
-    assert.equal(P('2023-03-15', null, true).v, 45000 - 1462);
-    assert.equal(P('2023-03-15 12:00').v, 45000.5);
-    assert.equal(P('2023-03-15T18:00:00').v, 45000.75);
-    assert.equal(P('2023-03-15 12:00:00').fmt, 'yyyy-mm-dd hh:mm:ss');
+    const P = (s: string, fmt?: string | null, d?: boolean): Loose | null =>
+        OX.parseInput(s, undefined, fmt ? { fmt } : null, d);
+    assert.equal(P('2023-03-15')?.v, 45000);
+    assert.equal(P('2023-03-15')?.fmt, 'yyyy-mm-dd');
+    assert.equal(P('2023-03-15', 'yyyy-mm-dd')?.fmt, undefined);
+    assert.equal(P('2023-3-5')?.v, 44990);
+    assert.equal(P('1900-01-01')?.v, 1);
+    assert.equal(P('1900-02-29')?.v, 60);
+    assert.equal(P('1900-03-01')?.v, 61);
+    assert.equal(P('9999-12-31')?.v, 2958465);
+    assert.equal(P('2023-03-15', null, true)?.v, 45000 - 1462);
+    assert.equal(P('2023-03-15 12:00')?.v, 45000.5);
+    assert.equal(P('2023-03-15T18:00:00')?.v, 45000.75);
+    assert.equal(P('2023-03-15 12:00:00')?.fmt, 'yyyy-mm-dd hh:mm:ss');
     assert.deepEqual(P('2023-02-29'), { t: 's', v: '2023-02-29' });
     assert.deepEqual(P('2023-13-01'), { t: 's', v: '2023-13-01' });
     assert.deepEqual(P('2023-03-15 25:00'), { t: 's', v: '2023-03-15 25:00' });
-    assert.equal(P('2024-02-29').v, 45351);
+    assert.equal(P('2024-02-29')?.v, 45351);
     assert.deepEqual(P('1899-12-31'), { t: 's', v: '1899-12-31' });
-    assert.equal(P('12:00').v, 0.5);
-    assert.equal(P('18:30:00').v, 18.5 / 24);
-    assert.equal(P('1:30 PM').v, 13.5 / 24);
-    assert.equal(P('12:00 AM').v, 0);
-    assert.equal(P('12:00 PM').v, 0.5);
-    assert.equal(P('36:00:00').v, 1.5);
+    assert.equal(P('12:00')?.v, 0.5);
+    assert.equal(P('18:30:00')?.v, 18.5 / 24);
+    assert.equal(P('1:30 PM')?.v, 13.5 / 24);
+    assert.equal(P('12:00 AM')?.v, 0);
+    assert.equal(P('12:00 PM')?.v, 0.5);
+    assert.equal(P('36:00:00')?.v, 1.5);
     assert.deepEqual(P('12:60'), { t: 's', v: '12:60' });
     assert.deepEqual(P('13:00 PM'), { t: 's', v: '13:00 PM' });
-    assert.equal(P('12:00').fmt, 'h:mm');
-    assert.equal(P('12:00:05').fmt, 'h:mm:ss');
-    assert.equal(P('12:00', 'h:mm:ss').fmt, undefined);
+    assert.equal(P('12:00')?.fmt, 'h:mm');
+    assert.equal(P('12:00:05')?.fmt, 'h:mm:ss');
+    assert.equal(P('12:00', 'h:mm:ss')?.fmt, undefined);
     // loose forms only with date format
     assert.deepEqual(P('3/15/2023'), { t: 'n', v: 45000, fmt: 'm/d/yyyy' });
     assert.deepEqual(P('03/15/23'), { t: 's', v: '03/15/23' });
     for (const f of ['m/d/yyyy', 'yyyy-mm-dd', 'd-mmm-yy', 'mmm d, yyyy']) {
-        assert.equal(P('3/15/2023', f).v, 45000, f);
-        assert.equal(P('03/15/23', f).v, 45000);
-        assert.equal(P('15.3.2023', f).v, 45000);
-        assert.equal(P('Mar 15, 2023', f).v, 45000);
-        assert.equal(P('March 15 2023', f).v, 45000);
-        assert.equal(P('15-Mar-2023', f).v, 45000);
-        assert.equal(P('15 Mar 23', f).v, 45000);
-        assert.equal(P('3/15/2023 12:00', f).v, 45000.5);
-        assert.equal(P('Mar 2023', f).v, 44986);
+        assert.equal(P('3/15/2023', f)?.v, 45000, f);
+        assert.equal(P('03/15/23', f)?.v, 45000);
+        assert.equal(P('15.3.2023', f)?.v, 45000);
+        assert.equal(P('Mar 15, 2023', f)?.v, 45000);
+        assert.equal(P('March 15 2023', f)?.v, 45000);
+        assert.equal(P('15-Mar-2023', f)?.v, 45000);
+        assert.equal(P('15 Mar 23', f)?.v, 45000);
+        assert.equal(P('3/15/2023 12:00', f)?.v, 45000.5);
+        assert.equal(P('Mar 2023', f)?.v, 44986);
     }
-    assert.equal(P('15.3.2023', 'd.m.yyyy').v, 45000);
-    assert.equal(P('1/1/29', 'm/d/yy').v, OX.dateToSerial(new Date(Date.UTC(2029, 0, 1)), false));
-    assert.equal(P('1/1/30', 'm/d/yy').v, OX.dateToSerial(new Date(Date.UTC(1930, 0, 1)), false));
+    assert.equal(P('15.3.2023', 'd.m.yyyy')?.v, 45000);
+    assert.equal(P('1/1/29', 'm/d/yy')?.v, OX.dateToSerial(new Date(Date.UTC(2029, 0, 1)), false));
+    assert.equal(P('1/1/30', 'm/d/yy')?.v, OX.dateToSerial(new Date(Date.UTC(1930, 0, 1)), false));
     assert.deepEqual(P('2/30/2023', 'm/d/yyyy'), { t: 's', v: '2/30/2023' });
     assert.deepEqual(P('Foo 15, 2023', 'm/d/yyyy'), { t: 's', v: 'Foo 15, 2023' });
     assert.deepEqual(P('hello', 'm/d/yyyy'), { t: 's', v: 'hello' });
 });
 
 test('exportText', () => {
-    const E = (cell, fmt, d) => OX.exportText(cell, fmt ? { fmt } : null, d);
+    const E = (cell: FormatCell | null | undefined, fmt?: string, d?: boolean) =>
+        OX.exportText(cell, fmt ? { fmt } : null, d);
     assert.equal(E({ t: 'n', v: null, f: 'SUM(A1:A3)' }), '=SUM(A1:A3)');
     assert.equal(E({ t: 'n', v: 6, f: 'A1+A2' }, '0.00'), '=A1+A2');
     assert.equal(E({ t: 'n', v: 0.1 + 0.2 }), '0.3');
@@ -560,7 +585,7 @@ test('exportText', () => {
 });
 
 test('round trips: parseInput(exportText(x)) preserves cell', () => {
-    const cases = [
+    const cases: [FormatCell, string][] = [
         [{ t: 'n', v: 42 }, 'General'],
         [{ t: 'n', v: -1234.5678 }, '0.00'],
         [{ t: 'n', v: 0.1 + 0.2 }, 'General'],
@@ -595,21 +620,21 @@ test('round trips: parseInput(exportText(x)) preserves cell', () => {
     ];
     for (const d1904 of [false, true])
         for (const [cell, fmt] of cases) {
-            const style = { fmt };
+            const style: FormatStyle = { fmt };
             const text = OX.exportText(cell, style, d1904);
-            const back = OX.parseInput(text, cell, style, d1904);
+            const back: Loose | null = OX.parseInput(text, cell, style, d1904);
             if (cell.f) {
                 assert.deepEqual(back, { t: 'n', v: null, f: cell.f });
                 continue;
             }
-            assert.equal(back.t, cell.t, JSON.stringify([cell, fmt, text, back]));
+            assert.equal(back?.t, cell.t, JSON.stringify([cell, fmt, text, back]));
             if (cell.t === 'n') {
                 const tol = fmt.includes('hh') || (fmt.includes('mm') && !fmt.includes('d')) ? 1e-9 : 0;
                 assert.ok(
-                    Math.abs(back.v - cell.v) <= tol + Math.abs(cell.v) * 1e-15,
+                    Math.abs(num(back?.v) - num(cell.v)) <= tol + Math.abs(num(cell.v)) * 1e-15,
                     JSON.stringify([cell, fmt, text, back])
                 );
-            } else assert.equal(back.v, cell.v, JSON.stringify([cell, fmt, text, back]));
+            } else assert.equal(back?.v, cell.v, JSON.stringify([cell, fmt, text, back]));
         }
     // formatted display of a typed value is stable
     for (const [typed, fmt, shown] of [
@@ -644,7 +669,7 @@ test('stats helpers', () => {
 });
 
 test('benchmark', () => {
-    const styles = [
+    const styles: (FormatStyle | null)[] = [
         null,
         { fmt: 'General' },
         { fmt: '0.00' },
@@ -658,21 +683,24 @@ test('benchmark', () => {
         { fmt: '[Red]0.00;[Blue]-0.00' },
         { fmt: 'h:mm:ss' }
     ];
-    const cells = [];
+    interface BenchCell extends FormatCell {
+        si: number;
+    }
+    const cells: BenchCell[] = [];
     let seed = 5;
     const rnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
     for (let i = 0; i < 4000; i++) {
         const k = rnd();
-        const c =
+        const c: BenchCell =
             k < 0.3
-                ? { t: 's', v: 'Item ' + i }
+                ? { t: 's', v: 'Item ' + i, si: 0 }
                 : k < 0.5
-                  ? { t: 'n', v: Math.floor(rnd() * 100000) }
+                  ? { t: 'n', v: Math.floor(rnd() * 100000), si: 0 }
                   : k < 0.8
-                    ? { t: 'n', v: Math.round(rnd() * 1e6) / 100 }
+                    ? { t: 'n', v: Math.round(rnd() * 1e6) / 100, si: 0 }
                     : k < 0.9
-                      ? { t: 'n', v: 40000 + Math.floor(rnd() * 8000) + (i % 3 ? 0 : 0.5) }
-                      : { t: 'b', v: i % 2 === 0 };
+                      ? { t: 'n', v: 40000 + Math.floor(rnd() * 8000) + (i % 3 ? 0 : 0.5), si: 0 }
+                      : { t: 'b', v: i % 2 === 0, si: 0 };
         c.si = c.t === 'n' ? 1 + Math.floor(rnd() * (styles.length - 1)) : 0;
         cells.push(c);
     }
@@ -701,6 +729,7 @@ test('benchmark', () => {
     console.log(
         `formatCell fast formats: ${(N / (Number(process.hrtime.bigint() - t1) / 1e9) / 1e6).toFixed(2)}M calls/sec`
     );
+    assert.ok(len > 0);
     assert.ok(rate > 1.5e6, 'rate ' + rate);
 });
 
@@ -722,23 +751,23 @@ test('locale and odd format codes', () => {
 });
 
 test('typed times get duration and AM/PM formats', () => {
-    const P = s => OX.parseInput(s, undefined, null, false);
-    assert.equal(P('25:00').fmt, '[h]:mm');
-    assert.equal(P('25:00:10').fmt, '[h]:mm:ss');
-    assert.equal(P('10:30 PM').fmt, 'h:mm AM/PM');
-    assert.equal(P('10:30:15 pm').fmt, 'h:mm:ss AM/PM');
-    assert.equal(P('10:30').fmt, 'h:mm');
+    const P = (s: string): Loose | null => OX.parseInput(s, undefined, null, false);
+    assert.equal(P('25:00')?.fmt, '[h]:mm');
+    assert.equal(P('25:00:10')?.fmt, '[h]:mm:ss');
+    assert.equal(P('10:30 PM')?.fmt, 'h:mm AM/PM');
+    assert.equal(P('10:30:15 pm')?.fmt, 'h:mm:ss AM/PM');
+    assert.equal(P('10:30')?.fmt, 'h:mm');
     assert.equal(OX.exportText({ t: 'n', v: 0.1 + 0.2 }, null, false), '0.3');
-    assert.equal(OX.parseInput('#SPILL!', undefined, null, false).t, 'e');
-    assert.equal(OX.parseInput('#GETTING_DATA', undefined, null, false).t, 's');
+    assert.equal(OX.parseInput('#SPILL!', undefined, null, false)?.t, 'e');
+    assert.equal(OX.parseInput('#GETTING_DATA', undefined, null, false)?.t, 's');
 });
 
 test('General cells convert full m/d/yyyy dates and keep ambiguous text', () => {
-    const OXf = webview('core/format');
-    const r = OXf.parseInput('12/25/2024', null, null, false);
-    assert.equal(r.t, 'n');
-    assert.equal(r.fmt, 'm/d/yyyy');
-    assert.equal(r.v, 45651);
-    assert.equal(OXf.parseInput('3/4/24', null, null, false).t, 's');
-    assert.equal(OXf.parseInput('13/45/2024', null, null, false).t, 's');
+    const OXf = OX;
+    const r: Loose | null = OXf.parseInput('12/25/2024', null, null, false);
+    assert.equal(r?.t, 'n');
+    assert.equal(r?.fmt, 'm/d/yyyy');
+    assert.equal(r?.v, 45651);
+    assert.equal(OXf.parseInput('3/4/24', null, null, false)?.t, 's');
+    assert.equal(OXf.parseInput('13/45/2024', null, null, false)?.t, 's');
 });

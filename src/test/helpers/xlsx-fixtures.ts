@@ -1,37 +1,45 @@
-'use strict';
 // Builders for realistic XLSX packages (written the way Excel lays them out).
-const fflate = require('fflate');
+import assert from 'node:assert/strict';
+import * as fflate from 'fflate';
+import type { Cell, Sheet } from '../../webview/core/xlsx-reader.ts';
 
-const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
-const NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
-const HDR = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+export const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+export const NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+export const HDR = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 
-const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+export const esc = (s: unknown): string =>
+    String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-function zip(files, opts) {
-    const o = {};
+/** Deflate level accepted by fflate (0 = stored). */
+export type ZipLevel = NonNullable<fflate.ZipOptions['level']>;
+/** Package parts by zip path; text is encoded as UTF-8. */
+export type FixtureFiles = Record<string, string | Uint8Array>;
+export interface ZipOpts {
+    /** deflate level; defaults to 6 */
+    level?: ZipLevel | undefined;
+}
+
+export function zip(files: FixtureFiles, opts?: ZipOpts): Uint8Array {
+    const o: fflate.Zippable = {};
     for (const k of Object.keys(files)) {
         const v = files[k];
-        o[k] = [
-            typeof v === 'string' ? fflate.strToU8(v) : v,
-            { level: (opts && opts.level) != null ? opts.level : 6 }
-        ];
+        o[k] = [typeof v === 'string' ? fflate.strToU8(v) : v, { level: opts?.level ?? 6 }];
     }
     return fflate.zipSync(o);
 }
 
-function colName(c) {
+export function colName(c: number): string {
     let s = '';
     for (let n = c + 1; n > 0; n = Math.floor((n - 1) / 26)) s = String.fromCharCode(65 + ((n - 1) % 26)) + s;
     return s;
 }
 
-const THEME =
+export const THEME =
     HDR +
     `<a:theme xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" name="Office Theme"><a:themeElements><a:clrScheme name="Office"><a:dk1><a:sysClr val="windowText" lastClr="000000"/></a:dk1><a:lt1><a:sysClr val="window" lastClr="FFFFFF"/></a:lt1><a:dk2><a:srgbClr val="44546A"/></a:dk2><a:lt2><a:srgbClr val="E7E6E6"/></a:lt2><a:accent1><a:srgbClr val="4472C4"/></a:accent1><a:accent2><a:srgbClr val="ED7D31"/></a:accent2><a:accent3><a:srgbClr val="A5A5A5"/></a:accent3><a:accent4><a:srgbClr val="FFC000"/></a:accent4><a:accent5><a:srgbClr val="5B9BD5"/></a:accent5><a:accent6><a:srgbClr val="70AD47"/></a:accent6><a:hlink><a:srgbClr val="0563C1"/></a:hlink><a:folHlink><a:srgbClr val="954F72"/></a:folHlink></a:clrScheme><a:fontScheme name="Office"><a:majorFont><a:latin typeface="Calibri Light"/></a:majorFont><a:minorFont><a:latin typeface="Calibri"/></a:minorFont></a:fontScheme><a:fmtScheme name="Office"><a:fillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:fillStyleLst><a:lnStyleLst><a:ln w="6350"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="12700"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln><a:ln w="19050"><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:ln></a:lnStyleLst><a:effectStyleLst><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle><a:effectStyle><a:effectLst/></a:effectStyle></a:effectStyleLst><a:bgFillStyleLst><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill><a:solidFill><a:schemeClr val="phClr"/></a:solidFill></a:bgFillStyleLst></a:fmtScheme></a:themeElements></a:theme>`;
 
 // cellXfs index map used by the full workbook fixture
-const STYLES =
+export const STYLES =
     HDR +
     `<styleSheet xmlns="${NS}">
 <numFmts count="2"><numFmt numFmtId="164" formatCode="&quot;$&quot;#,##0.00"/><numFmt numFmtId="165" formatCode="[&gt;=100]0.0;0"/></numFmts>
@@ -71,7 +79,10 @@ const STYLES =
 <dxfs count="1"><dxf><font><color rgb="FF9C0006"/></font><fill><patternFill><bgColor rgb="FFFFC7CE"/></patternFill></fill></dxf></dxfs>
 </styleSheet>`;
 
-function sst(items) {
+/** A shared-string item: plain text, or the raw inner XML of an <si> element. */
+export type SstItem = string | { raw: string };
+
+export function sst(items: readonly SstItem[]): string {
     let n = 0;
     const body = items
         .map(it => {
@@ -86,20 +97,52 @@ function sst(items) {
     return HDR + `<sst xmlns="${NS}" count="${n}" uniqueCount="${n}">${body}</sst>`;
 }
 
-function contentTypes(extra) {
+export function contentTypes(extra?: string): string {
     return (
         HDR +
         `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${extra || ''}</Types>`
     );
 }
-const ROOT_RELS =
+export const ROOT_RELS =
     HDR +
     '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>';
 
-// opts: { sheets:[{name,state,xml,rels,relType,target}], date1904, sst, styles, theme, extraFiles, absoluteTargets, calcChain }
-function buildPackage(o) {
+/** One sheet (or chartsheet) part of a fixture package. */
+export interface SheetFixture {
+    name: string;
+    state?: 'hidden' | 'veryHidden' | undefined;
+    /** the sheet part's XML */
+    xml: string;
+    /** XML of the sheet's own relationships part */
+    rels?: string | undefined;
+    /** relationship type of the sheet in workbook.xml.rels; defaults to 'worksheet' */
+    relType?: 'worksheet' | 'chartsheet' | undefined;
+    /** relationship target; defaults to worksheets/sheet<N>.xml (a leading '/' makes it absolute) */
+    target?: string | undefined;
+}
+
+export interface PackageOptions {
+    sheets: readonly SheetFixture[];
+    date1904?: boolean | undefined;
+    /** sharedStrings.xml text */
+    sst?: string | undefined;
+    /** styles.xml text */
+    styles?: string | undefined;
+    /** theme1.xml text */
+    theme?: string | undefined;
+    /** additional parts by zip path */
+    extraFiles?: FixtureFiles | undefined;
+    /** reference styles.xml by an absolute target */
+    absoluteTargets?: boolean | undefined;
+    calcChain?: string | undefined;
+    /** raw <definedNames> XML */
+    definedNames?: string | undefined;
+    level?: ZipLevel | undefined;
+}
+
+export function buildPackage(o: PackageOptions): Uint8Array {
     const sheets = o.sheets;
-    const files = {};
+    const files: FixtureFiles = {};
     let ct = '';
     files['_rels/.rels'] = ROOT_RELS;
     let wbSheets = '',
@@ -135,7 +178,7 @@ function buildPackage(o) {
     }
     if (o.calcChain) {
         files['xl/calcChain.xml'] = o.calcChain;
-        rels += `<Relationship Id="rId${++n}" Type="${NS_R}/calcChain" Target="calcChain.xml"/>`;
+        rels += `<Relationship Id="rId${n + 1}" Type="${NS_R}/calcChain" Target="calcChain.xml"/>`;
     }
     files['[Content_Types].xml'] = contentTypes(ct);
     files['xl/workbook.xml'] =
@@ -148,19 +191,30 @@ function buildPackage(o) {
     return zip(files, { level: o.level });
 }
 
-function sheetXml(parts) {
-    const p = Object.assign(
-        {
-            pr: '',
-            dim: '',
-            views: '<sheetViews><sheetView workbookViewId="0"/></sheetViews>',
-            fmt: '<sheetFormatPr defaultRowHeight="15"/>',
-            cols: '',
-            data: '',
-            post: ''
-        },
-        parts
-    );
+/** Raw XML fragments of a worksheet, in document order; omitted ones get defaults. */
+export interface SheetXmlParts {
+    pr?: string;
+    dim?: string;
+    views?: string;
+    fmt?: string;
+    cols?: string;
+    /** the rows inside <sheetData> */
+    data?: string;
+    /** elements after <sheetData> */
+    post?: string;
+}
+
+export function sheetXml(parts: SheetXmlParts): string {
+    const p = {
+        pr: '',
+        dim: '',
+        views: '<sheetViews><sheetView workbookViewId="0"/></sheetViews>',
+        fmt: '<sheetFormatPr defaultRowHeight="15"/>',
+        cols: '',
+        data: '',
+        post: '',
+        ...parts
+    };
     return (
         HDR +
         `<worksheet xmlns="${NS}" xmlns:r="${NS_R}">${p.pr}${p.dim}${p.views}${p.fmt}${p.cols}<sheetData>${p.data}</sheetData>${p.post}</worksheet>`
@@ -168,8 +222,8 @@ function sheetXml(parts) {
 }
 
 // A feature-rich workbook. Returns bytes; `expected` documents what the reader should see.
-function fullWorkbook() {
-    const strings = [
+export function fullWorkbook(): Uint8Array {
+    const strings: SstItem[] = [
         'Name',
         'Value',
         'Hello & <World>',
@@ -242,10 +296,20 @@ function fullWorkbook() {
 }
 
 // Minimal workbook from rows of plain JS values (string|number|boolean|null), strings inline-shared.
-function simpleWorkbook(rows, opts) {
-    opts = opts || {};
-    const strs = [],
-        idx = new Map();
+/** A plain value of simpleWorkbook; null/undefined leave the cell empty. */
+export type SimpleValue = string | number | boolean | null | undefined;
+export interface SimpleWorkbookOptions {
+    styles?: string | undefined;
+    theme?: string | undefined;
+    date1904?: boolean | undefined;
+}
+
+export function simpleWorkbook(
+    rows: readonly (readonly SimpleValue[])[],
+    opts: SimpleWorkbookOptions = {}
+): Uint8Array {
+    const strs: string[] = [],
+        idx = new Map<string, number>();
     let data = '';
     rows.forEach((row, r) => {
         let cs = '';
@@ -275,10 +339,10 @@ function simpleWorkbook(rows, opts) {
 }
 
 // Big sheet for perf tests: numeric/string/formula mix, ~cols per row.
-function bigWorkbook(rows, cols) {
-    const strs = [];
+export function bigWorkbook(rows: number, cols: number): Uint8Array {
+    const strs: string[] = [];
     for (let i = 0; i < 1000; i++) strs.push('Item ' + i);
-    const chunks = [];
+    const chunks: string[] = [];
     for (let r = 0; r < rows; r++) {
         let row = `<row r="${r + 1}" spans="1:${cols}">`;
         for (let c = 0; c < cols; c++) {
@@ -301,22 +365,13 @@ function bigWorkbook(rows, cols) {
     });
 }
 
-module.exports = {
-    fflate,
-    esc,
-    zip,
-    colName,
-    buildPackage,
-    sheetXml,
-    sst,
-    fullWorkbook,
-    simpleWorkbook,
-    bigWorkbook,
-    STYLES,
-    THEME,
-    HDR,
-    NS,
-    NS_R,
-    ROOT_RELS,
-    contentTypes
-};
+/** Narrows a possibly missing value (asserting its presence). */
+export function must<T>(v: T | null | undefined, what = 'value'): T {
+    assert.ok(v !== undefined && v !== null, `${what} is missing`);
+    return v;
+}
+
+/** The cell at (r, c) of a loaded sheet; fails the test when absent. */
+export function cellAt(sh: Sheet, r: number, c: number): Cell {
+    return must(sh.rows[r]?.[c], `cell ${r},${c}`);
+}

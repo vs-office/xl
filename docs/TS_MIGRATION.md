@@ -1,6 +1,6 @@
 # План перевода проекта на TypeScript
 
-Статус: фазы 1 и 2 закоммичены, фаза 3 выполнена в ветке `ts-migration` (не закоммичено), дальше фаза 4 (тесты на TS). Отклонения от плана описаны в конце файла.
+Статус: фазы 1-3 закоммичены, фаза 4 (тесты на TS) выполнена в ветке `ts-migration` (не закоммичено), дальше фаза 5 (закрепление). Отклонения от плана описаны в конце файла.
 
 Образец организации репозитория и кодовой базы: [astral-sh/ruff-vscode](https://github.com/astral-sh/ruff-vscode). Берём оттуда структуру, набор скриптов, подход к проверкам и защите цепочки поставок. Правила против `any` у нас строже (см. раздел 3).
 
@@ -295,3 +295,13 @@ npm i -D typescript typescript-eslint eslint @eslint/js globals eslint-plugin-im
 - `calc.ts`: методы прототипа перенесены в класс `Calc`, кэш анализа формул хранится в `WeakMap`, а не на узлах AST. Подозрения на баги, оставленные как есть: `IFS` с массивом-условием считает его истинным; `OFFSET` без аргументов строки/столбца даёт `NaN`; `RANDBETWEEN` с текстом возвращает `#NUM!` вместо `#VALUE!`; кэш `vec1d` не используется при поиске по ссылке (только производительность).
 - `eslint`: `no-control-regex` выключен для TS (нужен для экранирования XML и проверки кодов формата), `no-console` выключен в `src/webview`.
 - Не проверено вручную в настоящем VS Code: открытие CSV/XLSX, редактирование и сохранение, восстановление вида (зум, позиция) после перезапуска, загрузка чанка `excel-edit.js`.
+
+### Фаза 4 (готово, не закоммичено)
+
+- Все тесты и хелперы (`src/test/**`, 23 файла и 4 хелпера, около 8,6 тыс. строк) переведены в ESM TypeScript. `node --test src/test/*.test.ts` запускает их напрямую (Node >= 22.18), `src/test/package.json` задаёт `"type": "module"`. Числа тестов совпадают с базовой линией по каждому файлу (всего 244).
+- Старый загрузчик `src/test/helpers/webview.js`, слияние `OX = {...a, ...b}` и вендоренная копия `src/webview/vendor/fflate.js` удалены. Тесты импортируют модули явно, с расширением `.ts`.
+- `tsconfig`: `module: esnext` и `moduleResolution: bundler` (нужны для `import.meta` в тестах). Сборка хоста идёт через `ts-loader`, который выдаёт ESM и отдаёт его webpack.
+- ESLint для `src/test/**/*.ts`: разрешён двойной cast `as unknown as T` (фейки VS Code/DOM), `no-floating-promises` пропускает вызовы `test`/`it`/`describe` из `node:test`. `any` запрещён и там.
+- В тестах осталось 7 двойных приведений `as unknown as`: 6 в `helpers/csv-host-sim.ts` (приватные детали `Module`, фейковые `ExtensionContext`/`WebviewPanel`/`TextDocument` для настоящих классов хоста, фейковые `window`/`document`/`acquireVsCodeApi`, `FakeShell` как `Shell`) и 1 в `grid-load.test.ts`. Каждое с комментарием.
+- Остаются на JS: `webpack.config.js` и `scripts/build-styles.js` (конфигурация сборки, как в ruff-vscode), вендоренный `ssf.js`.
+- Предложение агента: в `csvDocumentView.ts` у `CsvOptions` поля `lineNumbers` и `formatValues` имеют тип `string`, их можно сузить до `LineNumbersMode` и `FormatValuesMode` и убрать один cast в хелпере.

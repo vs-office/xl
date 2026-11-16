@@ -1,20 +1,15 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const fflate = require('fflate');
-const OX = {
-    ...webview('core/xlsx-reader'),
-    ...webview('core/format'),
-    ...webview('core/xlsx-writer'),
-    ...webview('core/xlsx-provider')
-};
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import * as fflate from 'fflate';
+import { readXlsx, zipLimits } from '../webview/core/xlsx-reader.ts';
+import { patchXlsx } from '../webview/core/xlsx-writer.ts';
+import { XlsxProvider } from '../webview/core/xlsx-provider.ts';
 const fl = fflate;
-const enc = s => new TextEncoder().encode(s);
+const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
 const BOMB = /too large or looks like a zip bomb/;
 
-function pkg(sheetBytes, extra) {
-    const o = {
+function pkg(sheetBytes: Uint8Array, extra?: Record<string, Uint8Array>): Uint8Array {
+    const o: Record<string, Uint8Array> = {
         '[Content_Types].xml': enc('<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'),
         '_rels/.rels': enc(
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>'
@@ -30,14 +25,14 @@ function pkg(sheetBytes, extra) {
     return fl.zipSync(Object.assign(o, extra || {}), { level: 9 });
 }
 const head = '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>';
-const bombSheet = mb => {
+const bombSheet = (mb: number): Uint8Array => {
     const u = new Uint8Array(mb * 1048576);
     u.fill(32);
     u.set(enc(head), 0);
     return u;
 };
 
-function forge(z, name) {
+function forge(z: Uint8Array, name: string): Uint8Array {
     const dv = new DataView(z.buffer, z.byteOffset, z.length);
     const eo = z.length - 22;
     let q = dv.getUint32(eo + 16, true);
@@ -54,29 +49,29 @@ function forge(z, name) {
 test('streamed sheet over the size limit aborts with the bomb error', async () => {
     const z = forge(pkg(bombSheet(8)), 'xl/worksheets/sheet1.xml');
     assert.ok(z.length < 100000);
-    assert.throws(() => OX.readXlsx(pkg(bombSheet(8)), { limits: { maxSheet: 2 * 1048576 } }), BOMB);
-    const wb = OX.readXlsx(z, { limits: { maxSheet: 2 * 1048576, maxTotal: 1e12 } });
+    assert.throws(() => readXlsx(pkg(bombSheet(8)), { limits: { maxSheet: 2 * 1048576 } }), BOMB);
+    const wb = readXlsx(z, { limits: { maxSheet: 2 * 1048576, maxTotal: 1e12 } });
     await assert.rejects(wb.loadSheetAsync(0), BOMB);
     assert.throws(() => wb.loadSheet(0), BOMB);
 });
 
 test('ratio rule aborts streaming only when the output is also large', async () => {
     const z = pkg(bombSheet(8));
-    const wb = OX.readXlsx(z, { limits: { ratio: 100, ratioMin: 1048576 } });
+    const wb = readXlsx(z, { limits: { ratio: 100, ratioMin: 1048576 } });
     await assert.rejects(wb.loadSheetAsync(0), BOMB);
-    const ok = OX.readXlsx(z, { limits: { ratio: 100, ratioMin: 64 * 1048576 } });
+    const ok = readXlsx(z, { limits: { ratio: 100, ratioMin: 64 * 1048576 } });
     assert.ok(await ok.loadSheetAsync(0));
 });
 
 test('declared total size, per-part size and entry count are capped', () => {
     const z = pkg(bombSheet(4));
-    assert.throws(() => OX.readXlsx(z, { limits: { maxTotal: 1048576 } }), BOMB);
+    assert.throws(() => readXlsx(z, { limits: { maxTotal: 1048576 } }), BOMB);
     const sst = pkg(enc(head + '</sheetData></worksheet>'), { 'xl/sharedStrings.xml': bombSheet(4) });
-    assert.throws(() => OX.readXlsx(sst, { limits: { maxPart: 1048576 } }), BOMB);
-    const many = {};
+    assert.throws(() => readXlsx(sst, { limits: { maxPart: 1048576 } }), BOMB);
+    const many: Record<string, Uint8Array> = {};
     for (let i = 0; i < 50; i++) many['docProps/x' + i + '.txt'] = enc('x');
     assert.throws(
-        () => OX.readXlsx(pkg(enc(head + '</sheetData></worksheet>'), many), { limits: { maxEntries: 20 } }),
+        () => readXlsx(pkg(enc(head + '</sheetData></worksheet>'), many), { limits: { maxEntries: 20 } }),
         BOMB
     );
 });
@@ -84,19 +79,19 @@ test('declared total size, per-part size and entry count are capped', () => {
 test('lying header sizes cannot bypass the inflate cap', () => {
     const z = pkg(enc(head + '</sheetData></worksheet>'), { 'xl/sharedStrings.xml': bombSheet(4) });
     forge(z, 'xl/sharedStrings.xml');
-    assert.throws(() => OX.readXlsx(z, { limits: { maxPart: 1048576 } }), BOMB);
+    assert.throws(() => readXlsx(z, { limits: { maxPart: 1048576 } }), BOMB);
 });
 
 test('writer inflate paths are guarded too', () => {
     const z = pkg(bombSheet(4));
-    const saved = Object.assign({}, OX.zipLimits);
+    const saved = Object.assign({}, zipLimits);
     try {
-        OX.zipLimits.maxSheet = 1048576;
-        assert.throws(() => OX.patchXlsx(z, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]), BOMB);
-        Object.assign(OX.zipLimits, saved, { maxEntries: 3 });
-        assert.throws(() => OX.patchXlsx(z, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]), BOMB);
+        zipLimits.maxSheet = 1048576;
+        assert.throws(() => patchXlsx(z, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]), BOMB);
+        Object.assign(zipLimits, saved, { maxEntries: 3 });
+        assert.throws(() => patchXlsx(z, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]), BOMB);
     } finally {
-        Object.assign(OX.zipLimits, saved);
+        Object.assign(zipLimits, saved);
     }
 });
 
@@ -105,18 +100,18 @@ test('odd entry names are inert lookup keys', () => {
         '../../evil.xml': enc('x'),
         '/abs/__proto__': enc('y')
     });
-    const wb = OX.readXlsx(z);
-    assert.equal(wb.loadSheet(0).rows[0][0].v, 5);
-    assert.ok(OX.patchXlsx(z, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 6 } }]).length > 0);
+    const wb = readXlsx(z);
+    assert.equal(wb.loadSheet(0).rows[0]?.[0]?.v, 5);
+    assert.ok(patchXlsx(z, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 6 } }]).length > 0);
 });
 
 test('provider exposes array formula ranges', () => {
     const sheet =
         head +
         '<row r="1"><c r="E1"><f t="array" ref="E1:E3">A1:A3*2</f><v>2</v></c></row><row r="2"><c r="E2"><v>4</v></c></row></sheetData></worksheet>';
-    const wb = OX.readXlsx(pkg(enc(sheet)));
-    const p = new OX.XlsxProvider(wb, wb.loadSheet(0));
+    const wb = readXlsx(pkg(enc(sheet)));
+    const p = new XlsxProvider(wb, wb.loadSheet(0));
     assert.deepEqual(p.arrayRanges(), [{ r1: 0, c1: 4, r2: 2, c2: 4, mr: 0, mc: 4 }]);
-    assert.equal(p.arrayAt(1, 4).mr, 0);
+    assert.equal(p.arrayAt(1, 4)?.mr, 0);
     assert.equal(p.arrayAt(1, 3), null);
 });

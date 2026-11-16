@@ -1,10 +1,10 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const OX = webview('core/xlsx-writer');
-const fflate = require('fflate');
-const XLSX = require('xlsx');
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import * as fflate from 'fflate';
+import * as XLSX from 'xlsx';
+import { patchXlsx, patchXlsxSheets, escapeXml, writerShiftFormula } from '../webview/core/xlsx-writer.ts';
+import type { CellEdit, EditCell } from '../webview/core/xlsx-writer.ts';
+import * as reader from '../webview/core/xlsx-reader.ts';
 
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const RNS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
@@ -14,7 +14,7 @@ const str = fflate.strFromU8;
 const XMLDECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
 
 // ---- helpers ----
-function colName(c) {
+function colName(c: number): string {
     let s = '';
     c++;
     while (c > 0) {
@@ -25,14 +25,14 @@ function colName(c) {
     return s;
 }
 
-function wellFormed(xml) {
+function wellFormed(xml: string): boolean {
     let i = 0;
     const n = xml.length,
-        stack = [];
+        stack: string[] = [];
     let roots = 0;
-    const ent = (s, what) => {
+    const ent = (s: string, what: string): void => {
         const re = /&([^;\s]*);?/g;
-        let m;
+        let m: RegExpExecArray | null;
         while ((m = re.exec(s))) {
             if (!/^(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);$/.test(m[0].slice(1)))
                 throw new Error('bad entity ' + m[0] + ' in ' + what);
@@ -76,7 +76,7 @@ function wellFormed(xml) {
         }
         // open tag: find '>' outside quotes
         let j = lt + 1,
-            q = null;
+            q: string | null = null;
         for (; j < n; j++) {
             const ch = xml[j];
             if (q) {
@@ -89,10 +89,10 @@ function wellFormed(xml) {
         let body = xml.slice(lt + 1, j);
         const sc = body.endsWith('/');
         if (sc) body = body.slice(0, -1);
-        const nm = /^[A-Za-z_][\w.\-]*(?::[A-Za-z_][\w.\-]*)?/.exec(body);
+        const nm = /^[A-Za-z_][\w.-]*(?::[A-Za-z_][\w.-]*)?/.exec(body);
         if (!nm) throw new Error('bad tag name at ' + lt + ': ' + body.slice(0, 30));
         let rest = body.slice(nm[0].length);
-        const seen = new Set();
+        const seen = new Set<string>();
         for (;;) {
             const am = /^\s+([A-Za-z_][\w.\-:]*)\s*=\s*(?:"([^"<]*)"|'([^'<]*)')/.exec(rest);
             if (!am) break;
@@ -113,7 +113,7 @@ function wellFormed(xml) {
     return true;
 }
 
-function colNum(ref) {
+function colNum(ref: string): number {
     let c = 0;
     for (const ch of ref) {
         const k = ch.charCodeAt(0);
@@ -123,9 +123,33 @@ function colNum(ref) {
     return c;
 }
 
+interface ParsedCell {
+    ref: string;
+    col: number;
+    s: string | null;
+    t: string | null;
+    v: string | null;
+    is: string | null;
+    f: string | null;
+    fattrs: string | null;
+    raw: string;
+}
+interface ParsedRow {
+    r: number;
+    attrs: string;
+    cells: ParsedCell[];
+    raw: string;
+}
+
+/** Unwraps a regexp match / lookup that the fixture guarantees. */
+function must<T>(v: T | null | undefined, what: string): T {
+    if (v === null || v === undefined) throw new Error('missing ' + what);
+    return v;
+}
+
 // parse sheetData into [{r, cells:[{ref,col,s,t,v,f,fattrs,raw}]}] and validate ordering
-function parseSheet(xml) {
-    const rows = [];
+function parseSheet(xml: string): ParsedRow[] {
+    const rows: ParsedRow[] = [];
     const sd = xml.indexOf('<sheetData');
     const body =
         sd < 0
@@ -135,19 +159,19 @@ function parseSheet(xml) {
                   xml.indexOf('</sheetData>') < 0 ? undefined : xml.indexOf('</sheetData>')
               );
     const rre = /<row\b([^>]*?)(\/>|>([\s\S]*?)<\/row>)/g;
-    let m,
+    let m: RegExpExecArray | null,
         lastR = 0;
     while ((m = rre.exec(body))) {
-        const r = +/\sr="(\d+)"/.exec(m[1])[1];
+        const r = +must(/\sr="(\d+)"/.exec(m[1]), 'row r')[1];
         assert.ok(r > lastR, 'rows sorted/unique: ' + r + ' after ' + lastR);
         lastR = r;
-        const cells = [];
+        const cells: ParsedCell[] = [];
         if (m[3]) {
             const cre = /<c\b([^>]*?)(\/>|>([\s\S]*?)<\/c>)/g;
-            let cm,
+            let cm: RegExpExecArray | null,
                 lastC = 0;
             while ((cm = cre.exec(m[3]))) {
-                const ref = /\sr="([A-Z]+)(\d+)"/.exec(cm[1]);
+                const ref = must(/\sr="([A-Z]+)(\d+)"/.exec(cm[1]), 'cell r');
                 assert.equal(+ref[2], r, 'cell row matches row');
                 const col = colNum(ref[1]);
                 assert.ok(col > lastC, 'cells sorted/unique in row ' + r);
@@ -175,13 +199,14 @@ function parseSheet(xml) {
     }
     return rows;
 }
-const cellMap = xml => {
-    const o = {};
+const cellMap = (xml: string): Record<string, ParsedCell> => {
+    const o: Record<string, ParsedCell> = {};
     for (const r of parseSheet(xml)) for (const c of r.cells) o[c.ref] = c;
     return o;
 };
 
-function relsXml(rels) {
+type Rel = readonly [id: string, type: string, target: string];
+function relsXml(rels: readonly Rel[]): string {
     return (
         XMLDECL +
         '<Relationships xmlns="' +
@@ -226,7 +251,7 @@ const SHEET3_NOSD =
     NS +
     '"><sheetViews><sheetView workbookViewId="0"/></sheetViews><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>';
 
-function wbXml(extra) {
+function wbXml(extra?: string): string {
     return (
         XMLDECL +
         '<workbook xmlns="' +
@@ -239,8 +264,14 @@ function wbXml(extra) {
     );
 }
 
-function buildFixture(o) {
-    o = o || {};
+interface FixtureOptions {
+    absTarget?: boolean;
+    wb?: string;
+    sheet1?: string;
+    noCalcChain?: boolean;
+}
+
+function buildFixture(o: FixtureOptions = {}): Uint8Array {
     const png = new Uint8Array(300);
     for (let i = 0; i < png.length; i++) png[i] = (i * 37 + 11) & 255;
     const ct =
@@ -263,7 +294,7 @@ function buildFixture(o) {
         ['rId5', T + 'sharedStrings', 'sharedStrings.xml'],
         ['rId6', T + 'calcChain', 'calcChain.xml']
     ]);
-    const files = {
+    const files: fflate.Zippable = {
         'xl/workbook.xml': u8(o.wb || wbXml()),
         '[Content_Types].xml': u8(ct),
         '_rels/.rels': u8(relsXml([['rId1', T + 'officeDocument', 'xl/workbook.xml']])),
@@ -298,19 +329,31 @@ function buildFixture(o) {
     return fflate.zipSync(files);
 }
 
-function patchAndRead(bytes, edits) {
-    const out = OX.patchXlsx(bytes, edits);
+function patchAndRead(bytes: Uint8Array, edits: readonly CellEdit[]): { out: Uint8Array; z: fflate.Unzipped } {
+    const out = patchXlsx(bytes, edits);
     const z = fflate.unzipSync(out);
     return { out, z };
 }
-function allWellFormed(z) {
+function allWellFormed(z: fflate.Unzipped): void {
     for (const k of Object.keys(z)) if (/\.(xml|rels)$/.test(k)) wellFormed(str(z[k]));
 }
-const eq = (a, b) => a.length === b.length && Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
+const eq = (a: Uint8Array, b: Uint8Array): boolean =>
+    a.length === b.length && Buffer.compare(Buffer.from(a), Buffer.from(b)) === 0;
+
+function isCellObject(x: unknown): x is XLSX.CellObject {
+    return typeof x === 'object' && x !== null && 't' in x;
+}
+/** SheetJS types worksheet indexing as `any`; this reads one cell through a typed lookup. */
+function sheetCell(wb: XLSX.WorkBook, sheet: string, ref: string): XLSX.CellObject | undefined {
+    const lookup: Record<string, unknown> = wb.Sheets[sheet];
+    const c = lookup[ref];
+    return isCellObject(c) ? c : undefined;
+}
+const readSheetJs = (bytes: Uint8Array): XLSX.WorkBook => XLSX.read(Buffer.from(bytes), { type: 'buffer' });
 
 // ---- tests ----
 test('formula shifter', () => {
-    const f = OX.writerShiftFormula;
+    const f = writerShiftFormula;
     assert.equal(f('A1+$B$2', 1, 1), 'B2+$B$2');
     assert.equal(f('SUM(A1:B$3)', 2, 3), 'SUM(D3:E$3)');
     assert.equal(f("'My Sheet'!C5+LOG10(A1)", 1, 0), "'My Sheet'!C6+LOG10(A2)");
@@ -325,7 +368,7 @@ test('formula shifter', () => {
 });
 
 test('escapeXml', () => {
-    assert.equal(OX.escapeXml('a<b>&"c\u0001'), 'a&lt;b&gt;&amp;&quot;c');
+    assert.equal(escapeXml('a<b>&"c\u0001'), 'a&lt;b&gt;&amp;&quot;c');
 });
 
 test('basic edits: values, types, untouched entries identical, wellformed', () => {
@@ -360,7 +403,7 @@ test('basic edits: values, types, untouched entries identical, wellformed', () =
     allWellFormed(z);
     const xml = str(z['xl/worksheets/sheet1.xml']);
     const cm = cellMap(xml);
-    assert.ok(cm.A1.is.includes(' lead &amp; trail &lt;x&gt; "q" \n line2\ttab '));
+    assert.ok(cm.A1.is?.includes(' lead &amp; trail &lt;x&gt; "q" \n line2\ttab '));
     assert.equal(cm.A1.t, 'inlineStr');
     assert.equal(cm.B1.v, '1e-7');
     assert.equal(cm.B1.s, '1');
@@ -389,16 +432,16 @@ test('basic edits: values, types, untouched entries identical, wellformed', () =
     assert.ok(!/<row r="1"[^>]*spans/.test(xml));
     assert.ok(xml.includes('<row r="2" ht="20" customHeight="1">'));
     // sheetjs round trip
-    const wb = XLSX.read(Buffer.from(out), { type: 'buffer' });
-    const ws = wb.Sheets.One;
-    assert.equal(ws.A1.v, long);
-    assert.equal(ws.D1.v, true);
-    assert.equal(ws.E1.t, 'e');
-    assert.equal(ws.F1.f, 'SUM(B1:B5)');
-    assert.equal(ws.E7.v, 'x\u0001y_x0041_');
-    assert.equal(ws.A4.v, 30);
-    assert.equal(ws.A5, undefined);
-    assert.equal(ws.C4.v, 60);
+    const wb = readSheetJs(out);
+    const sc = (ref: string): XLSX.CellObject | undefined => sheetCell(wb, 'One', ref);
+    assert.equal(sc('A1')?.v, long);
+    assert.equal(sc('D1')?.v, true);
+    assert.equal(sc('E1')?.t, 'e');
+    assert.equal(sc('F1')?.f, 'SUM(B1:B5)');
+    assert.equal(sc('E7')?.v, 'x\u0001y_x0041_');
+    assert.equal(sc('A4')?.v, 30);
+    assert.equal(sc('A5'), undefined);
+    assert.equal(sc('C4')?.v, 60);
 });
 
 test('cell values with formula keep cached value types', () => {
@@ -445,12 +488,12 @@ test('insert order: cell before, between, after existing; duplicates last wins',
 
 test('clearing nonexistent cells is a no-op returning identical bytes', () => {
     const orig = buildFixture();
-    const out = OX.patchXlsx(orig, [
+    const out = patchXlsx(orig, [
         { sheet: 0, r: 100, c: 100, cell: null },
         { sheet: 0, r: 0, c: 20, cell: null }
     ]);
     assert.equal(out, orig);
-    assert.equal(OX.patchXlsx(orig, []), orig);
+    assert.equal(patchXlsx(orig, []), orig);
 });
 
 test('shared formula master overwritten converts dependents', () => {
@@ -465,10 +508,8 @@ test('shared formula master overwritten converts dependents', () => {
     assert.equal(cm.B4.v, '60');
     assert.equal(cm.B4.s, '1');
     assert.ok(!xml.includes('t="shared"'));
-    const ws = XLSX.read(Buffer.from(OX.patchXlsx(orig, [{ sheet: 0, r: 1, c: 1, cell: { t: 'n', v: 99 } }])), {
-        type: 'buffer'
-    }).Sheets.One;
-    assert.equal(ws.B4.f, 'A4*2+$A$1');
+    const wb = readSheetJs(patchXlsx(orig, [{ sheet: 0, r: 1, c: 1, cell: { t: 'n', v: 99 } }]));
+    assert.equal(sheetCell(wb, 'One', 'B4')?.f, 'A4*2+$A$1');
 });
 
 test('shared formula master replaced by another formula', () => {
@@ -486,7 +527,7 @@ test('shared formula child overwritten keeps master', () => {
     const cm = cellMap(xml);
     assert.equal(cm.B4.f, null);
     assert.equal(cm.B4.v, '5');
-    assert.ok(cm.B2.fattrs.includes('shared'));
+    assert.ok(cm.B2.fattrs?.includes('shared'));
 });
 
 test('array formula: master overwrite ok, interior-only edit throws', () => {
@@ -495,7 +536,7 @@ test('array formula: master overwrite ok, interior-only edit throws', () => {
     const cm = cellMap(str(z['xl/worksheets/sheet1.xml']));
     assert.equal(cm.C4.f, null);
     assert.equal(cm.C5.v, '80');
-    assert.throws(() => OX.patchXlsx(orig, [{ sheet: 0, r: 4, c: 2, cell: { t: 'n', v: 1 } }]), /array formula/);
+    assert.throws(() => patchXlsx(orig, [{ sheet: 0, r: 4, c: 2, cell: { t: 'n', v: 1 } }]), /array formula/);
     // whole array cleared together is fine
     patchAndRead(orig, [
         { sheet: 0, r: 3, c: 2, cell: null },
@@ -517,9 +558,9 @@ test('empty sheetData and missing sheetData', () => {
     assert.ok(x2.includes('</sheetData><pageMargins'));
     const x3 = str(z['xl/worksheets/sheet3.xml']);
     assert.ok(x3.includes('</sheetViews><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><mergeCells'));
-    const wb = XLSX.read(Buffer.from(out), { type: 'buffer' });
-    assert.equal(wb.Sheets.Empty.B3.v, 5);
-    assert.equal(wb.Sheets.NoData.A1.v, 1);
+    const wb = readSheetJs(out);
+    assert.equal(sheetCell(wb, 'Empty', 'B3')?.v, 5);
+    assert.equal(sheetCell(wb, 'NoData', 'A1')?.v, 1);
 });
 
 test('calcChain removal bookkeeping and calcPr', () => {
@@ -546,7 +587,7 @@ test('calcChain removal bookkeeping and calcPr', () => {
     assert.ok(!str(r.z['[Content_Types].xml']).includes('calcChain'));
     // option off leaves everything
     const o2 = fflate.unzipSync(
-        OX.patchXlsx(orig, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }], { fullCalcOnLoad: false })
+        patchXlsx(orig, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }], { fullCalcOnLoad: false })
     );
     assert.ok(o2['xl/calcChain.xml']);
 });
@@ -576,14 +617,14 @@ test('prefixed worksheet XML throws a clear error', () => {
         NS +
         '"><x:sheetData><x:row r="1"><x:c r="A1"><x:v>1</x:v></x:c></x:row></x:sheetData></x:worksheet>';
     assert.throws(
-        () => OX.patchXlsx(buildFixture({ sheet1: s }), [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 2 } }]),
+        () => patchXlsx(buildFixture({ sheet1: s }), [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 2 } }]),
         /Prefixed worksheet/
     );
 });
 
 test('validation errors', () => {
     const orig = buildFixture();
-    const e = (edit, re) => assert.throws(() => OX.patchXlsx(orig, [edit]), re);
+    const e = (edit: CellEdit, re: RegExp): void => assert.throws(() => patchXlsx(orig, [edit]), re);
     e({ sheet: 3, r: 0, c: 0, cell: null }, /out of range/);
     e({ sheet: -1, r: 0, c: 0, cell: null }, /Invalid sheet/);
     e({ sheet: 0, r: 1048576, c: 0, cell: null }, /out of range/);
@@ -603,43 +644,38 @@ test('validation errors', () => {
 
 test('multiple sheets in one batch and patchXlsxSheets', () => {
     const orig = buildFixture();
-    const a = OX.patchXlsx(orig, [
+    const a = patchXlsx(orig, [
         { sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } },
         { sheet: 1, r: 0, c: 0, cell: { t: 'n', v: 2 } }
     ]);
-    const b = OX.patchXlsxSheets(orig, {
+    const b = patchXlsxSheets(orig, {
         0: [{ r: 0, c: 0, cell: { t: 'n', v: 1 } }],
         1: [{ r: 0, c: 0, cell: { t: 'n', v: 2 } }]
     });
     const za = fflate.unzipSync(a),
         zb = fflate.unzipSync(b);
     for (const k of Object.keys(za)) assert.ok(eq(za[k], zb[k]), k);
-    const wb = XLSX.read(Buffer.from(a), { type: 'buffer' });
-    assert.equal(wb.Sheets.One.A1.v, 1);
-    assert.equal(wb.Sheets.Empty.A1.v, 2);
+    const wb = readSheetJs(a);
+    assert.equal(sheetCell(wb, 'One', 'A1')?.v, 1);
+    assert.equal(sheetCell(wb, 'Empty', 'A1')?.v, 2);
 });
 
 test('double patch is stable and SheetJS-readable', () => {
     let b = buildFixture();
-    for (let i = 0; i < 3; i++) b = OX.patchXlsx(b, [{ sheet: 0, r: i, c: 6, cell: { t: 's', v: 'n' + i } }]);
-    const ws = XLSX.read(Buffer.from(b), { type: 'buffer' }).Sheets.One;
-    assert.equal(ws.G3.v, 'n2');
-    assert.equal(ws.A1.v, 'Hello');
-    assert.equal(ws.B1.v, 2.5);
+    for (let i = 0; i < 3; i++) b = patchXlsx(b, [{ sheet: 0, r: i, c: 6, cell: { t: 's', v: 'n' + i } }]);
+    const wb = readSheetJs(b);
+    assert.equal(sheetCell(wb, 'One', 'G3')?.v, 'n2');
+    assert.equal(sheetCell(wb, 'One', 'A1')?.v, 'Hello');
+    assert.equal(sheetCell(wb, 'One', 'B1')?.v, 2.5);
 });
 
 test('optional reader oracle', () => {
-    let R;
-    try {
-        R = webview('core/xlsx-reader');
-    } catch (_) {
-        return;
-    }
+    const R: Record<string, unknown> = { ...reader };
     if (!R.readXlsx && !R.openXlsx && !R.parseXlsx) return;
 });
 
 // ---- fuzz ----
-function rng(seed) {
+function rng(seed: number): () => number {
     let s = seed >>> 0;
     return () => {
         s = (s * 1664525 + 1013904223) >>> 0;
@@ -647,36 +683,45 @@ function rng(seed) {
     };
 }
 
-function genModel(rand, NR, NC) {
-    const m = new Map(); // "r,c" -> {kind, ...}
+type ModelBody =
+    | { k: 'n'; v: number }
+    | { k: 'sst'; v: number }
+    | { k: 'is'; v: string }
+    | { k: 'f'; f: string }
+    | { k: 'b'; v: boolean }
+    | { k: 'z' }
+    | { k: 'shm'; si: number; ref: string; f: string }
+    | { k: 'shc'; si: number };
+type ModelCell = ModelBody & { s: number | null };
+
+function genModel(rand: () => number, NR: number, NC: number): Map<string, ModelCell> {
+    const m = new Map<string, ModelCell>(); // "r,c" -> {kind, ...}
     for (let r = 0; r < NR; r++)
         for (let c = 0; c < NC; c++) {
             const x = rand();
             if (x < 0.45) continue;
             const s = rand() < 0.3 ? 1 + Math.floor(rand() * 3) : null;
-            let cell;
+            let cell: ModelBody;
             if (x < 0.6) cell = { k: 'n', v: Math.round(rand() * 1000) / 10 };
             else if (x < 0.7) cell = { k: 'sst', v: Math.floor(rand() * 4) };
             else if (x < 0.78) cell = { k: 'is', v: 'str' + r + '_' + c };
             else if (x < 0.84) cell = { k: 'f', f: colName(Math.max(0, c - 1)) + (r + 1) + '+1' };
             else if (x < 0.9) cell = { k: 'b', v: rand() < 0.5 };
             else cell = { k: 'z' };
-            cell.s = s;
-            m.set(r + ',' + c, cell);
+            m.set(r + ',' + c, { ...cell, s });
         }
     return m;
 }
-function modelToXml(m, NR, NC, rand, shared) {
-    const sst = v => v;
+function modelToXml(m: Map<string, ModelCell>, NR: number, NC: number, rand: () => number): string {
     let body = '';
     // optional shared formula groups: column NC-1 rows 2..6 (cells forced)
     for (let r = 0; r < NR; r++) {
         let cells = '',
-            any = false;
+            hasCells = false;
         for (let c = 0; c < NC; c++) {
             const x = m.get(r + ',' + c);
             if (!x) continue;
-            any = true;
+            hasCells = true;
             const ref = colName(c) + (r + 1),
                 s = x.s ? ' s="' + x.s + '"' : '';
             if (x.k === 'n') cells += '<c r="' + ref + '"' + s + '><v>' + x.v + '</v></c>';
@@ -701,7 +746,7 @@ function modelToXml(m, NR, NC, rand, shared) {
             else if (x.k === 'shc')
                 cells += '<c r="' + ref + '"' + s + '><f t="shared" si="' + x.si + '"/><v>1</v></c>';
         }
-        if (!any) {
+        if (!hasCells) {
             if (rand() < 0.3) body += '<row r="' + (r + 1) + '"/>';
             continue;
         }
@@ -735,7 +780,7 @@ test('fuzz: random edit batches against a model', () => {
             NC = 8;
         const model = genModel(rand, NR, NC);
         // shared formula groups: master at col c0 row r0, children below; formula "<left cell>*2"
-        const groups = [];
+        const groups: { c0: number; r0: number; len: number }[] = [];
         for (let g = 0; g < 2; g++) {
             const c0 = 1 + Math.floor(rand() * (NC - 1)),
                 r0 = Math.floor(rand() * 10),
@@ -761,7 +806,7 @@ test('fuzz: random edit batches against a model', () => {
         }
         const xml = modelToXml(model, NR, NC, rand);
         wellFormed(xml);
-        const files = {
+        const files: fflate.Zippable = {
             '[Content_Types].xml': u8(
                 '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/xl/workbook.xml" ContentType="x"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="y"/></Types>'
             ),
@@ -778,14 +823,14 @@ test('fuzz: random edit batches against a model', () => {
         };
         const orig = fflate.zipSync(files);
         // edits
-        const edits = [];
-        const exp = new Map();
+        const edits: CellEdit[] = [];
+        const exp = new Map<string, EditCell | null>();
         const n = 1 + Math.floor(rand() * 25);
         for (let i = 0; i < n; i++) {
             const r = Math.floor(rand() * (NR + 6)),
                 c = Math.floor(rand() * (NC + 3));
             const x = rand();
-            let cell;
+            let cell: EditCell | null;
             if (x < 0.2) cell = null;
             else if (x < 0.45) cell = { t: 'n', v: Math.round(rand() * 1e6) / 100 };
             else if (x < 0.65) cell = { t: 's', v: 's<' + i + '&' + (rand() < 0.3 ? ' ' : '') };
@@ -795,13 +840,13 @@ test('fuzz: random edit batches against a model', () => {
             edits.push({ sheet: 0, r, c, cell });
             exp.set(r + ',' + c, cell);
         }
-        const out = OX.patchXlsx(orig, edits);
+        const out = patchXlsx(orig, edits);
         const z = fflate.unzipSync(out);
         const nx = str(z['xl/worksheets/sheet1.xml']);
         wellFormed(nx);
         const cm = cellMap(nx); // also asserts ordering
         // expected state per cell
-        const killedShared = new Set();
+        const killedShared = new Set<{ c0: number; r0: number; len: number }>();
         for (const g of groups) {
             if (exp.has(g.r0 + ',' + g.c0)) killedShared.add(g);
         }
@@ -822,11 +867,13 @@ test('fuzz: random edit batches against a model', () => {
                         } else assert.equal(got, undefined, 'cleared ' + ref + ' seed ' + seed);
                     } else {
                         assert.ok(got, 'exists ' + ref);
+                        assert.ok(e);
                         if (old && old.s) assert.equal(got.s, String(old.s));
                         else assert.ok(got.s === null || r >= 0);
                         if (e.f) assert.equal(got.f, 'A1+' + e.f.slice(3));
-                        else if (e.t === 'n') assert.equal(+got.v, e.v);
-                        else if (e.t === 's') assert.equal(got.is, e.v.replace(/&/g, '&amp;').replace(/</g, '&lt;'));
+                        else if (e.t === 'n') assert.equal(Number(got.v), e.v);
+                        else if (e.t === 's')
+                            assert.equal(got.is, String(e.v).replace(/&/g, '&amp;').replace(/</g, '&lt;'));
                         else if (e.t === 'b') assert.equal(got.v, e.v ? '1' : '0');
                         else assert.equal(got.v, '#N/A');
                     }
@@ -837,7 +884,7 @@ test('fuzz: random edit batches against a model', () => {
                         continue;
                     }
                     assert.ok(got, 'untouched exists ' + ref);
-                    if (old.k === 'n') assert.equal(+got.v, old.v);
+                    if (old.k === 'n') assert.equal(Number(got.v), old.v);
                     else if (old.k === 'sst') assert.equal(got.t, 's');
                     else if (old.k === 'is') assert.equal(got.is, old.v);
                     else if (old.k === 'f') assert.equal(got.f, old.f);
@@ -845,9 +892,9 @@ test('fuzz: random edit batches against a model', () => {
                     else if (old.k === 'shm' || old.k === 'shc') {
                         const g = groups[old.si];
                         if (killedShared.has(g)) {
-                            assert.ok(!got.fattrs.includes('shared'));
+                            assert.ok(!got.fattrs?.includes('shared'));
                             assert.equal(got.f, colName(c - 1) + (r + 1) + '*2', 'converted ' + ref + ' seed ' + seed);
-                        } else assert.ok(got.fattrs.includes('shared'));
+                        } else assert.ok(got.fattrs?.includes('shared'));
                     }
                 }
             }
@@ -857,7 +904,7 @@ test('fuzz: random edit batches against a model', () => {
 // ---- perf ----
 test('perf: 200k rows, 100 edits', () => {
     const NR = 200000;
-    const rows = new Array(NR);
+    const rows = new Array<string>(NR);
     for (let r = 1; r <= NR; r++) {
         rows[r - 1] =
             '<row r="' +
@@ -897,7 +944,7 @@ test('perf: 200k rows, 100 edits', () => {
         '</sheetData></worksheet>';
     const orig = buildFixture({ sheet1: sheet });
     const rand = rng(42);
-    const edits = [];
+    const edits: CellEdit[] = [];
     for (let i = 0; i < 100; i++)
         edits.push({
             sheet: 0,
@@ -906,7 +953,7 @@ test('perf: 200k rows, 100 edits', () => {
             cell: i % 7 === 0 ? null : { t: 'n', v: i + 0.5 }
         });
     const t0 = process.hrtime.bigint();
-    const out = OX.patchXlsx(orig, edits);
+    const out = patchXlsx(orig, edits);
     const ms = Number(process.hrtime.bigint() - t0) / 1e6;
     console.log(
         'perf: sheet ' +
@@ -920,9 +967,8 @@ test('perf: 200k rows, 100 edits', () => {
             ' ms'
     );
     const x = str(fflate.unzipSync(out)['xl/worksheets/sheet1.xml']);
-    const last = new Map();
+    const last = new Map<string, CellEdit>();
     for (const e of edits) last.set(e.r + ',' + e.c, e);
-    const cm = {};
     const m = /<sheetData>/.exec(x);
     assert.ok(m);
     for (const [k, e] of last) {

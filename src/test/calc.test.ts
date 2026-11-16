@@ -1,61 +1,96 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const OX = webview('core/calc');
-const { budget } = require('./helpers/timing.js');
-const { Calc } = OX;
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { Calc } from '../webview/core/calc.ts';
+import type {
+    CalcCell,
+    CalcResult,
+    CalcStore,
+    CellPos,
+    ForEachCellCallback,
+    RecalcOptions,
+    RecalcResults,
+    SheetExtent
+} from '../webview/core/calc.ts';
+import { budget } from './helpers/timing.ts';
+
+/** A store cell: the fields the engine reads plus the style index every fixture cell carries. */
+type TestCell = CalcCell & { s: number };
+/** A fixture cell as written in a test: a literal (strings starting with `=` are formulas, `#` errors) or a full cell. */
+type FixtureValue = number | string | boolean | TestCell | null | undefined;
+type SheetFixture = Record<string, FixtureValue>;
+type Sheets = Record<string, SheetFixture>;
+interface StoreOptions {
+    date1904?: boolean;
+    now?: () => Date;
+}
+type Rng = () => number;
+
+function defined<T>(x: T | null | undefined): T {
+    if (x === null || x === undefined) throw new Error('expected a value');
+    return x;
+}
+/** The error code of a formula that fails to parse (undefined when it parses). */
+function parseError(text: string): string | undefined {
+    const ast = Calc.parse(text);
+    return ast.k === 'e' ? ast.error : undefined;
+}
 
 // ---- in-memory store (rows[r][c] = cell)
-function cellOf(x) {
+function cellOf(x: FixtureValue): TestCell | undefined {
     if (x === undefined || x === null) return undefined;
     if (typeof x === 'object') return x;
     if (typeof x === 'number') return { t: 'n', v: x, s: 0 };
     if (typeof x === 'boolean') return { t: 'b', v: x, s: 0 };
-    if (typeof x === 'string') {
-        if (x[0] === '=') return { t: 'n', v: 0, f: x.slice(1), s: 0 };
-        if (x[0] === '#') return { t: 'e', v: x, s: 0 };
-        return { t: 's', v: x, s: 0 };
-    }
+    if (x[0] === '=') return { t: 'n', v: 0, f: x.slice(1), s: 0 };
+    if (x[0] === '#') return { t: 'e', v: x, s: 0 };
+    return { t: 's', v: x, s: 0 };
 }
-class Store {
-    constructor(sheets, opts) {
+/** 'B3' -> [row, col] (zero based). */
+const addr = (a: string): [number, number] => {
+    const m = /^([A-Z]+)(\d+)$/.exec(a);
+    if (!m?.[1] || !m[2]) throw new Error('bad address ' + a);
+    let c = 0;
+    for (const ch of m[1]) c = c * 26 + ch.charCodeAt(0) - 64;
+    return [+m[2] - 1, c - 1];
+};
+class Store implements CalcStore {
+    sheetNames: string[];
+    date1904: boolean;
+    now: (() => Date) | undefined;
+    rows: Array<Array<Array<TestCell | undefined> | undefined>>;
+    constructor(sheets: Sheets, opts?: StoreOptions) {
         this.sheetNames = Object.keys(sheets);
-        this.date1904 = !!(opts && opts.date1904);
-        this.now = opts && opts.now;
+        this.date1904 = !!opts?.date1904;
+        this.now = opts?.now;
         this.rows = this.sheetNames.map(n => {
-            const rows = [];
-            for (const [addr, val] of Object.entries(sheets[n])) {
-                const m = /^([A-Z]+)(\d+)$/.exec(addr);
-                let c = 0;
-                for (const ch of m[1]) c = c * 26 + ch.charCodeAt(0) - 64;
-                const r = +m[2] - 1;
-                c -= 1;
-                (rows[r] || (rows[r] = []))[c] = cellOf(val);
+            const rows: Array<Array<TestCell | undefined> | undefined> = [];
+            for (const [a, val] of Object.entries(defined(sheets[n]))) {
+                const [r, c] = addr(a);
+                (rows[r] ??= [])[c] = cellOf(val);
             }
             return rows;
         });
     }
-    sheetIndexByName(n) {
+    sheetIndexByName(n: string): number {
         const l = n.toLowerCase();
         return this.sheetNames.findIndex(x => x.toLowerCase() === l);
     }
-    getCell(s, r, c) {
-        const row = this.rows[s] && this.rows[s][r];
+    getCell(s: number, r: number, c: number): TestCell | undefined {
+        const row = this.rows[s]?.[r];
         return row ? row[c] : undefined;
     }
-    setCell(s, r, c, x) {
-        const rows = this.rows[s];
-        (rows[r] || (rows[r] = []))[c] = cellOf(x);
+    setCell(s: number, r: number, c: number, x: FixtureValue): void {
+        const rows = defined(this.rows[s]);
+        (rows[r] ??= [])[c] = cellOf(x);
     }
-    getExtent(s) {
-        const rows = this.rows[s];
+    getExtent(s: number): SheetExtent {
+        const rows = defined(this.rows[s]);
         let cols = 0;
         for (const r of rows) if (r && r.length > cols) cols = r.length;
         return { rowCount: rows.length, colCount: cols };
     }
-    forEachCell(s, r1, c1, r2, c2, cb) {
-        const rows = this.rows[s];
+    forEachCell(s: number, r1: number, c1: number, r2: number, c2: number, cb: ForEachCellCallback): void {
+        const rows = defined(this.rows[s]);
         const re = Math.min(r2, rows.length - 1);
         for (let r = r1; r <= re; r++) {
             const row = rows[r];
@@ -68,7 +103,7 @@ class Store {
         }
     }
 }
-const FIX = {
+const FIX: Sheets = {
     Sheet1: {
         A1: 10,
         A2: 20,
@@ -105,21 +140,18 @@ const FIX = {
     },
     'My Sheet': { A1: 100, B1: "it's" }
 };
-function ev(f, sheets, opts) {
+function ev(f: string, sheets?: Sheets, opts?: StoreOptions): CalcResult {
     const st = new Store(sheets || FIX, opts);
     const c = new Calc(st);
     const r = c.evaluate(0, 20, 20, f);
     return r;
 }
-const val = (f, sheets, opts) => {
-    const r = ev(f, sheets, opts);
-    return r.v;
-};
-function close(a, b, eps) {
+function close(a: number, b: number, eps?: number): boolean {
     return Math.abs(a - b) <= (eps || 1e-9) * Math.max(1, Math.abs(b));
 }
-function table(name, rows, sheets, opts) {
-    test(name, () => {
+type Expected = number | string | boolean;
+function table(name: string, rows: Array<[string, Expected]>, sheets?: Sheets, opts?: StoreOptions): void {
+    void test(name, () => {
         for (const [f, exp] of rows) {
             const r = ev(f, sheets, opts);
             if (typeof exp === 'number' && !Number.isInteger(exp))
@@ -881,15 +913,9 @@ table('parser edge cases', [
 ]);
 
 // ---------------- engine: dependency recalculation ----------------
-const addr = a => {
-    const m = /^([A-Z]+)(\d+)$/.exec(a);
-    let c = 0;
-    for (const ch of m[1]) c = c * 26 + ch.charCodeAt(0) - 64;
-    return [+m[2] - 1, c - 1];
-};
-function apply(store, results) {
+function apply(store: Store, results: RecalcResults): void {
     for (const [k, res] of results) {
-        const [s, r, c] = k.split(',').map(Number);
+        const [s, r, c] = k.split(',').map(Number) as [number, number, number]; // keys are always 'sheet,r,c'
         const cell = store.getCell(s, r, c);
         if (cell) {
             cell.t = res.t;
@@ -897,14 +923,21 @@ function apply(store, results) {
         }
     }
 }
-function edit(store, calc, sheet, a, x, opts) {
+function edit(
+    store: Store,
+    calc: Calc,
+    sheet: number,
+    a: string,
+    x: FixtureValue,
+    opts?: RecalcOptions
+): RecalcResults {
     const [r, c] = addr(a);
     store.setCell(sheet, r, c, x);
     const res = calc.recalcDependents([{ sheet, r, c }], opts);
     apply(store, res);
     return res;
 }
-const got = (res, sheet, a) => {
+const got = (res: RecalcResults, sheet: number, a: string): CalcResult['v'] | undefined => {
     const [r, c] = addr(a);
     const x = res.get(`${sheet},${r},${c}`);
     return x ? x.v : undefined;
@@ -974,7 +1007,7 @@ test('recalcDependents: cross-sheet, whole-column, range growth, sheet-qualified
 });
 
 test('recalcDependents: interval index selects exactly the intersecting ranges', () => {
-    const sheet = {};
+    const sheet: SheetFixture = {};
     for (let i = 1; i <= 50; i++) sheet['A' + i] = i;
     for (let i = 1; i <= 40; i++) sheet['C' + i] = `=SUM(A${i}:A${i + 9})`; // sliding windows
     sheet.D1 = '=SUM(A1:A50)';
@@ -985,7 +1018,7 @@ test('recalcDependents: interval index selects exactly the intersecting ranges',
     c.recalcAll();
     const res = c.recalcDependents([{ sheet: 0, r: 24, c: 0 }]); // A25
     const keys = [...res.keys()].sort();
-    const want = [];
+    const want: string[] = [];
     for (let i = 16; i <= 25; i++) want.push(`0,${i - 1},2`);
     want.push('0,0,3');
     assert.deepEqual(keys, want.sort());
@@ -1005,7 +1038,7 @@ test('cycles: reported as #CIRC!, never hang, recover after fix', () => {
     const c = new Calc(st);
     let res = c.recalcAll();
     for (const a of ['A1', 'B1', 'D1', 'C1']) assert.equal(got(res, 0, a), '#CIRC!', a);
-    assert.equal(res.get('0,0,0').t, 'e');
+    assert.equal(defined(res.get('0,0,0')).t, 'e');
     assert.equal(got(res, 0, 'F1'), 2);
     assert.ok(res.circular >= 3);
     apply(st, res);
@@ -1035,18 +1068,18 @@ test('volatile cells recalc on every call; INDIRECT/OFFSET are volatile', () => 
     const r1 = c.recalcDependents([]);
     assert.ok(r1.has('0,0,1') && r1.has('0,0,2') && !r1.has('0,0,3'));
     const r2 = c.recalcDependents([]);
-    assert.notEqual(r1.get('0,0,1').v, r2.get('0,0,1').v);
+    assert.notEqual(defined(r1.get('0,0,1')).v, defined(r2.get('0,0,1')).v);
     assert.equal(c.recalcDependents([], { volatile: false }).size, 0);
 });
 
 test('partial results: work cap and pending list resume to the same final state', () => {
-    const sheet = { A1: 1 };
+    const sheet: SheetFixture = { A1: 1 };
     for (let i = 2; i <= 300; i++) sheet['A' + i] = `=A${i - 1}+1`;
     const st = new Store({ S: sheet });
     const c = new Calc(st);
     const [r, cc] = addr('A1');
     st.setCell(0, r, cc, 10);
-    let res = c.recalcDependents([{ sheet: 0, r, c: cc }], { maxEvals: 100 });
+    const res = c.recalcDependents([{ sheet: 0, r, c: cc }], { maxEvals: 100 });
     assert.equal(res.partial, true);
     assert.equal(res.pending.length, 199);
     apply(st, res);
@@ -1056,7 +1089,7 @@ test('partial results: work cap and pending list resume to the same final state'
 });
 
 test('time budget yields partial results', () => {
-    const sheet = { A1: 1 };
+    const sheet: SheetFixture = { A1: 1 };
     for (let i = 2; i <= 20000; i++) sheet['A' + i] = `=A${i - 1}+1`;
     const st = new Store({ S: sheet });
     const c = new Calc(st);
@@ -1129,9 +1162,12 @@ test('errors in store cells and typed cells', () => {
 });
 
 test('store without forEachCell/getExtent still evaluates direct references', () => {
-    const rows = { '0,0': 3, '1,0': 4 };
+    const rows: Record<string, number | undefined> = { '0,0': 3, '1,0': 4 };
     const c = new Calc({
-        getCell: (s, r, cc) => (rows[r + ',' + cc] === undefined ? undefined : { t: 'n', v: rows[r + ',' + cc] }),
+        getCell: (_s, r, cc) => {
+            const v = rows[r + ',' + cc];
+            return v === undefined ? undefined : { t: 'n', v };
+        },
         sheetNames: ['S'],
         sheetIndexByName: n => (n === 'S' ? 0 : -1)
     });
@@ -1142,7 +1178,7 @@ test('store without forEachCell/getExtent still evaluates direct references', ()
 
 test('parse cache and AST shape', () => {
     assert.equal(Calc.parse('1+2'), Calc.parse('1+2'));
-    assert.equal(Calc.parse('SUM(').error, '#NAME?');
+    assert.equal(parseError('SUM('), '#NAME?');
     assert.equal(Calc.parse('SUM(A1:B2)').k, 'fn');
     assert.ok(Calc.functionNames().length >= 140);
     for (const n of ['SUM', 'VLOOKUP', 'XLOOKUP', 'TEXTJOIN', 'SUMIFS', 'DATEDIF', 'IFS', 'SWITCH'])
@@ -1150,7 +1186,7 @@ test('parse cache and AST shape', () => {
 });
 
 // ---------------- property tests: incremental == full recomputation ----------------
-function rng(seed) {
+function rng(seed: number): Rng {
     let a = seed >>> 0;
     return () => {
         a = (a + 0x6d2b79f5) >>> 0;
@@ -1160,39 +1196,45 @@ function rng(seed) {
         return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
     };
 }
-const colName = c => String.fromCharCode(65 + c);
+const colName = (c: number): string => String.fromCharCode(65 + c);
 // independent oracle: lazily/recursively evaluates formula cells with a fresh engine per formula (no graph, no overlay)
-class OracleStore {
-    constructor(base) {
+class OracleStore implements CalcStore {
+    sheetNames: string[];
+    date1904: boolean;
+    memo = new Map<string, TestCell>();
+    base: Store;
+    constructor(base: Store) {
         this.base = base;
         this.sheetNames = base.sheetNames;
         this.date1904 = base.date1904;
-        this.memo = new Map();
     }
-    sheetIndexByName(n) {
+    sheetIndexByName(n: string): number {
         return this.base.sheetIndexByName(n);
     }
-    getExtent(s) {
+    getExtent(s: number): SheetExtent {
         return this.base.getExtent(s);
     }
-    getCell(s, r, c) {
+    getCell(s: number, r: number, c: number): TestCell | undefined {
         const cell = this.base.getCell(s, r, c);
-        if (!cell || !cell.f) return cell;
+        if (!cell?.f) return cell;
         const k = s + ',' + r + ',' + c;
         let m = this.memo.get(k);
         if (!m) {
-            this.memo.set(k, { t: 'n', v: 0 });
+            this.memo.set(k, { t: 'n', v: 0, s: 0 });
             const res = new Calc(this).evaluate(s, r, c, cell.f, { array: !!cell.fa });
             m = { t: res.t, v: res.v, f: cell.f, s: 0 };
             this.memo.set(k, m);
         }
         return m;
     }
-    forEachCell(s, r1, c1, r2, c2, cb) {
-        this.base.forEachCell(s, r1, c1, r2, c2, (r, c) => cb(r, c, this.getCell(s, r, c)));
+    forEachCell(s: number, r1: number, c1: number, r2: number, c2: number, cb: ForEachCellCallback): void {
+        this.base.forEachCell(s, r1, c1, r2, c2, (r, c) => {
+            const cell = this.getCell(s, r, c);
+            if (cell) cb(r, c, cell);
+        });
     }
 }
-function randomFormula(rnd, nr, nc, r, c, sheets) {
+function randomFormula(rnd: Rng, _nr: number, nc: number, r: number, _c: number, sheets: number): string {
     if (r === 0) return '1+1';
     const ref = () => {
         const rr = Math.floor(rnd() * r),
@@ -1238,10 +1280,10 @@ function randomFormula(rnd, nr, nc, r, c, sheets) {
             return `${ref()}*2-${ref()}`;
     }
 }
-function buildRandom(rnd, nsheets, nr, nc) {
-    const sheets = {};
+function buildRandom(rnd: Rng, nsheets: number, nr: number, nc: number): Sheets {
+    const sheets: Sheets = {};
     for (let s = 0; s < nsheets; s++) {
-        const sh = {};
+        const sh: SheetFixture = {};
         for (let r = 0; r < nr; r++)
             for (let c = 0; c < nc; c++) {
                 const x = rnd();
@@ -1254,13 +1296,17 @@ function buildRandom(rnd, nsheets, nr, nc) {
     }
     return sheets;
 }
-function compareToOracle(st, label) {
+function compareToOracle(st: Store, label: string): void {
     const o = new OracleStore(st);
     for (let s = 0; s < st.rows.length; s++)
         st.forEachCell(s, 0, 0, 1e6, 1e6, (r, c, cell) => {
             if (!cell.f) return;
-            const exp = o.getCell(s, r, c);
-            const ok = cell.t === exp.t && (typeof exp.v === 'number' ? close(cell.v, exp.v, 1e-9) : cell.v === exp.v);
+            const exp = defined(o.getCell(s, r, c));
+            const ok =
+                cell.t === exp.t &&
+                (typeof exp.v === 'number'
+                    ? typeof cell.v === 'number' && close(cell.v, exp.v, 1e-9)
+                    : cell.v === exp.v);
             assert.ok(
                 ok,
                 `${label}: ${s}!${colName(c)}${r + 1} =${cell.f}: got ${cell.t}:${cell.v} expected ${exp.t}:${exp.v}`
@@ -1279,14 +1325,14 @@ test('property: incremental recalculation equals full recalculation on random sh
         apply(st, calc.recalcAll());
         compareToOracle(st, `seed ${seed} initial`);
         for (let round = 0; round < 12; round++) {
-            const changed = [];
+            const changed: CellPos[] = [];
             const k = 1 + Math.floor(rnd() * 3);
             for (let i = 0; i < k; i++) {
                 const s = Math.floor(rnd() * nsheets),
                     r = Math.floor(rnd() * nr),
                     c = Math.floor(rnd() * nc),
                     x = rnd();
-                let nv;
+                let nv: FixtureValue;
                 if (x < 0.55) nv = Math.floor(rnd() * 9) - 3;
                 else if (x < 0.65) nv = ['a', 'b', 'x', ''][Math.floor(rnd() * 4)];
                 else if (x < 0.72) nv = undefined;
@@ -1314,7 +1360,10 @@ test('property: recalcAll after reset gives the same values as the incremental e
         apply(st, full);
         const b = new Calc(st);
         const full2 = b.recalcAll();
-        for (const [k, v] of full) assert.deepEqual({ t: full2.get(k).t, v: full2.get(k).v }, { t: v.t, v: v.v });
+        for (const [k, v] of full) {
+            const v2 = defined(full2.get(k));
+            assert.deepEqual({ t: v2.t, v: v2.v }, { t: v.t, v: v.v });
+        }
     }
 });
 
@@ -1332,37 +1381,31 @@ test('property: cycles injected into random sheets never hang and non-cyclic cel
 });
 
 // ---------------- performance ----------------
-function bigStore(rows, cols, fill) {
+function bigStore(rows: number, cols: number, fill: (r: number, c: number) => TestCell | undefined): Store {
     const st = new Store({ S: {} });
-    const data = new Array(rows);
-    for (let r = 0; r < rows; r++) {
-        const row = new Array(cols);
-        for (let c = 0; c < cols; c++) row[c] = fill(r, c);
-        data[r] = row;
-    }
-    st.rows[0] = data;
+    st.rows[0] = Array.from({ length: rows }, (_r, r) => Array.from({ length: cols }, (_c, c) => fill(r, c)));
     return st;
 }
 test('perf: parser handles 8192-char formulas quickly, deep nesting safely', () => {
     let f = '1';
     while (f.length < 8000) f += '+A1*2';
     let t = process.hrtime.bigint();
-    const ast = Calc.parse(f);
+    Calc.parse(f);
     const dt = Number(process.hrtime.bigint() - t) / 1e6;
-    assert.ok(!ast.error);
+    assert.ok(!parseError(f));
     assert.ok(dt < budget(50), 'parse ms ' + dt);
     let g = 'SUM(';
     while (g.length < 8000) g += 'A1,';
     g += '1)';
     t = process.hrtime.bigint();
-    assert.ok(!Calc.parse(g).error);
+    assert.ok(!parseError(g));
     const dt2 = Number(process.hrtime.bigint() - t) / 1e6;
     const deep = '('.repeat(3000) + '1' + ')'.repeat(3000);
-    assert.equal(Calc.parse(deep).error, '#NAME?');
+    assert.equal(parseError(deep), '#NAME?');
     const evil = '"' + 'a'.repeat(8000);
-    assert.ok(Calc.parse(evil).error);
+    assert.ok(parseError(evil));
     const evil2 = ':'.repeat(8000) + 'A'.repeat(100);
-    assert.ok(Calc.parse(evil2).error);
+    assert.ok(parseError(evil2));
     const evil3 = 'A1'.repeat(3000);
     const t3 = process.hrtime.bigint();
     Calc.parse(evil3);
@@ -1408,13 +1451,13 @@ test('perf: 100k-formula chain recalculates iteratively (no recursion limits)', 
     const res0 = calc.recalcDependents([{ sheet: 0, r: 0, c: 0 }]);
     const dtFirst = Number(process.hrtime.bigint() - t) / 1e6;
     assert.equal(res0.size, N - 1);
-    assert.equal(res0.get(`0,${N - 1},0`).v, N);
+    assert.equal(defined(res0.get(`0,${N - 1},0`)).v, N);
     apply(st, res0);
     st.setCell(0, 0, 0, 5);
     t = process.hrtime.bigint();
     const res = calc.recalcDependents([{ sheet: 0, r: 0, c: 0 }]);
     const dt = Number(process.hrtime.bigint() - t) / 1e6;
-    assert.equal(res.get(`0,${N - 1},0`).v, N + 4);
+    assert.equal(defined(res.get(`0,${N - 1},0`)).v, N + 4);
     assert.equal(res.partial, false);
     console.log(
         `[perf] 100k chain: first call (scan+parse+calc) ${dtFirst.toFixed(0)} ms, incremental edit ${dt.toFixed(0)} ms`
@@ -1439,24 +1482,24 @@ test('perf: 100k fan-in / fan-out', () => {
     let res = calc.recalcAll();
     const dtAll = Number(process.hrtime.bigint() - t) / 1e6;
     apply(st, res);
-    assert.equal(res.get('0,0,2').v, 2 * ((N * (N - 1)) / 2));
+    assert.equal(defined(res.get('0,0,2')).v, 2 * ((N * (N - 1)) / 2));
     st.setCell(0, 500, 0, 1000);
     t = process.hrtime.bigint();
     res = calc.recalcDependents([{ sheet: 0, r: 500, c: 0 }]);
     const dt1 = Number(process.hrtime.bigint() - t) / 1e6;
     assert.equal(res.size, 2);
-    assert.equal(res.get('0,0,2').v, 2 * ((N * (N - 1)) / 2) - 1000 + 2000);
+    assert.equal(defined(res.get('0,0,2')).v, 2 * ((N * (N - 1)) / 2) - 1000 + 2000);
     apply(st, res);
-    const all = [];
+    const all: CellPos[] = [];
     for (let r = 0; r < N; r++) {
-        st.getCell(0, r, 0).v = 1;
+        defined(st.getCell(0, r, 0)).v = 1;
         all.push({ sheet: 0, r, c: 0 });
     }
     t = process.hrtime.bigint();
     res = calc.recalcDependents(all);
     const dt2 = Number(process.hrtime.bigint() - t) / 1e6;
     assert.equal(res.size, N + 1);
-    assert.equal(res.get('0,0,2').v, 2 * N);
+    assert.equal(defined(res.get('0,0,2')).v, 2 * N);
     console.log(
         `[perf] fan-in 100k: recalcAll ${dtAll.toFixed(0)} ms (incl. scan), single edit ${dt1.toFixed(1)} ms, 100k edits at once ${dt2.toFixed(0)} ms`
     );
@@ -1483,8 +1526,8 @@ test('perf: VLOOKUP exact over 20k rows x 20k lookups uses the cached index', ()
     const t = process.hrtime.bigint();
     const res = calc.recalcAll();
     const dt = Number(process.hrtime.bigint() - t) / 1e6;
-    assert.equal(res.get(`0,0,2`).v, N - 1);
-    assert.equal(res.get(`0,${N - 1},2`).v, 0);
+    assert.equal(defined(res.get(`0,0,2`)).v, N - 1);
+    assert.equal(defined(res.get(`0,${N - 1},2`)).v, 0);
     console.log(`[perf] 20k exact VLOOKUPs over 20k rows: ${dt.toFixed(0)} ms`);
     assert.ok(dt < 3000);
 });
@@ -1500,7 +1543,7 @@ test('array formulas: evaluateMatrix returns all members, recalc results flag ar
     st.setCell(0, 0, 0, 10);
     const res = c.recalcDependents([{ sheet: 0, r: 0, c: 0 }]);
     assert.deepEqual(res.arrays, [{ sheet: 0, r: 0, c: 4 }]);
-    assert.equal(res.get('0,0,4').array, true);
+    assert.equal(defined(res.get('0,0,4')).array, true);
     assert.deepEqual(
         c.evaluateMatrix(0, 0, 4, 'A1:A3*2').map(row => row[0].v),
         [20, 4, 6]

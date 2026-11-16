@@ -1,23 +1,20 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert');
-const OX = {
-    ...webview('core/csv-parser'),
-    ...webview('core/csv-provider'),
-    ...webview('core/format'),
-    ...webview('core/grid-core'),
-    ...webview('core/app-shell')
-};
-const { budget } = require('./helpers/timing.js');
+import test from 'node:test';
+import assert from 'node:assert';
+import { indexCsv } from '../webview/core/csv-parser.ts';
+import { CsvProvider } from '../webview/core/csv-provider.ts';
+import type { CsvProviderOptions } from '../webview/core/csv-provider.ts';
+import { mergeSortGen, radixRows, runTask, Shell } from '../webview/core/app-shell.ts';
+import type { ShellProvider, TextFilterOp } from '../webview/core/app-shell.ts';
+import type { GridSelection, GridView } from '../webview/core/grid.ts';
+import { budget } from './helpers/timing.ts';
 
 let seed = 987654321;
-const rnd = n => {
+const rnd = (n: number): number => {
     seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
     return Math.floor((seed / 4294967296) * n);
 };
-const wait = ms => new Promise(r => setTimeout(r, ms));
-const waitFor = async (fn, ms = 20000) => {
+const wait = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+const waitFor = async (fn: () => boolean, ms = 20000) => {
     const t0 = Date.now();
     while (!fn()) {
         if (Date.now() - t0 > ms) throw new Error('timeout');
@@ -26,8 +23,13 @@ const waitFor = async (fn, ms = 20000) => {
 };
 
 // A Shell without DOM: only the view/stats pipeline is exercised.
-function mkShell(provider, hdr, sel) {
-    const sh = Object.create(OX.Shell.prototype);
+interface TestShell extends Shell {
+    msgs: string[];
+    gridView: GridView | null | undefined;
+}
+function mkShell(provider: ShellProvider, hdr: number, sel?: GridSelection): TestShell {
+    // Shell without its DOM-building constructor: only the fields of the view/stats pipeline are provided
+    const sh = Object.create(Shell.prototype) as TestShell;
     Object.assign(sh, {
         provider,
         view: { sort: null, filters: new Map() },
@@ -40,52 +42,56 @@ function mkShell(provider, hdr, sel) {
         stats: { textContent: '' },
         btnClear: { style: {} },
         grid: {
-            setView(v) {
+            setView(v: GridView | null) {
                 sh.gridView = v;
             },
-            getSelection: () => sel || { ranges: [{ r1: 0, c1: 0, r2: 0, c2: 0 }] }
+            getSelection: () => sel || { active: { r: 0, c: 0, sr: 0 }, ranges: [{ r1: 0, c1: 0, r2: 0, c2: 0 }] }
         }
     });
-    sh.setMessage = m => sh.msgs.push(m);
+    sh.setMessage = (m: string) => void sh.msgs.push(m);
     sh._updateAll = () => {};
     return sh;
 }
-const csvProvider = (text, o) =>
-    new OX.CsvProvider(OX.indexCsv(text, { hasHeaders: true }), Object.assign({ hasHeaders: true }, o));
-const done = sh => waitFor(() => !sh.busy());
+const csvProvider = (text: string, o?: CsvProviderOptions) =>
+    new CsvProvider(indexCsv(text, { hasHeaders: true }), Object.assign({ hasHeaders: true }, o));
+const orderOf = (sh: Shell): number[] => {
+    assert.ok(sh._order);
+    return Array.from(sh._order);
+};
+const done = (sh: Shell) => waitFor(() => !sh.busy());
 
 // the pre-redesign comparator, as the oracle
-function oracle(p, hdr, c, dir, filt) {
-    const keyOf = r => {
+function oracle(p: CsvProvider, hdr: number, c: number, dir: number, filt?: (r: number) => boolean): number[] {
+    const keyOf = (r: number): number | string | null => {
         const raw = p.getRaw(r, c);
         if (raw === '') return null;
         const n = Number(raw);
         return n === n && raw.trim() !== '' && !/^[=']/.test(raw) ? n : raw.toLowerCase();
     };
-    let rows = [];
+    const rows: number[] = [];
     for (let r = hdr; r < p.rowCount; r++) {
         if (filt && !filt(r)) continue;
         rows.push(r);
     }
     const keys = new Map(rows.map(r => [r, keyOf(r)]));
     rows.sort((a, b) => {
-        const ka = keys.get(a),
-            kb = keys.get(b);
+        const ka = keys.get(a) ?? null,
+            kb = keys.get(b) ?? null;
         if (ka === kb) return a - b;
         if (ka === null) return 1;
         if (kb === null) return -1;
         const na = typeof ka === 'number',
             nb = typeof kb === 'number';
         if (na !== nb) return na ? -1 : 1;
-        const d = na ? ka - kb : ka < kb ? -1 : 1;
+        const d = na ? ka - (kb as number) : ka < (kb as string) ? -1 : 1; // na/nb say which
         return d * dir || a - b;
     });
-    const out = [];
+    const out: number[] = [];
     for (let r = 0; r < hdr; r++) out.push(r);
     return out.concat(rows);
 }
 
-function genCsv(rows) {
+function genCsv(rows: number): string {
     const names = ['alpha', 'Beta', 'gamma', 'Delta', 'epsilon', 'ALPHA', 'beta', ''];
     const lines = ['id,num,txt,mixed'];
     for (let i = 0; i < rows; i++) {
@@ -97,7 +103,7 @@ function genCsv(rows) {
 }
 
 // a provider that only offers getRaw/getCell, like the XLSX one: exercises the generic fallbacks
-function plain(p) {
+function plain(p: CsvProvider): ShellProvider {
     return {
         get rowCount() {
             return p.rowCount;
@@ -105,9 +111,14 @@ function plain(p) {
         get colCount() {
             return p.colCount;
         },
-        getRaw: (r, c) => p.getRaw(r, c),
-        getCell: (r, c) => p.getCell(r, c),
-        frozenRows: 1
+        getRaw: (r: number, c: number) => p.getRaw(r, c),
+        getCell: (r: number, c: number) => p.getCell(r, c),
+        colWidth: (c: number) => p.colWidth(c),
+        rowHeight: (r: number) => p.rowHeight(r),
+        isColHidden: () => p.isColHidden(),
+        isRowHidden: () => p.isRowHidden(),
+        frozenRows: 1,
+        frozenCols: 0
     };
 }
 
@@ -119,7 +130,7 @@ test('sort: CSV fast path and generic path equal the old comparator (asc/desc, b
                 const sh = mkShell(prov, 1);
                 sh.sortBy(c, dir);
                 await done(sh);
-                assert.deepStrictEqual(Array.from(sh._order), oracle(p, 1, c, dir), 'col ' + c + ' dir ' + dir);
+                assert.deepStrictEqual(orderOf(sh), oracle(p, 1, c, dir), 'col ' + c + ' dir ' + dir);
             }
     }
 });
@@ -139,17 +150,18 @@ test('filter by values and by text, combined with sort, equals a direct row scan
             1,
             -1,
             r =>
-                ['alpha', 'Beta', ''].includes(p.getCell(r, 2) ? p.getCell(r, 2).text : '') &&
+                ['alpha', 'Beta', ''].includes(p.getCell(r, 2)?.text ?? '') &&
                 p.getRaw(r, 3).toLowerCase().includes('1')
         );
-        assert.deepStrictEqual(Array.from(sh._order), want);
-        assert.strictEqual(sh.gridView.order, sh._order);
-        for (const [op, f] of [
+        assert.deepStrictEqual(orderOf(sh), want);
+        assert.strictEqual(sh.gridView?.order, sh._order);
+        const textCases: [TextFilterOp, (s: string) => boolean][] = [
             ['equals', s => s === 'beta'],
             ['starts', s => s.startsWith('al')],
             ['ends', s => s.endsWith('a')],
             ['notcontains', s => !s.includes('a')]
-        ]) {
+        ];
+        for (const [op, f] of textCases) {
             const s2 = mkShell(prov, 1);
             s2.view.filters.set(2, {
                 kind: 'text',
@@ -160,7 +172,7 @@ test('filter by values and by text, combined with sort, equals a direct row scan
             await done(s2);
             const exp = [0];
             for (let r = 1; r < p.rowCount; r++) if (f(p.getRaw(r, 2).toLowerCase())) exp.push(r);
-            assert.deepStrictEqual(Array.from(s2._order), exp, op);
+            assert.deepStrictEqual(orderOf(s2), exp, op);
         }
     }
 });
@@ -182,14 +194,14 @@ test('filtering a column with more than 50000 distinct values never silently hid
     await done(sh);
     const want = [0];
     for (let i = 0; i < n; i++) if (('key' + i).includes('key5999')) want.push(i + 1);
-    assert.deepStrictEqual(Array.from(sh._order), want);
+    assert.deepStrictEqual(orderOf(sh), want);
     // a set filter stored before the column grew past the limit is still applied exactly (per-row path)
     const keep = new Set(['key1', 'key59999']);
     const s2 = mkShell(p, 1);
     s2.view.filters.set(1, { kind: 'set', set: keep });
     s2.recomputeView();
     await done(s2);
-    assert.deepStrictEqual(Array.from(s2._order), [0, 2, 60000]);
+    assert.deepStrictEqual(orderOf(s2), [0, 2, 60000]);
 });
 
 test('a new request cancels the running one; clearView resets', async () => {
@@ -199,7 +211,7 @@ test('a new request cancels the running one; clearView resets', async () => {
     assert.ok(sh.busy(), 'a 120k-row sort must not complete inside its first slice');
     sh.sortBy(3, -1);
     await done(sh);
-    assert.deepStrictEqual(Array.from(sh._order.slice(0, 50)), oracle(p, 1, 3, -1).slice(0, 50));
+    assert.deepStrictEqual(orderOf(sh).slice(0, 50), oracle(p, 1, 3, -1).slice(0, 50));
     sh.clearView();
     assert.strictEqual(sh._order, null);
     assert.strictEqual(sh.gridView, null);
@@ -223,10 +235,12 @@ test('sorting 600k rows never blocks the event loop for long', async () => {
         sh.sortBy(c, 1);
         await done(sh);
         clearInterval(iv);
-        assert.strictEqual(sh._order.length, 600001);
+        const order = sh._order;
+        assert.ok(order);
+        assert.strictEqual(order.length, 600001);
         for (let i = 2; i < 600001; i += 997) {
-            const a = p.getRaw(sh._order[i - 1], c),
-                b = p.getRaw(sh._order[i], c);
+            const a = p.getRaw(order[i - 1], c),
+                b = p.getRaw(order[i], c);
             if (c === 0) assert.ok(Number(a) <= Number(b));
             else assert.ok(a.toLowerCase() <= b.toLowerCase());
         }
@@ -238,7 +252,6 @@ test('sorting 600k rows never blocks the event loop for long', async () => {
 test('stats: selections are computed in the background, whole columns come from the cache, results are never partial', async () => {
     const lines = ['a,b,c'];
     let sum = 0,
-        nums = 0,
         cnt = 0;
     const n = 300000;
     for (let i = 0; i < n; i++) {
@@ -247,11 +260,10 @@ test('stats: selections are computed in the background, whole columns come from 
         if (v !== '') cnt++;
         if (v !== '' && v !== 'txt') {
             sum += Number(v);
-            nums++;
         }
     }
     const p = csvProvider(lines.join('\n') + '\n', { formatValues: 'always' });
-    const sel = { active: { r: 0, c: 0 }, ranges: [{ r1: 0, c1: 0, r2: n, c2: 0 }] };
+    const sel: GridSelection = { active: { r: 0, c: 0, sr: 0 }, ranges: [{ r1: 0, c1: 0, r2: n, c2: 0 }] };
     const sh = mkShell(p, 1, sel);
     sh._viewState = () => {};
     sh._updateName = () => {};
@@ -271,7 +283,7 @@ test('stats: selections are computed in the background, whole columns come from 
     await done(sh);
     assert.ok(performance.now() - t0 < budget(50), 'cached whole-column stats');
     // select-all style multi column
-    const all = { active: { r: 0, c: 0 }, ranges: [{ r1: 0, c1: 0, r2: n, c2: 2 }] };
+    const all: GridSelection = { active: { r: 0, c: 0, sr: 0 }, ranges: [{ r1: 0, c1: 0, r2: n, c2: 2 }] };
     const s2 = mkShell(p, 1, all);
     s2._runStats(all);
     await done(s2);
@@ -279,7 +291,7 @@ test('stats: selections are computed in the background, whole columns come from 
     // a newer selection cancels the older computation
     const s3 = mkShell(p, 1, all);
     s3._runStats(all);
-    const small = { active: { r: 1, c: 0 }, ranges: [{ r1: 1, c1: 1, r2: 3, c2: 1 }] };
+    const small: GridSelection = { active: { r: 1, c: 0, sr: 1 }, ranges: [{ r1: 1, c1: 1, r2: 3, c2: 1 }] };
     s3.grid.getSelection = () => small;
     s3._runStats(small);
     await done(s3);
@@ -288,7 +300,7 @@ test('stats: selections are computed in the background, whole columns come from 
 
 test('stats under a sort/filter order only count the visible rows; generic providers work too', async () => {
     const p = csvProvider('a,b\n1,2\n3,4\n5,6\n7,8\n', { formatValues: 'always' });
-    const sel = { active: { r: 0, c: 0 }, ranges: [{ r1: 1, c1: 0, r2: 2, c2: 1 }] };
+    const sel: GridSelection = { active: { r: 0, c: 0, sr: 0 }, ranges: [{ r1: 1, c1: 0, r2: 2, c2: 1 }] };
     for (const prov of [p, plain(p)]) {
         const sh = mkShell(prov, 1, sel);
         sh._order = Int32Array.from([0, 4, 2]);
@@ -301,12 +313,12 @@ test('stats under a sort/filter order only count the visible rows; generic provi
 test('mergeSortGen and radixRows are stable and correct', () => {
     const n = 5000,
         a = new Int32Array(n),
-        vals = new Array(n);
+        vals: number[] = new Array<number>(n);
     for (let i = 0; i < n; i++) {
         a[i] = i;
         vals[i] = rnd(50);
     }
-    const g = OX.mergeSortGen(a, (x, y) => vals[x] < vals[y]);
+    const g = mergeSortGen(a, (x, y) => vals[x] < vals[y]);
     while (!g.next().done);
     for (let i = 1; i < n; i++)
         assert.ok(vals[a[i - 1]] < vals[a[i]] || (vals[a[i - 1]] === vals[a[i]] && a[i - 1] < a[i]));
@@ -320,7 +332,7 @@ test('mergeSortGen and radixRows are stable and correct', () => {
     }
     const rows = new Int32Array(n);
     for (let i = 0; i < n; i++) rows[i] = i;
-    const r = OX.radixRows(rows, cat, hi, lo);
+    const r = radixRows(rows, cat, hi, lo);
     let x = r.next();
     while (!x.done) x = r.next();
     const out = x.value;
@@ -354,12 +366,12 @@ test('runTask slices work, reports progress and can be cancelled', async () => {
         }
         return 7;
     }
-    const t = OX.runTask(g(), {
+    const t = runTask(g(), {
         budget: 5,
-        onProgress: p => {
+        onProgress: (p: number) => {
             prog = p;
         },
-        onDone: v => {
+        onDone: (v: number) => {
             finished = v === 7;
         }
     });
@@ -373,7 +385,7 @@ test('runTask slices work, reports progress and can be cancelled', async () => {
             yield 0;
         }
     }
-    const t2 = OX.runTask(h(), { budget: 3 });
+    const t2 = runTask(h(), { budget: 3 });
     t2.cancel();
     const seen = c2;
     await wait(20);

@@ -1,24 +1,22 @@
-'use strict';
-const webview = require('./helpers/webview.js');
 // Raw-copy zip assembly in xlsx-writer: strict structural verifier + fuzz over odd zip layouts.
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const zlib = require('node:zlib');
-const OX = webview('core/xlsx-writer');
-const fflate = require('fflate');
-const XLSX = require('xlsx');
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import * as zlib from 'node:zlib';
+import * as fflate from 'fflate';
+import * as XLSX from 'xlsx';
+import { patchXlsx, writerDeps } from '../webview/core/xlsx-writer.ts';
+import type { CellEdit, EditCell } from '../webview/core/xlsx-writer.ts';
 
-const u8 = fflate.strToU8;
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const RNS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 const PK = 'http://schemas.openxmlformats.org/package/2006/relationships';
 const T = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/';
 const HDR = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
-const rng = seed => {
+const rng = (seed: number): (() => number) => {
     let h = seed;
     return () => (h = (h * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
 };
-const colName = c => {
+const colName = (c: number): string => {
     let s = '';
     c++;
     while (c > 0) {
@@ -29,34 +27,54 @@ const colName = c => {
     return s;
 };
 
+/** Unwraps a lookup that the fixture guarantees. */
+function must<T>(v: T | null | undefined, what: string): T {
+    if (v === null || v === undefined) throw new Error('missing ' + what);
+    return v;
+}
+const toBuffer = (d: string | Uint8Array): Buffer => (typeof d === 'string' ? Buffer.from(d) : Buffer.from(d));
+
 // ---- independent zip builder (does not use fflate) ----
-// entry: {name, data, method 0|8, dd: 0|1|2 (descriptor w/o|with signature), z64: bool, extra: Buffer, comment, time, date, utf8flag}
-function buildZip(entries, opts) {
-    opts = opts || {};
-    const chunks = [],
-        cds = [];
+/** dd: data descriptor without (1) / with (2) signature; z64: zip64 extra fields */
+interface ZipSpec {
+    name: string;
+    data: string | Uint8Array;
+    method: 0 | 8;
+    level?: number;
+    dd?: 1 | 2;
+    z64?: boolean;
+    extra?: Buffer;
+    comment?: string;
+    time?: number;
+    date?: number;
+    utf8flag?: boolean;
+}
+
+function buildZip(entries: readonly ZipSpec[], opts: { comment?: string } = {}): Uint8Array {
+    const chunks: Buffer[] = [],
+        cds: Buffer[] = [];
     let pos = 0;
-    const w = b => {
+    const w = (b: Buffer): void => {
         chunks.push(b);
         pos += b.length;
     };
-    const h16 = v => {
+    const h16 = (v: number): Buffer => {
         const b = Buffer.alloc(2);
         b.writeUInt16LE(v);
         return b;
     };
-    const h32 = v => {
+    const h32 = (v: number): Buffer => {
         const b = Buffer.alloc(4);
         b.writeUInt32LE(v >>> 0);
         return b;
     };
-    const h64 = v => {
+    const h64 = (v: number): Buffer => {
         const b = Buffer.alloc(8);
         b.writeBigUInt64LE(BigInt(v));
         return b;
     };
     for (const e of entries) {
-        const data = Buffer.from(e.data);
+        const data = toBuffer(e.data);
         const comp = e.method === 8 ? zlib.deflateRawSync(data, { level: e.level === undefined ? 6 : e.level }) : data;
         const crc = zlib.crc32(data);
         const nb = Buffer.from(e.name, 'utf8');
@@ -161,7 +179,31 @@ function buildZip(entries, opts) {
 }
 
 // ---- strict verifier (zlib + own parser) ----
-function verifyZip(b, lenient) {
+/** central directory record of an entry (sizes patched from zip64 extras in lenient mode) */
+interface CentralEntry {
+    flag: number;
+    method: number;
+    time: number;
+    date: number;
+    crc: number;
+    csize: number;
+    usize: number;
+    lho: number;
+    eattr: number;
+    nameBytes: Buffer;
+    name: string;
+    extra: Buffer;
+    comment: string;
+}
+/** central record plus what the local header and the data area say */
+interface VerifiedEntry extends CentralEntry {
+    lextra: Buffer;
+    ds: number;
+    raw: Buffer;
+    data: Buffer;
+}
+
+function verifyZip(b: Uint8Array, lenient?: boolean): VerifiedEntry[] {
     const buf = Buffer.from(b.buffer, b.byteOffset, b.length);
     let eo = -1;
     for (let i = buf.length - 22; i >= Math.max(0, buf.length - 22 - 65535); i--)
@@ -187,11 +229,15 @@ function verifyZip(b, lenient) {
         cdEnd = zo;
     }
     assert.equal(cdOff + cdSize, cdEnd, 'central directory is contiguous with the end records');
-    const out = [];
+    const central: CentralEntry[] = [];
     let p = cdOff;
     for (let k = 0; k < cnt; k++) {
         assert.equal(buf.readUInt32LE(p), 0x02014b50, 'central sig');
-        const e = {
+        const nl = buf.readUInt16LE(p + 28),
+            el = buf.readUInt16LE(p + 30),
+            cl = buf.readUInt16LE(p + 32);
+        const nameBytes = buf.subarray(p + 46, p + 46 + nl);
+        const e: CentralEntry = {
             flag: buf.readUInt16LE(p + 8),
             method: buf.readUInt16LE(p + 10),
             time: buf.readUInt16LE(p + 12),
@@ -200,15 +246,12 @@ function verifyZip(b, lenient) {
             csize: buf.readUInt32LE(p + 20),
             usize: buf.readUInt32LE(p + 24),
             lho: buf.readUInt32LE(p + 42),
-            eattr: buf.readUInt32LE(p + 38)
+            eattr: buf.readUInt32LE(p + 38),
+            nameBytes,
+            name: nameBytes.toString('utf8'),
+            extra: buf.subarray(p + 46 + nl, p + 46 + nl + el),
+            comment: buf.subarray(p + 46 + nl + el, p + 46 + nl + el + cl).toString('utf8')
         };
-        const nl = buf.readUInt16LE(p + 28),
-            el = buf.readUInt16LE(p + 30),
-            cl = buf.readUInt16LE(p + 32);
-        e.nameBytes = buf.subarray(p + 46, p + 46 + nl);
-        e.name = e.nameBytes.toString('utf8');
-        e.extra = buf.subarray(p + 46 + nl, p + 46 + nl + el);
-        e.comment = buf.subarray(p + 46 + nl + el, p + 46 + nl + el + cl).toString('utf8');
         if (lenient) {
             for (let q = 0; q + 4 <= e.extra.length; q += 4 + e.extra.readUInt16LE(q + 2)) {
                 if (e.extra.readUInt16LE(q) === 1) {
@@ -221,12 +264,13 @@ function verifyZip(b, lenient) {
             assert.notEqual(e.usize, 0xffffffff);
         }
         p += 46 + nl + el + cl;
-        out.push(e);
+        central.push(e);
     }
     assert.equal(p, cdEnd, 'central directory parsed exactly');
     // local headers: contiguous, ascending, exact
+    const out: VerifiedEntry[] = [];
     let expect = 0;
-    for (const e of out) {
+    for (const e of central) {
         assert.equal(buf.readUInt32LE(e.lho), 0x04034b50, 'local sig');
         if (!lenient) {
             assert.equal(e.lho, expect, 'entry ' + e.name + ' starts where the previous one ends (no gap/overlap)');
@@ -251,14 +295,15 @@ function verifyZip(b, lenient) {
         const nl = buf.readUInt16LE(e.lho + 26),
             el = buf.readUInt16LE(e.lho + 28);
         assert.equal(buf.subarray(e.lho + 30, e.lho + 30 + nl).compare(e.nameBytes), 0, 'local name == central name');
-        e.lextra = buf.subarray(e.lho + 30 + nl, e.lho + 30 + nl + el);
-        e.ds = e.lho + 30 + nl + el;
-        e.raw = buf.subarray(e.ds, e.ds + e.csize);
-        expect = e.ds + e.csize;
+        const lextra = buf.subarray(e.lho + 30 + nl, e.lho + 30 + nl + el);
+        const ds = e.lho + 30 + nl + el;
+        const raw = buf.subarray(ds, ds + e.csize);
+        expect = ds + e.csize;
         assert.ok(expect <= cdOff, 'entry inside the data area');
-        e.data = e.method === 0 ? e.raw : zlib.inflateRawSync(e.raw);
-        assert.equal(e.data.length, e.usize, 'usize of ' + e.name);
-        assert.equal(zlib.crc32(e.data), e.crc, 'crc of ' + e.name);
+        const data = e.method === 0 ? raw : zlib.inflateRawSync(raw);
+        assert.equal(data.length, e.usize, 'usize of ' + e.name);
+        assert.equal(zlib.crc32(data), e.crc, 'crc of ' + e.name);
+        out.push({ ...e, lextra, ds, raw, data });
     }
     if (!lenient) assert.equal(expect, cdOff, 'data area ends at the central directory');
     assert.equal(new Set(out.map(e => e.name)).size, out.length, 'unique names');
@@ -275,7 +320,7 @@ function verifyZip(b, lenient) {
 }
 
 // ---- package generator ----
-function sheetXml(rand, NR, NC, tag) {
+function sheetXml(rand: () => number, NR: number, NC: number, tag: string): string {
     let body = '';
     for (let r = 0; r < NR; r++) {
         if (rand() < 0.2) continue;
@@ -303,14 +348,23 @@ function sheetXml(rand, NR, NC, tag) {
     );
 }
 
-function genPackage(seed) {
+interface GeneratedPackage {
+    entries: ZipSpec[];
+    comment: string;
+    rand: () => number;
+    withCalc: boolean;
+    NR: number;
+    NC: number;
+}
+
+function genPackage(seed: number): GeneratedPackage {
     const rand = rng(seed * 104729);
-    const pick = a => a[Math.floor(rand() * a.length)];
+    const pick = <T>(a: readonly T[]): T => a[Math.floor(rand() * a.length)];
     const NR = 20,
         NC = 6;
     const sheets = [sheetXml(rand, NR, NC, 'a'), sheetXml(rand, NR, NC, 'b')];
     const withCalc = rand() < 0.7;
-    const base = [
+    const base: [string, string | Buffer][] = [
         [
             '[Content_Types].xml',
             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="a"/>' +
@@ -350,7 +404,7 @@ function genPackage(seed) {
         ['xl/worksheets/sheet2.xml', sheets[1]]
     ];
     if (withCalc) base.push(['xl/calcChain.xml', '<calcChain xmlns="' + NS + '"><c r="A1" i="1"/></calcChain>']);
-    const noise = [];
+    const noise: [string, string | Buffer][] = [];
     const nn = 3 + Math.floor(rand() * 10);
     for (let i = 0; i < nn; i++) {
         const kind = pick(['rand', 'text', 'empty', 'dir', 'uni', 'big']);
@@ -374,14 +428,14 @@ function genPackage(seed) {
         }
     const entries = all.map(([name, data]) => {
         const isDir = name.endsWith('/');
-        const e = {
+        const e: ZipSpec = {
             name,
             data: typeof data === 'string' ? Buffer.from(data) : data,
-            method: isDir || data.length === 0 ? pick([0, 8]) : pick([0, 8, 8, 8]),
+            method: isDir || data.length === 0 ? pick<0 | 8>([0, 8]) : pick<0 | 8>([0, 8, 8, 8]),
             level: pick([1, 6, 9])
         };
         if (/[^\x00-\x7f]/.test(name)) e.utf8flag = rand() < 0.5;
-        if (rand() < 0.3) e.dd = pick([1, 2]);
+        if (rand() < 0.3) e.dd = pick<1 | 2>([1, 2]);
         if (rand() < 0.25) e.z64 = true;
         if (rand() < 0.3) e.extra = Buffer.concat([Buffer.from([0xfe, 0xca, 4, 0, 1, 2, 3, 4])]);
         if (rand() < 0.2) e.comment = 'cmt ' + i_(rand);
@@ -393,7 +447,17 @@ function genPackage(seed) {
     });
     return { entries, comment: rand() < 0.4 ? 'archive comment ' + seed : '', rand, withCalc, NR, NC };
 }
-const i_ = r => String(Math.floor(r() * 1000));
+const i_ = (r: () => number): string => String(Math.floor(r() * 1000));
+
+function isCellObject(x: unknown): x is XLSX.CellObject {
+    return typeof x === 'object' && x !== null && 't' in x;
+}
+/** SheetJS types worksheet indexing as `any`; this reads one cell through a typed lookup. */
+function sheetCell(wb: XLSX.WorkBook, sheet: string, ref: string): XLSX.CellObject | undefined {
+    const lookup: Record<string, unknown> = wb.Sheets[sheet];
+    const c = lookup[ref];
+    return isCellObject(c) ? c : undefined;
+}
 
 test('verifier accepts the independent builder output and the fixtures read in SheetJS', () => {
     for (let seed = 1; seed <= 10; seed++) {
@@ -409,20 +473,21 @@ test('fuzz: raw-copy rewrite keeps untouched entries byte-exact and the package 
         const rand = p.rand;
         const orig = buildZip(p.entries, { comment: p.comment });
         const before = verifyZip(orig, true);
-        const origByName = new Map();
+        const origByName = new Map<string, VerifiedEntry>();
         for (const e of before) origByName.set(e.name, e);
-        const edits = [],
-            exp = new Map();
+        const edits: CellEdit[] = [],
+            exp = new Map<string, EditCell>();
         const n = 1 + Math.floor(rand() * 8);
         for (let i = 0; i < n; i++) {
             const sheet = rand() < 0.7 ? 0 : 1,
                 r = Math.floor(rand() * (p.NR + 3)),
                 c = Math.floor(rand() * (p.NC + 2));
-            const cell = rand() < 0.5 ? { t: 'n', v: 1000 + i + seed / 10 } : { t: 's', v: 'new ' + i + ' ü日' };
+            const cell: EditCell =
+                rand() < 0.5 ? { t: 'n', v: 1000 + i + seed / 10 } : { t: 's', v: 'new ' + i + ' ü日' };
             edits.push({ sheet, r, c, cell });
             exp.set(sheet + ',' + r + ',' + c, cell);
         }
-        const out = OX.patchXlsx(orig, edits);
+        const out = patchXlsx(orig, edits);
         const after = verifyZip(out);
         const touchedSheets = new Set(edits.map(e => 'xl/worksheets/sheet' + (e.sheet + 1) + '.xml'));
         const rewritten = new Set([
@@ -442,7 +507,7 @@ test('fuzz: raw-copy rewrite keeps untouched entries byte-exact and the package 
             'seed ' + seed
         );
         for (const e of after) {
-            const o = origByName.get(e.name);
+            const o = must(origByName.get(e.name), 'original ' + e.name);
             if (rewritten.has(e.name)) continue;
             assert.equal(Buffer.compare(e.raw, o.raw), 0, 'raw compressed bytes copied: ' + e.name + ' seed ' + seed);
             assert.equal(e.crc, o.crc);
@@ -455,13 +520,19 @@ test('fuzz: raw-copy rewrite keeps untouched entries byte-exact and the package 
             assert.equal(e.comment, o.comment);
             assert.equal(e.flag, o.flag & ~8);
             assert.equal(Buffer.compare(e.nameBytes, o.nameBytes), 0);
-            const src = p.entries.find(x => x.name === e.name);
+            const src = must(
+                p.entries.find(x => x.name === e.name),
+                'source ' + e.name
+            );
             if (src.extra && !src.z64)
                 assert.ok(e.extra.includes(Buffer.from([0xfe, 0xca, 4, 0])), 'extra kept for ' + e.name);
         }
         for (const nm of touchedSheets) {
-            const a = after.find(e => e.name === nm),
-                o = origByName.get(nm);
+            const a = must(
+                    after.find(e => e.name === nm),
+                    nm
+                ),
+                o = must(origByName.get(nm), nm);
             assert.equal(a.time, o.time);
             assert.equal(a.date, o.date);
         }
@@ -470,19 +541,17 @@ test('fuzz: raw-copy rewrite keeps untouched entries byte-exact and the package 
         const wbA = XLSX.read(plain, { type: 'array' }),
             wbB = XLSX.read(out, { type: 'array' });
         for (let si = 0; si < 2; si++) {
-            const A = wbA.Sheets[wbA.SheetNames[si]],
-                B = wbB.Sheets[wbB.SheetNames[si]];
+            const nameA = wbA.SheetNames[si],
+                nameB = wbB.SheetNames[si];
+            const A = (ref: string): XLSX.CellObject | undefined => sheetCell(wbA, nameA, ref),
+                B = (ref: string): XLSX.CellObject | undefined => sheetCell(wbB, nameB, ref);
+            const tv = (c: XLSX.CellObject | undefined): unknown[] | undefined => (c ? [c.t, c.v] : undefined);
             for (let r = 0; r < p.NR + 3; r++)
                 for (let c = 0; c < p.NC + 2; c++) {
                     const ref = colName(c) + (r + 1),
                         e = exp.get(si + ',' + r + ',' + c);
-                    if (e) assert.equal(B[ref] && B[ref].v, e.v, ref);
-                    else
-                        assert.deepEqual(
-                            B[ref] && [B[ref].t, B[ref].v],
-                            A[ref] && [A[ref].t, A[ref].v],
-                            'untouched ' + ref + ' seed ' + seed
-                        );
+                    if (e) assert.equal(B(ref)?.v, e.v, ref);
+                    else assert.deepEqual(tv(B(ref)), tv(A(ref)), 'untouched ' + ref + ' seed ' + seed);
                 }
         }
     }
@@ -495,26 +564,25 @@ test('big untouched entries are never inflated', () => {
     const p = genPackage(3);
     p.entries.push({ name: 'xl/media/big.dat', data: big, method: 8, level: 1 });
     const orig = buildZip(p.entries);
-    const calls = [];
-    const real = OX.writerDeps.Inflate;
-    OX.writerDeps.Inflate = function (cb) {
-        const inf = new real(cb);
-        const push = inf.push.bind(inf);
-        let n = 0;
-        inf.push = (d, f) => {
-            n += d.length;
-            if (f) calls.push(n);
-            return push(d, f);
-        };
-        return inf;
-    };
-    let out;
-    try {
-        out = OX.patchXlsx(orig, [{ sheet: 0, r: 2, c: 1, cell: { t: 'n', v: 7 } }]);
-    } finally {
-        OX.writerDeps.Inflate = real;
+    const calls: number[] = [];
+    const real = writerDeps.Inflate;
+    // spy: a subclass that records how many compressed bytes each inflate stream was fed
+    class SpyInflate extends real {
+        private fed = 0;
+        override push(d: Uint8Array, f?: boolean): void {
+            this.fed += d.length;
+            if (f) calls.push(this.fed);
+            super.push(d, f);
+        }
     }
-    const bigC = verifyZip(orig, true).find(e => e.name === 'xl/media/big.dat').csize;
+    writerDeps.Inflate = SpyInflate;
+    let out: Uint8Array;
+    try {
+        out = patchXlsx(orig, [{ sheet: 0, r: 2, c: 1, cell: { t: 'n', v: 7 } }]);
+    } finally {
+        writerDeps.Inflate = real;
+    }
+    const bigC = verifyZip(orig, true).find(e => e.name === 'xl/media/big.dat')?.csize ?? 0;
     assert.ok(calls.length > 0 && calls.every(n => n < bigC / 2), 'only small parts were inflated: ' + calls.join(','));
     verifyZip(out);
 });
@@ -539,29 +607,29 @@ test('sheet too large to edit', () => {
         q += 46 + nl + el + cl;
     }
     assert.throws(
-        () => OX.patchXlsx(hacked, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]),
+        () => patchXlsx(hacked, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]),
         /sheet too large to edit|zip bomb/
     );
 });
 
 test('zip64 end records for >65534 entries, junk before the zip, clean errors on garbage', () => {
     const p = genPackage(6);
-    const extra = [];
+    const extra: ZipSpec[] = [];
     for (let i = 0; i < 66000; i++) extra.push({ name: 'x/' + i, data: '', method: 0 });
     const orig = buildZip(p.entries.concat(extra).map(e => e));
-    const out = OX.patchXlsx(orig, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]);
+    const out = patchXlsx(orig, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]);
     assert.ok(verifyZip(out).length >= 66000);
     const pk = genPackage(7);
     const good = buildZip(pk.entries);
     const junk = Buffer.concat([Buffer.from('MZ junk stub'.repeat(10)), Buffer.from(good)]);
-    const o2 = OX.patchXlsx(new Uint8Array(junk), [{ sheet: 0, r: 1, c: 1, cell: { t: 'n', v: 5 } }]);
-    assert.equal(XLSX.read(o2, { type: 'array' }).Sheets.A.B2.v, 5);
-    assert.throws(() => OX.patchXlsx(new Uint8Array(100), [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]), /zip/i);
+    const o2 = patchXlsx(new Uint8Array(junk), [{ sheet: 0, r: 1, c: 1, cell: { t: 'n', v: 5 } }]);
+    assert.equal(sheetCell(XLSX.read(o2, { type: 'array' }), 'A', 'B2')?.v, 5);
+    assert.throws(() => patchXlsx(new Uint8Array(100), [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 1 } }]), /zip/i);
 });
 
 test('perf: 60k rows, one edit touches only the sheet', () => {
     const NR = 60000;
-    const rows = new Array(NR);
+    const rows = new Array<string>(NR);
     for (let r = 1; r <= NR; r++)
         rows[r - 1] =
             '<row r="' +
@@ -595,7 +663,7 @@ test('perf: 60k rows, one edit touches only the sheet', () => {
     p.entries.push({ name: 'xl/worksheets/sheet1.xml', data: Buffer.from(sheet), method: 8, level: 3 });
     const orig = buildZip(p.entries);
     const t0 = process.hrtime.bigint();
-    const out = OX.patchXlsx(orig, [
+    const out = patchXlsx(orig, [
         { sheet: 0, r: 30000, c: 1, cell: { t: 's', v: 'EDIT' } },
         { sheet: 0, r: NR + 5, c: 0, cell: { t: 'n', v: 9 } }
     ]);
@@ -610,7 +678,12 @@ test('perf: 60k rows, one edit touches only the sheet', () => {
             ' ms'
     );
     const after = verifyZip(out);
-    const x = Buffer.from(after.find(e => e.name === 'xl/worksheets/sheet1.xml').data).toString();
+    const x = Buffer.from(
+        must(
+            after.find(e => e.name === 'xl/worksheets/sheet1.xml'),
+            'sheet1'
+        ).data
+    ).toString();
     assert.ok(x.includes('<c r="B30001" t="inlineStr"><is><t>EDIT</t></is></c>') || x.includes('EDIT'));
     assert.ok(x.includes('<row r="' + (NR + 6) + '">'));
     assert.ok(x.includes('<row r="29999"><c r="A29999">'));

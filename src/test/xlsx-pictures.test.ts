@@ -1,9 +1,9 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const OX = { ...webview('core/xlsx-reader'), ...webview('core/xlsx-writer') };
-const F = require('./helpers/xlsx-fixtures.js');
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readXlsx } from '../webview/core/xlsx-reader.ts';
+import { patchXlsx } from '../webview/core/xlsx-writer.ts';
+import * as F from './helpers/xlsx-fixtures.ts';
+import { must } from './helpers/xlsx-fixtures.ts';
 
 const NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
 const RNS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
@@ -17,7 +17,7 @@ const PNG = Buffer.from(
     'base64'
 );
 
-function drawingXml() {
+function drawingXml(): string {
     return (
         HDR +
         `<xdr:wsDr xmlns:xdr="${DR}" xmlns:a="${DML}">` +
@@ -35,7 +35,7 @@ function drawingXml() {
     );
 }
 
-function workbookWithPics() {
+function workbookWithPics(): Uint8Array {
     const sheet =
         HDR +
         `<worksheet xmlns="${NS}" xmlns:r="${RNS}"><sheetViews><sheetView workbookViewId="0"/></sheetViews><sheetFormatPr defaultRowHeight="15"/><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData><drawing r:id="rId1"/></worksheet>`;
@@ -57,10 +57,10 @@ function workbookWithPics() {
 }
 
 test('drawings: anchored raster picture is exposed, emf is skipped', () => {
-    const wb = OX.readXlsx(workbookWithPics());
+    const wb = readXlsx(workbookWithPics());
     const sh = wb.loadSheet(0);
     assert.equal(sh.pictures.length, 1);
-    const p = sh.pictures[0];
+    const p = must(sh.pictures[0]);
     assert.deepEqual(
         { r: p.r, c: p.c, dx: p.dx, dy: p.dy, w: p.w, h: p.h },
         { r: 2, c: 1, dx: 1, dy: 2, w: 20, h: 10 }
@@ -70,14 +70,14 @@ test('drawings: anchored raster picture is exposed, emf is skipped', () => {
 });
 
 test('drawings: sheet without drawings has no pictures', () => {
-    const wb = OX.readXlsx(F.simpleWorkbook([['a']]));
+    const wb = readXlsx(F.simpleWorkbook([['a']]));
     assert.deepEqual(wb.loadSheet(0).pictures, []);
 });
 
 test('drawings: patchXlsx keeps drawing parts byte-for-byte', () => {
     const orig = workbookWithPics();
-    const out = OX.patchXlsx(orig, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 2 } }]);
-    const sh = OX.readXlsx(out).loadSheet(0);
+    const out = patchXlsx(orig, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 2 } }]);
+    const sh = readXlsx(out).loadSheet(0);
     assert.equal(sh.pictures.length, 1);
-    assert.equal(sh.pictures[0].url, 'data:image/png;base64,' + PNG.toString('base64'));
+    assert.equal(must(sh.pictures[0]).url, 'data:image/png;base64,' + PNG.toString('base64'));
 });

@@ -1,8 +1,6 @@
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert');
-const OX = webview('core/grid-core');
-const G = OX.GridCore;
+import test from 'node:test';
+import assert from 'node:assert';
+import { GridCore as G } from '../webview/core/grid-core.ts';
 
 test('colName', () => {
     assert.equal(G.colName(0), 'A');
@@ -43,7 +41,7 @@ test('Axis uniform and custom', () => {
 test('Axis hidden at start skipped by indexAt', () => {
     const b = new G.Axis().build(
         4,
-        i => 20,
+        _i => 20,
         i => i === 0 || i === 1,
         20,
         1
@@ -73,7 +71,7 @@ test('MergeIndex', () => {
 
 test('dataEdge', () => {
     const data = new Set(['0,0', '1,0', '2,0', '5,0', '6,0']);
-    const e = (r, c) => !data.has(r + ',' + c);
+    const e = (r: number, c: number): boolean => !data.has(r + ',' + c);
     assert.deepEqual(G.dataEdge(e, 0, 0, 1, 0, 100, 5), { r: 2, c: 0 });
     assert.deepEqual(G.dataEdge(e, 2, 0, 1, 0, 100, 5), { r: 5, c: 0 });
     assert.deepEqual(G.dataEdge(e, 6, 0, 1, 0, 100, 5), { r: 100, c: 0 });
@@ -152,6 +150,7 @@ test('findAll and markdown and widthcache', () => {
     let n = 0;
     for (let i = 0; i < 20; i++) w.get('f', 't' + (i % 6), s => (n++, s.length));
     assert.ok(w.n <= 4);
+    assert.ok(n > 4);
     assert.equal(G.shiftFormula('=SUM(A1:B2)+$C$3+"A1"+D$4', 1, 1), '=SUM(B2:C3)+$C$3+"A1"+E$4');
     assert.equal(G.shiftFormula('=LOG10(A1)', 1, 0), '=LOG10(A2)');
     assert.equal(G.shiftFormula('=A1', -1, 0), '=#REF!');

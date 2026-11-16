@@ -1,14 +1,17 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert');
-const OX = { ...webview('core/csv-parser'), ...webview('core/csv-provider') };
-const drain = g => {
+import test from 'node:test';
+import assert from 'node:assert';
+import { indexCsv, csvToBytes, csvNumBytes } from '../webview/core/csv-parser.ts';
+import type { CsvParseOptions } from '../webview/core/csv-parser.ts';
+import { CsvProvider, csvIsNumeric } from '../webview/core/csv-provider.ts';
+import type { CsvProviderOptions } from '../webview/core/csv-provider.ts';
+
+const drain = <T>(g: Generator<number, T, undefined>): T => {
     let r = g.next();
     while (!r.done) r = g.next();
     return r.value;
 };
-const prov = (t, io, po) => new OX.CsvProvider(OX.indexCsv(t, io), Object.assign({}, po));
+const prov = (t: string, io: CsvParseOptions, po: CsvProviderOptions): CsvProvider =>
+    new CsvProvider(indexCsv(t, io), Object.assign({}, po));
 
 test('numeric grammar: strict numBytes agrees with csvIsNumeric; hex, Infinity, NaN, spaces are text', () => {
     const samples = [
@@ -40,13 +43,13 @@ test('numeric grammar: strict numBytes agrees with csvIsNumeric; hex, Infinity, 
         '٣'
     ];
     for (const s of samples) {
-        const b = OX.csvToBytes(s),
-            strict = OX.csvNumBytes(b, 0, b.length, true);
-        assert.strictEqual(strict === strict, OX.csvIsNumeric(s), JSON.stringify(s));
+        const b = csvToBytes(s),
+            strict = csvNumBytes(b, 0, b.length, true);
+        assert.strictEqual(strict === strict, csvIsNumeric(s), JSON.stringify(s));
     }
     for (const s of ['0x1F', 'Infinity', 'NaN', ' 12', '1_000', '.', 'e5', '1e']) {
-        const b = OX.csvToBytes(s);
-        assert.ok(Number.isNaN(OX.csvNumBytes(b, 0, b.length, false)), s);
+        const b = csvToBytes(s);
+        assert.ok(Number.isNaN(csvNumBytes(b, 0, b.length, false)), s);
     }
 });
 
@@ -58,7 +61,7 @@ test('sortKeyColumn: numbers before text, hex/Infinity are text, -0 equals 0, hu
         { hasHeaders: true }
     );
     const k = drain(p.sortKeyColumn(0));
-    const cat = s => {
+    const cat = (s: string): number => {
         for (let r = 1; r < p.rowCount; r++) if (p.getRaw(r, 0) === s) return k.cat[r];
         return -1;
     };
@@ -66,11 +69,12 @@ test('sortKeyColumn: numbers before text, hex/Infinity are text, -0 equals 0, hu
     assert.strictEqual(cat('Infinity'), 1);
     assert.strictEqual(cat('b'), 1);
     for (const s of ['10', '-2', '-0', '0', '1e400', '-1e400', '007', '.5']) assert.strictEqual(cat(s), 0, s);
-    const key = s => {
+    const key = (s: string): [number, number] => {
         for (let r = 1; r < p.rowCount; r++) if (p.getRaw(r, 0) === s) return [k.hi[r], k.lo[r]];
+        return [-1, -1];
     };
     assert.deepStrictEqual(key('-0'), key('0'));
-    const lt = (a, b) => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
+    const lt = (a: [number, number], b: [number, number]): boolean => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
     assert.ok(
         lt(key('-1e400'), key('-2')) &&
             lt(key('-2'), key('0')) &&
@@ -109,6 +113,6 @@ test('quoted flags follow rows through edits, deletes and appends', () => {
     p.setCell(r, 0, 'q');
     assert.strictEqual(p.serializeRow(r), 'q,');
     drain(p.sortKeyColumn(0));
-    drain(p.rangeStats({}, null, 0, p.rowCount - 1, 0, 1));
+    drain(p.rangeStats({ cnt: 0, nums: 0, sum: 0, min: 0, max: 0 }, null, 0, p.rowCount - 1, 0, 1));
     assert.strictEqual(p.serializeRow(2), '"e",f');
 });

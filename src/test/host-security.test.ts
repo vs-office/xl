@@ -1,18 +1,19 @@
-'use strict';
-const test = require('node:test');
-const assert = require('node:assert');
-const sim = require('./helpers/csv-host-sim.js');
-const { run, edit, drain, tick } = require('./helpers/csv-host-ops.js');
+import test from 'node:test';
+import assert from 'node:assert';
+import * as sim from './helpers/csv-host-sim.ts';
+import { defined, loadHost, URI } from './helpers/csv-host-sim.ts';
+import { run, edit, drain } from './helpers/csv-host-ops.ts';
+import type * as WorkbookBytes from '../excel/workbookBytes.ts';
 
 const evil = '</script><script>alert(1)</script>  &';
 
-test('getHtml: inline JSON is inert, every script has the nonce, CSP has no script unsafe-inline', async () => {
+test('getHtml: inline JSON is inert, every script has the nonce, CSP has no script unsafe-inline', () => {
     const w = sim.makeWebview('a,b\n1,2\n', 1, { separator: evil, commentCharacter: evil, numberFormat: evil });
     const html = w.view.getHtml();
-    const nonce = /script-src [^;]*'nonce-([A-Za-z0-9]+)'/.exec(html)[1];
+    const nonce = defined(/script-src [^;]*'nonce-([A-Za-z0-9]+)'/.exec(html))[1];
     assert.ok(nonce.length >= 32);
     assert.ok(!/script-src[^;]*unsafe-inline/.test(html));
-    const tags = html.match(/<script\b[^>]*>/g);
+    const tags = defined(html.match(/<script\b[^>]*>/g));
     assert.ok(tags.length >= 2);
     for (const t of tags) assert.ok(t.includes('nonce="' + nonce + '"'), t);
     assert.strictEqual((html.match(/<\/script>/g) || []).length, tags.length);
@@ -34,7 +35,7 @@ test('language comes from the previewed document, not the active editor', () => 
     sim.vscode.workspace.textDocuments = [];
     w.view.languageId = undefined;
     Object.defineProperty(w.view, '_uri', {
-        value: require('vscode-uri').URI.parse('file:///x/b.tsv'),
+        value: URI.parse('file:///x/b.tsv'),
         writable: true
     });
     assert.strictEqual(w.view.getOptions().languageId, 'tsv');
@@ -49,7 +50,7 @@ test('stale line edits (external change before the refresh lands) are dropped an
     await new Promise(r => setTimeout(r, 60));
     await drain(w);
     assert.strictEqual(w.doc.text, 'HEADER\na,1\nb,2\nc,3\n');
-    const p = w.shell().provider;
+    const p = defined(w.shell().provider);
     assert.strictEqual(p.getRaw(0, 0), 'HEADER');
 });
 
@@ -68,7 +69,8 @@ test('malformed lineEdits never touch the document', async () => {
     await drain(w);
     const before = w.doc.text;
     const v = w.doc.version;
-    const bad = [
+    // deliberately malformed wire data: the host takes `unknown`
+    const bad: unknown[] = [
         [],
         'x',
         [{ start: -1, end: 0, text: 'h' }],
@@ -79,7 +81,7 @@ test('malformed lineEdits never touch the document', async () => {
         [null]
     ];
     for (const b of bad) {
-        w.view.enqueue(() => w.view.applyLineEdits(b, w.view._viewVersion));
+        w.view['enqueue'](() => w.view['applyLineEdits'](b, w.view['_viewVersion']));
         await drain(w);
         assert.strictEqual(w.doc.text, before);
         assert.strictEqual(w.doc.version, v);
@@ -100,7 +102,7 @@ test('empty and blank-line-only files accept a header edit', async () => {
 });
 
 test('toWorkbookBytes accepts only non-empty zips', () => {
-    const { toWorkbookBytes: f } = require('../excel/workbookBytes.ts');
+    const { toWorkbookBytes: f } = loadHost('/src/excel/workbookBytes.ts') as typeof WorkbookBytes;
     assert.ok(f(new Uint8Array([0x50, 0x4b, 3, 4, 0])));
     assert.ok(f(new Uint8Array([0x50, 0x4b, 3, 4, 0]).buffer));
     assert.ok(f({ length: 5, 0: 0x50, 1: 0x4b, 2: 3, 3: 4, 4: 0 }));

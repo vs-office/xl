@@ -38,5 +38,5 @@ TypeScript is strict. `any`, non-null assertions and `@ts-ignore` are lint error
 
 - `src/extension.ts`, `src/common`, `src/csv`, `src/excel`: extension host.
 - `src/webview`: code that runs inside the webview pages (TypeScript, bundled by webpack; Node runs the same `.ts` files directly in tests).
-- `src/test`: tests (`node --test`).
+- `src/test`: tests (TypeScript, run directly by `node --test`, no build step).
 - `scripts`: build helpers.

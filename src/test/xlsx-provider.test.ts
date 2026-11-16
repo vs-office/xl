@@ -1,19 +1,16 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const OX = {
-    ...webview('core/xlsx-reader'),
-    ...webview('core/format'),
-    ...webview('core/xlsx-writer'),
-    ...webview('core/xlsx-provider')
-};
-const F = require('./helpers/xlsx-fixtures.js');
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import type { Workbook } from '../webview/core/xlsx-reader.ts';
+import { readXlsx } from '../webview/core/xlsx-reader.ts';
+import { patchXlsx } from '../webview/core/xlsx-writer.ts';
+import { XlsxProvider } from '../webview/core/xlsx-provider.ts';
+import * as F from './helpers/xlsx-fixtures.ts';
+import { cellAt, must } from './helpers/xlsx-fixtures.ts';
 
-function open() {
+function open(): { bytes: Uint8Array; wb: Workbook; p: XlsxProvider } {
     const bytes = F.fullWorkbook();
-    const wb = OX.readXlsx(bytes);
-    return { bytes, wb, p: new OX.XlsxProvider(wb, wb.loadSheet(0)) };
+    const wb = readXlsx(bytes);
+    return { bytes, wb, p: new XlsxProvider(wb, wb.loadSheet(0)) };
 }
 
 test('provider exposes cells, raw text and extents', () => {
@@ -27,18 +24,18 @@ test('provider exposes cells, raw text and extents', () => {
 });
 
 test('edit overlay, undo slot and patch round trip', () => {
-    const { bytes, wb, p } = open();
+    const { bytes, p } = open();
     const cell = p.editFromText(2, 1, 'hello');
     const slot = p.setCell(2, 1, cell);
-    assert.equal(p.getCell(2, 1).text, 'hello');
+    assert.equal(must(p.getCell(2, 1)).text, 'hello');
     assert.equal(p.getRaw(2, 1), 'hello');
     assert.ok(p.dirty);
     const edits = p.pendingEdits(0);
     assert.equal(edits.length, 1);
-    const out = OX.patchXlsx(bytes, edits);
-    const wb2 = OX.readXlsx(out);
+    const out = patchXlsx(bytes, edits);
+    const wb2 = readXlsx(out);
     const sh2 = wb2.loadSheet(0);
-    assert.equal(sh2.rows[2][1].v, 'hello');
+    assert.equal(cellAt(sh2, 2, 1).v, 'hello');
     p.restoreSlot(2, 1, slot);
     assert.ok(!p.dirty);
 });

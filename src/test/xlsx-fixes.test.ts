@@ -1,55 +1,75 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert/strict');
-const fflate = require('fflate');
-const OX = {
-    ...webview('core/xlsx-reader'),
-    ...webview('core/format'),
-    ...webview('core/xlsx-writer'),
-    ...webview('core/xlsx-provider')
-};
-const F = require('./helpers/xlsx-fixtures.js');
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import * as fflate from 'fflate';
+import type { Workbook } from '../webview/core/xlsx-reader.ts';
+import { readXlsx } from '../webview/core/xlsx-reader.ts';
+import { patchXlsx, validateFormula } from '../webview/core/xlsx-writer.ts';
+import { XlsxProvider } from '../webview/core/xlsx-provider.ts';
+import type { EditCell, EditError } from '../webview/core/xlsx-provider.ts';
+import * as F from './helpers/xlsx-fixtures.ts';
+import { cellAt, must } from './helpers/xlsx-fixtures.ts';
+import type { FixtureFiles, SheetXmlParts } from './helpers/xlsx-fixtures.ts';
 
-const unz = b => {
+/** Result of XlsxProvider.editFromText. */
+type EditResult = EditCell | EditError | undefined;
+/** The edit cell of a result that must not be refused. */
+function asCell(r: EditResult): EditCell {
+    const v = must(r, 'edit result');
+    assert.ok(!('error' in v), 'edit was refused');
+    return v;
+}
+/** The refusal message of a result, undefined when it was accepted. */
+function errorOf(r: EditResult): string | undefined {
+    return r !== undefined && 'error' in r ? r.error : undefined;
+}
+
+const unz = (b: Uint8Array): Record<string, string> => {
     const z = fflate.unzipSync(b);
-    const o = {};
+    const o: Record<string, string> = {};
     for (const k in z) o[k] = fflate.strFromU8(z[k]);
     return o;
 };
-const MIN_STYLES = extra =>
+const MIN_STYLES = (extra: { nf?: string }): string =>
     F.HDR +
     `<styleSheet xmlns="${F.NS}">${extra.nf || ''}<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`;
-function book(data, o) {
-    o = o || {};
+interface BookOptions {
+    /** extra worksheet XML fragments */
+    sheet?: Omit<SheetXmlParts, 'data'>;
+    /** relationships of the sheet part */
+    rels?: string;
+    styles?: string;
+    /** additional package parts */
+    extra?: FixtureFiles;
+}
+function book(data: string, o: BookOptions = {}): Uint8Array {
     return F.buildPackage({
-        sheets: [{ name: 'S', xml: F.sheetXml(Object.assign({ data }, o.sheet || {})), rels: o.rels }],
+        sheets: [{ name: 'S', xml: F.sheetXml({ data, ...o.sheet }), rels: o.rels }],
         styles: o.styles || MIN_STYLES({}),
         theme: F.THEME,
         extraFiles: o.extra
     });
 }
-function open(bytes) {
-    const wb = OX.readXlsx(bytes);
-    return { wb, p: new OX.XlsxProvider(wb, wb.loadSheet(0), { validateFormula: OX.validateFormula }) };
+function open(bytes: Uint8Array): { wb: Workbook; p: XlsxProvider } {
+    const wb = readXlsx(bytes);
+    return { wb, p: new XlsxProvider(wb, wb.loadSheet(0), { validateFormula }) };
 }
-function save(bytes, p) {
-    return OX.patchXlsx(bytes, p.pendingEdits(0));
+function save(bytes: Uint8Array, p: XlsxProvider): Uint8Array {
+    return patchXlsx(bytes, p.pendingEdits(0));
 }
 
 test('typed date/percent/time keep their number format through view and save', () => {
     const bytes = book('<row r="1"><c r="A1"><v>1</v></c></row>');
     const { p } = open(bytes);
-    const d = p.editFromText(0, 1, '2023-1-2');
+    const d = asCell(p.editFromText(0, 1, '2023-1-2'));
     assert.equal(d.fmt, 'yyyy-mm-dd');
     p.setCell(0, 1, d);
-    assert.equal(p.getCell(0, 1).text, '2023-01-02');
-    assert.equal(p.getCell(0, 1).kind, 'date');
+    assert.equal(must(p.getCell(0, 1)).text, '2023-01-02');
+    assert.equal(must(p.getCell(0, 1)).kind, 'date');
     p.setCell(1, 0, p.editFromText(1, 0, '5%'));
     p.setCell(2, 0, p.editFromText(2, 0, '9%'));
     p.setCell(3, 0, p.editFromText(3, 0, '10:30'));
-    assert.equal(p.getCell(1, 0).text, '5%');
-    assert.equal(p.getCell(3, 0).text, '10:30');
+    assert.equal(must(p.getCell(1, 0)).text, '5%');
+    assert.equal(must(p.getCell(3, 0)).text, '10:30');
     const out = save(bytes, p);
     const z = unz(out);
     const st = z['xl/styles.xml'];
@@ -57,14 +77,14 @@ test('typed date/percent/time keep their number format through view and save', (
     assert.match(st, /formatCode="yyyy-mm-dd"/);
     assert.ok(!/formatCode="h:mm"/.test(st)); // h:mm is builtin 20
     assert.match(st, /<cellXfs count="4">/); // default + date + 0% (builtin 9, shared by two cells) + time
-    const wb2 = OX.readXlsx(out),
+    const wb2 = readXlsx(out),
         sh = wb2.loadSheet(0);
-    assert.equal(wb2.styles[sh.rows[0][1].s].fmt, 'yyyy-mm-dd');
-    assert.equal(wb2.styles[sh.rows[1][0].s].fmt, '0%');
-    assert.equal(sh.rows[1][0].s, sh.rows[2][0].s);
-    assert.equal(wb2.styles[sh.rows[3][0].s].fmt, 'h:mm');
-    const p2 = new OX.XlsxProvider(wb2, sh, { validateFormula: OX.validateFormula });
-    assert.equal(p2.getCell(0, 1).text, '2023-01-02');
+    assert.equal(wb2.styles[cellAt(sh, 0, 1).s].fmt, 'yyyy-mm-dd');
+    assert.equal(wb2.styles[cellAt(sh, 1, 0).s].fmt, '0%');
+    assert.equal(cellAt(sh, 1, 0).s, cellAt(sh, 2, 0).s);
+    assert.equal(wb2.styles[cellAt(sh, 3, 0).s].fmt, 'h:mm');
+    const p2 = new XlsxProvider(wb2, sh, { validateFormula: validateFormula });
+    assert.equal(must(p2.getCell(0, 1)).text, '2023-01-02');
 });
 
 test('derived xf clones the cell xf and reuses existing numFmt ids', () => {
@@ -88,49 +108,46 @@ test('styles.xml without numFmts or with prefixed names', () => {
         F.HDR +
         `<x:styleSheet xmlns:x="${F.NS}"><x:fonts count="1"><x:font><x:sz val="11"/></x:font></x:fonts><x:fills count="1"><x:fill><x:patternFill patternType="none"/></x:fill></x:fills><x:borders count="1"><x:border/></x:borders><x:cellXfs count="1"><x:xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></x:cellXfs></x:styleSheet>`;
     const bytes = book('<row r="1"><c r="A1"><v>1</v></c></row>', { styles: pref });
-    const out = OX.patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 45000, fmt: 'dd/mm/yyyy' } }]);
+    const out = patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 45000, fmt: 'dd/mm/yyyy' } }]);
     const st = unz(out)['xl/styles.xml'];
     assert.match(
         st,
         /<x:styleSheet[^>]*><x:numFmts count="1"><x:numFmt numFmtId="164" formatCode="dd\/mm\/yyyy"\/><\/x:numFmts>/
     );
     assert.match(st, /<x:cellXfs count="2">/);
-    const wb = OX.readXlsx(out);
-    assert.equal(wb.styles[wb.loadSheet(0).rows[0][0].s].fmt, 'dd/mm/yyyy');
+    const wb = readXlsx(out);
+    assert.equal(wb.styles[cellAt(wb.loadSheet(0), 0, 0).s].fmt, 'dd/mm/yyyy');
     // no cellXfs at all
     const none =
         F.HDR +
         `<styleSheet xmlns="${F.NS}"><fonts count="1"><font><sz val="11"/></font></fonts><dxfs count="0"/></styleSheet>`;
-    const o2 = OX.patchXlsx(book('<row r="1"/>', { styles: none }), [
+    const o2 = patchXlsx(book('<row r="1"/>', { styles: none }), [
         { sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 0.5, fmt: '0.0%' } }
     ]);
     const s2 = unz(o2)['xl/styles.xml'];
     assert.ok(s2.indexOf('<cellXfs count="2">') < s2.indexOf('<dxfs'));
-    const w2 = OX.readXlsx(o2);
-    assert.equal(w2.styles[w2.loadSheet(0).rows[0][0].s].fmt, '0.0%');
+    const w2 = readXlsx(o2);
+    assert.equal(w2.styles[cellAt(w2.loadSheet(0), 0, 0).s].fmt, '0.0%');
 });
 
 test('invalid input is refused by the provider and by the writer', () => {
     const bytes = book('<row r="1"><c r="A1"><v>1</v></c></row>');
     const { p } = open(bytes);
     for (const t of ['=SUM(', '=A1+', '=("a"', '=SUM(1;2)', '="abc', '=IF(A1,{1,2)', '=1)', '==1'])
-        assert.ok(p.editFromText(0, 1, t).error, t);
-    assert.ok(p.editFromText(0, 1, 'x'.repeat(40000)).error);
-    assert.equal(p.editFromText(0, 1, '=SUM(A1,"a)b",\'Sheet 1\'!A1)').error, undefined);
-    assert.equal(p.editFromText(0, 1, '=A1&"x"').f, 'A1&"x"');
+        assert.ok(errorOf(p.editFromText(0, 1, t)), t);
+    assert.ok(errorOf(p.editFromText(0, 1, 'x'.repeat(40000))));
+    assert.equal(errorOf(p.editFromText(0, 1, '=SUM(A1,"a)b",\'Sheet 1\'!A1)')), undefined);
+    assert.equal(asCell(p.editFromText(0, 1, '=A1&"x"')).f, 'A1&"x"');
     const before = p.dirty;
     p.setCell(0, 1, { error: 'x' });
     assert.equal(p.dirty, before);
     assert.throws(
-        () => OX.patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: null, f: 'SUM(' } }]),
+        () => patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: null, f: 'SUM(' } }]),
         /Invalid formula/
     );
-    assert.throws(
-        () => OX.patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 's', v: 'x'.repeat(32768) } }]),
-        /32767/
-    );
-    assert.throws(() => OX.patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'e', v: '#BOGUS!' } }]), /error value/);
-    assert.doesNotThrow(() => OX.patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'e', v: '#SPILL!' } }]));
+    assert.throws(() => patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 's', v: 'x'.repeat(32768) } }]), /32767/);
+    assert.throws(() => patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'e', v: '#BOGUS!' } }]), /error value/);
+    assert.doesNotThrow(() => patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'e', v: '#SPILL!' } }]));
 });
 
 test('_xlfn prefixes are added on write and hidden on read', () => {
@@ -146,9 +163,9 @@ test('_xlfn prefixes are added on write and hidden on read', () => {
         x.includes('<f>_xlfn._xlws.SORT(_xlfn._xlws.FILTER(A1:A9,A1:A9&gt;1))+_xlfn.STDEV.S(A1:A3)+Sheet1!A1</f>'),
         x
     );
-    const sh = OX.readXlsx(out).loadSheet(0);
-    assert.equal(sh.rows[0][1].f, 'XLOOKUP(1,A1:A2,B1:B2)+IFERROR(1,2)+IFS(1,2)+"CONCAT(x)"'); // read strips every prefix
-    assert.equal(sh.rows[0][2].f, 'SORT(FILTER(A1:A9,A1:A9>1))+STDEV.S(A1:A3)+Sheet1!A1');
+    const sh = readXlsx(out).loadSheet(0);
+    assert.equal(cellAt(sh, 0, 1).f, 'XLOOKUP(1,A1:A2,B1:B2)+IFERROR(1,2)+IFS(1,2)+"CONCAT(x)"'); // read strips every prefix
+    assert.equal(cellAt(sh, 0, 2).f, 'SORT(FILTER(A1:A9,A1:A9>1))+STDEV.S(A1:A3)+Sheet1!A1');
 });
 
 const TABLE_RELS =
@@ -157,7 +174,7 @@ const TABLE_RELS =
 const TABLE =
     F.HDR +
     `<table xmlns="${F.NS}" id="1" name="T1" displayName="T1" ref="A1:B3"><autoFilter ref="A1:B3"/><tableColumns count="2"><tableColumn id="1" name="Name"/><tableColumn id="2" name="Qty &amp; Co"><calculatedColumnFormula>T1[[#This Row],[Name]]</calculatedColumnFormula></tableColumn></tableColumns></table>`;
-function tableBook() {
+function tableBook(): Uint8Array {
     return book(
         '<row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>Qty &amp; Co</t></is></c></row><row r="2"><c r="A2"><v>1</v></c></row>',
         {
@@ -172,13 +189,13 @@ test('table header edits rename tableColumn and are validated', () => {
     const bytes = tableBook();
     const { wb, p } = open(bytes);
     assert.equal(wb.loadSheet(0).tables.length, 1);
-    assert.ok(p.editFromText(0, 0, '').error);
-    assert.ok(p.editFromText(0, 0, '=1+1').error);
-    assert.ok(p.editFromText(0, 0, 'Qty & Co').error);
-    const ok = p.editFromText(0, 0, 'Renamed');
+    assert.ok(errorOf(p.editFromText(0, 0, '')));
+    assert.ok(errorOf(p.editFromText(0, 0, '=1+1')));
+    assert.ok(errorOf(p.editFromText(0, 0, 'Qty & Co')));
+    const ok = asCell(p.editFromText(0, 0, 'Renamed'));
     assert.equal(ok.t, 's');
     p.setCell(0, 0, ok);
-    const n = p.editFromText(0, 1, '5');
+    const n = asCell(p.editFromText(0, 1, '5'));
     assert.deepEqual([n.t, n.v], ['s', '5']);
     p.setCell(0, 1, n);
     const z = unz(save(bytes, p));
@@ -186,9 +203,9 @@ test('table header edits rename tableColumn and are validated', () => {
     assert.match(z['xl/tables/table1.xml'], /<tableColumn id="2" name="5">/);
     assert.match(z['xl/tables/table1.xml'], /\[Renamed\]/);
     assert.match(z['xl/worksheets/sheet1.xml'], /<c r="B1" t="inlineStr"><is><t xml:space="preserve">5<\/t>/);
-    assert.throws(() => OX.patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: null, f: 'A2' } }]), /header/);
-    assert.throws(() => OX.patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: null }]), /empty/);
-    assert.throws(() => OX.patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 's', v: 'qty & co' } }]), /unique/);
+    assert.throws(() => patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: null, f: 'A2' } }]), /header/);
+    assert.throws(() => patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: null }]), /empty/);
+    assert.throws(() => patchXlsx(bytes, [{ sheet: 0, r: 0, c: 0, cell: { t: 's', v: 'qty & co' } }]), /unique/);
 });
 
 test('array interior edits give a clear message', () => {
@@ -196,21 +213,18 @@ test('array interior edits give a clear message', () => {
         '<row r="1"><c r="A1"><f t="array" ref="A1:A2">B1:B2</f><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row>'
     );
     const { p } = open(bytes);
-    assert.match(p.editFromText(1, 0, '7').error, /array formula \(A2 is inside A1:A2\)/);
-    assert.ok(p.editFromText(0, 0, '7').error === undefined);
-    assert.throws(
-        () => OX.patchXlsx(bytes, [{ sheet: 0, r: 1, c: 0, cell: { t: 'n', v: 1 } }]),
-        /inside the array A1:A2/
-    );
+    assert.match(must(errorOf(p.editFromText(1, 0, '7'))), /array formula \(A2 is inside A1:A2\)/);
+    assert.ok(errorOf(p.editFromText(0, 0, '7')) === undefined);
+    assert.throws(() => patchXlsx(bytes, [{ sheet: 0, r: 1, c: 0, cell: { t: 'n', v: 1 } }]), /inside the array A1:A2/);
     // single-quoted attribute variants are recognised
     const sq = book(
         '<row r="1"><c r="A1"><f t=\'array\' ref=\'A1:A2\'>B1:B2</f><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row>'
     );
-    assert.throws(() => OX.patchXlsx(sq, [{ sheet: 0, r: 1, c: 0, cell: { t: 'n', v: 1 } }]), /array/);
+    assert.throws(() => patchXlsx(sq, [{ sheet: 0, r: 1, c: 0, cell: { t: 'n', v: 1 } }]), /array/);
     const sh = book(
         '<row r="1"><c r="A1"><v>1</v><f t=\'shared\' ref="A1:A2" si="0">B1+1</f></c></row><row r="2"><c r="A2"><f t=\'shared\' si="0"/><v>2</v></c></row>'
     );
-    const z = unz(OX.patchXlsx(sh, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 5 } }]))['xl/worksheets/sheet1.xml'];
+    const z = unz(patchXlsx(sh, [{ sheet: 0, r: 0, c: 0, cell: { t: 'n', v: 5 } }]))['xl/worksheets/sheet1.xml'];
     assert.match(z, /<c r="A2"><f>B2\+1<\/f>/);
 });
 
@@ -238,29 +252,29 @@ test('reader: tab colors up front, column/row styles, clearing keeps style, zero
         styles,
         theme: F.THEME
     });
-    const wb = OX.readXlsx(bytes);
+    const wb = readXlsx(bytes);
     assert.deepEqual(
         wb.sheets.map(s => s.tabColor),
         ['#ff0000', '#ed7d31']
     );
     const sh = wb.loadSheet(0),
-        p = new OX.XlsxProvider(wb, sh, { validateFormula: OX.validateFormula });
-    assert.equal(p.getCell(5, 1).style.bg, '#ffff00');
-    assert.equal(p.getCell(5, 2).style.bg, '#ffff00');
+        p = new XlsxProvider(wb, sh, { validateFormula: validateFormula });
+    assert.equal(must(must(p.getCell(5, 1)).style).bg, '#ffff00');
+    assert.equal(must(must(p.getCell(5, 2)).style).bg, '#ffff00');
     assert.equal(p.getCell(5, 3), undefined);
-    assert.equal(p.getCell(2, 7).style.bg, '#ffff00');
+    assert.equal(must(must(p.getCell(2, 7)).style).bg, '#ffff00');
     assert.equal(p.getCell(1, 0), undefined);
     assert.equal(p.isRowHidden(0), false);
     assert.equal(p.isRowHidden(1), true);
     assert.equal(p.isRowHidden(3), true);
     // typing into a blank cell of a styled column keeps the column style in the view
-    assert.equal(p.editFromText(5, 1, 'hi').s, 1);
+    assert.equal(asCell(p.editFromText(5, 1, 'hi')).s, 1);
     // clearing a styled cell keeps its style visible
-    const cl = p.editFromText(0, 0, '');
+    const cl = asCell(p.editFromText(0, 0, ''));
     assert.equal(cl.cleared, true);
     p.setCell(0, 0, null);
-    assert.equal(p.getCell(0, 0).style.bg, '#ffff00');
-    assert.equal(p.getCell(0, 0).text, '');
+    assert.equal(must(must(p.getCell(0, 0)).style).bg, '#ffff00');
+    assert.equal(must(p.getCell(0, 0)).text, '');
     const e = p.pendingEdits(0);
     assert.deepEqual(
         e.map(x => x.cell),
@@ -279,13 +293,13 @@ test('reader: part lookup is case-insensitive, hyperlinks sanitized, merges clam
     const z = fflate.unzipSync(
         F.buildPackage({ sheets: [{ name: 'S', xml: x, rels }], styles: MIN_STYLES({}), theme: F.THEME })
     );
-    const o = {};
+    const o: Record<string, Uint8Array> = {};
     for (const k in z) o[k === 'xl/worksheets/sheet1.xml' ? 'XL/Worksheets/Sheet1.xml' : k] = z[k];
-    const wb = OX.readXlsx(F.zip(o));
+    const wb = readXlsx(F.zip(o));
     const sh = wb.loadSheet(0);
     assert.equal(sh.warning, null);
-    assert.equal(sh.rows[0][0].f, 'IF(A2<2,1,0)');
-    assert.equal(sh.rows[0][1].f, 'CONCAT("a","b")');
+    assert.equal(cellAt(sh, 0, 0).f, 'IF(A2<2,1,0)');
+    assert.equal(cellAt(sh, 0, 1).f, 'CONCAT("a","b")');
     assert.deepEqual(sh.merges, [{ r1: 2, c1: 0, r2: 3, c2: 1 }]);
     assert.equal(sh.hyperlinks.size, 0);
 });

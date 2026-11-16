@@ -1,15 +1,19 @@
-'use strict';
-const test = require('node:test');
-const assert = require('node:assert');
-const sim = require('./helpers/csv-host-sim.js');
-const { run, edit, editMany, del, add, drain } = require('./helpers/csv-host-ops.js');
+import test from 'node:test';
+import assert from 'node:assert';
+import * as sim from './helpers/csv-host-sim.ts';
+import { defined } from './helpers/csv-host-sim.ts';
+import { run, edit, editMany, del, add, drain } from './helpers/csv-host-ops.ts';
+import type { Step, SyncStep } from './helpers/csv-host-ops.ts';
+import type { HostMessage, RefreshMessage } from '../webview/csv.ts';
 
 // Drives the real src/csv/csvDocumentView.ts + src/webview/csv.js + csv-parser/provider against a fake VS Code document.
-const good = async (name, text, eol, steps, o) => {
+const good = async (name: string, text: string, eol: number, steps: Step[], o?: Record<string, string | boolean>) => {
     const r = await run(name, text, eol, steps, o);
     assert.ok(r.ok, r.msg);
     return r.w;
 };
+
+const isRefresh = (m: HostMessage): m is RefreshMessage => 'refresh' in m;
 
 const base = 'a,b\n1,2\n3,4\n5,6\n';
 
@@ -107,9 +111,9 @@ test('CRLF, BOM and sep= documents', async () => {
 test('self edits do not swallow a concurrent undo/external change', async () => {
     const w = sim.makeWebview(base, 1);
     await drain(w);
-    const posted = [];
-    const orig = w.view.webview.postMessage;
-    w.view.webview.postMessage = m => {
+    const posted: HostMessage[] = [];
+    const orig = w.view.webview.postMessage.bind(w.view.webview);
+    w.view.webview.postMessage = (m: HostMessage) => {
         posted.push(m);
         return orig(m);
     };
@@ -118,35 +122,32 @@ test('self edits do not swallow a concurrent undo/external change', async () => 
     };
     w.shell().o.onEdit([{ r: 1, c: 1, text: 'Z' }], 'type');
     await new Promise(r => setTimeout(r, 80));
-    assert.ok(
-        posted.some(m => m.refresh),
-        'external change must trigger a refresh'
-    );
-    const last = posted.filter(m => m.refresh).pop();
-    assert.ok(/EXT/.test(last.content));
+    assert.ok(posted.some(isRefresh), 'external change must trigger a refresh');
+    const last = defined(posted.filter(isRefresh).pop());
+    assert.ok(/EXT/.test(defined(last.content)));
 });
 
 test('plain own edits do not echo a refresh', async () => {
     const w = sim.makeWebview(base, 1);
     await drain(w);
-    const posted = [];
-    const orig = w.view.webview.postMessage;
-    w.view.webview.postMessage = m => {
+    const posted: HostMessage[] = [];
+    const orig = w.view.webview.postMessage.bind(w.view.webview);
+    w.view.webview.postMessage = (m: HostMessage) => {
         posted.push(m);
         return orig(m);
     };
     w.shell().o.onEdit([{ r: 1, c: 1, text: 'Z' }], 'type');
     await new Promise(r => setTimeout(r, 80));
-    assert.strictEqual(posted.filter(m => m.refresh).length, 0);
+    assert.strictEqual(posted.filter(isRefresh).length, 0);
 });
 
 test('randomized operation sequences stay aligned with the document', async () => {
     let seed = 12345;
-    const rnd = n => {
+    const rnd = (n: number) => {
         seed = (seed * 1103515245 + 12345) & 0x7fffffff;
         return seed % n;
     };
-    const docs = [
+    const docs: [string, number][] = [
         ['a,b\n1,2\n3,4\n5,6\n', 1],
         ['a,b\n1,2\n3,4\n5,6', 1],
         ['a,b\r\n1,2\r\n3,4', 2],
@@ -156,18 +157,18 @@ test('randomized operation sequences stay aligned with the document', async () =
     ];
     for (let i = 0; i < 40; i++) {
         const [text, eol] = docs[i % docs.length];
-        const steps = [];
+        const steps: SyncStep[] = [];
         for (let k = 0; k < 6; k++) {
             const op = rnd(5),
                 v = ['', 'q', 'a,b', 'm\nn', '"'][rnd(5)];
             if (op === 0)
-                steps.push((w, sh) => {
-                    const p = sh.provider;
+                steps.push((_w, sh) => {
+                    const p = defined(sh.provider);
                     sh.o.onEdit([{ r: rnd(p.rowCount), c: rnd(Math.max(1, p.colCount)), text: v }], 'type');
                 });
             else if (op === 1)
-                steps.push((w, sh) => {
-                    const p = sh.provider;
+                steps.push((_w, sh) => {
+                    const p = defined(sh.provider);
                     const r = rnd(p.rowCount);
                     sh.o.onEdit(
                         [
@@ -181,12 +182,12 @@ test('randomized operation sequences stay aligned with the document', async () =
             else if (op === 2) steps.push(add);
             else if (op === 3)
                 steps.push((w, sh) => {
-                    const p = sh.provider;
+                    const p = defined(sh.provider);
                     if (p.rowCount > 2) del([1 + rnd(p.rowCount - 1)])(w, sh);
                 });
             else
                 steps.push((w, sh) => {
-                    const p = sh.provider;
+                    const p = defined(sh.provider);
                     if (p.rowCount > 3) {
                         const r = 1 + rnd(p.rowCount - 2);
                         del([r, r + 1])(w, sh);

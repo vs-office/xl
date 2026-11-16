@@ -1,11 +1,12 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert');
-const OX = { ...webview('core/csv-parser'), ...webview('core/csv-provider') };
+import test from 'node:test';
+import assert from 'node:assert';
+import { parseCsv, indexCsv, CsvIndex, csvNumBytes } from '../webview/core/csv-parser.ts';
+import type { CsvParseOptions } from '../webview/core/csv-parser.ts';
+import { CsvProvider } from '../webview/core/csv-provider.ts';
+import type { CsvStatsAcc, FormatValuesMode } from '../webview/core/csv-provider.ts';
 
 let seed = 20240607;
-const rnd = n => {
+const rnd = (n: number): number => {
     seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
     return Math.floor((seed / 4294967296) * n);
 };
@@ -36,14 +37,14 @@ const ALPHA = [
     '﻿',
     '  '
 ];
-const randText = () => {
+const randText = (): string => {
     let t = '';
     for (let i = 0, L = rnd(40); i < L; i++) t += ALPHA[rnd(ALPHA.length)];
     if (rnd(6) === 0) t = 'sep=;\n' + t;
     if (rnd(8) === 0) t = '﻿' + t;
     return t;
 };
-const randOpts = () => ({
+const randOpts = (): CsvParseOptions => ({
     separator: [',', ';', '\t', '::', '→'][rnd(5)],
     quote: rnd(7) ? '"' : "'",
     hasHeaders: !!rnd(2),
@@ -51,9 +52,9 @@ const randOpts = () => ({
     commentChar: rnd(2) ? '#' : '//'
 });
 
-function compare(t, opts, ix) {
-    const old = OX.parseCsv(t, opts);
-    const p = new OX.CsvProvider(ix, { hasHeaders: opts.hasHeaders });
+function compare(t: string, opts: CsvParseOptions, ix: CsvIndex): void {
+    const old = parseCsv(t, opts);
+    const p = new CsvProvider(ix, { hasHeaders: opts.hasHeaders });
     const ctx = JSON.stringify(t) + ' ' + JSON.stringify(opts);
     assert.strictEqual(ix.n, old.rows.length, 'rows ' + ctx);
     assert.strictEqual(ix.colCount, old.colCount, 'colCount ' + ctx);
@@ -81,7 +82,7 @@ test('fuzz: byte index equals the legacy parser (rows, fields, quote flags, line
     for (let i = 0; i < 6000; i++) {
         const t = randText(),
             o = randOpts();
-        compare(t, o, OX.indexCsv(t, o));
+        compare(t, o, indexCsv(t, o));
     }
 });
 
@@ -89,10 +90,10 @@ test('fuzz: chunked / incremental indexing gives the one-shot result', () => {
     for (let i = 0; i < 3000; i++) {
         const t = randText(),
             o = randOpts();
-        const one = OX.indexCsv(t, o),
+        const one = indexCsv(t, o),
             by = new TextEncoder().encode(t),
             buf = new Uint8Array(by.length + 5);
-        const ix = new OX.CsvIndex(o);
+        const ix = new CsvIndex(o);
         let f = 0;
         do {
             f = Math.min(by.length, f + 1 + rnd(6));
@@ -120,7 +121,7 @@ test('more than 16.7M quoted fields in wide columns are no longer a problem (fla
         t = Array.from({ length: 4 }, () =>
             Array.from({ length: cols }, (_, c) => (c % 2 ? '"q"' : 'u')).join(',')
         ).join('\n');
-    const p = new OX.CsvProvider(OX.indexCsv(t, {}), {});
+    const p = new CsvProvider(indexCsv(t, {}), {});
     assert.strictEqual(p.isQuoted(3, 39), true);
     assert.strictEqual(p.isQuoted(3, 38), false);
     assert.strictEqual(p.getRaw(2, 39), 'q');
@@ -149,12 +150,12 @@ test('numBytes agrees with Number for the numeric grammar', () => {
     ];
     for (const s of cases) {
         const b = enc.encode(s);
-        const v = OX.csvNumBytes(b, 0, b.length, false);
+        const v = csvNumBytes(b, 0, b.length, false);
         assert.ok(Object.is(v, Number(s)) || (v === 0 && Number(s) === 0), s + ' -> ' + v + ' vs ' + Number(s));
     }
     for (const s of ['', '-', '+', '.', 'e1', '1e', '1e+', 'abc', '1 2', '0x10', 'Infinity', 'NaN', '1,5', '--1']) {
         const b = enc.encode(s);
-        assert.ok(Number.isNaN(OX.csvNumBytes(b, 0, b.length, false)), s);
+        assert.ok(Number.isNaN(csvNumBytes(b, 0, b.length, false)), s);
     }
     for (let i = 0; i < 20000; i++) {
         const sg = ['', '-', '+'][rnd(3)],
@@ -163,27 +164,27 @@ test('numBytes agrees with Number for the numeric grammar', () => {
             ex = rnd(4) ? '' : 'e' + (rnd(60) - 30);
         const s = sg + ip + fp + ex,
             b = enc.encode(s);
-        assert.ok(Object.is(OX.csvNumBytes(b, 0, b.length, false), Number(s)), s);
+        assert.ok(Object.is(csvNumBytes(b, 0, b.length, false), Number(s)), s);
     }
 });
 
-function ref(p) {
+function ref(p: CsvProvider): string[][] {
     // brute-force rows via getRaw
-    const rows = [];
+    const rows: string[][] = [];
     for (let r = p.off; r < p.rowCount; r++) {
-        const a = [];
+        const a: string[] = [];
         for (let c = 0; c < p.colCount; c++) a.push(p.getRaw(r, c));
         rows.push(a);
     }
     return rows;
 }
-const drain = g => {
+const drain = <T>(g: Generator<number, T, undefined>): T => {
     let r = g.next();
     while (!r.done) r = g.next();
     return r.value;
 };
 
-function randCsv(rows, cols) {
+function randCsv(rows: number, cols: number): string {
     const vals = [
         '',
         '1',
@@ -216,23 +217,26 @@ function randCsv(rows, cols) {
 }
 
 test('columnIds equals brute force distinct display values; counts and truncation', () => {
-    for (const fv of ['never', 'always', 'unquoted']) {
+    for (const fv of ['never', 'always', 'unquoted'] as const satisfies readonly FormatValuesMode[]) {
         const t = randCsv(300, 4),
-            p = new OX.CsvProvider(OX.indexCsv(t, { hasHeaders: true }), { hasHeaders: true, formatValues: fv });
+            p = new CsvProvider(indexCsv(t, { hasHeaders: true }), { hasHeaders: true, formatValues: fv });
         for (let c = 0; c < 4; c++) {
             const res = drain(p.columnIds(c, 1000, false));
-            const want = new Map();
+            assert.ok(res.values && res.counts && res.ids);
+            const counts = res.counts;
+            const want = new Map<string, number>();
             for (let r = 1; r < p.rowCount; r++) {
                 const cv = p.getCell(r, c),
                     k = cv ? cv.text : '';
                 want.set(k, (want.get(k) || 0) + 1);
             }
-            assert.deepStrictEqual(new Map(res.values.map((v, i) => [v, res.counts[i]])), want, fv + ' col ' + c);
+            assert.deepStrictEqual(new Map(res.values.map((v, i) => [v, counts[i]])), want, fv + ' col ' + c);
             for (let r = 1; r < p.rowCount; r++) {
                 const cv = p.getCell(r, c);
                 assert.strictEqual(res.values[res.ids[r]], cv ? cv.text : '');
             }
             const raw = drain(p.columnIds(c, 1000, true));
+            assert.ok(raw.values && raw.ids);
             for (let r = 1; r < p.rowCount; r++) assert.strictEqual(raw.values[raw.ids[r]], p.getRaw(r, c));
         }
         assert.strictEqual(drain(p.columnIds(0, 3, false)).truncated, true);
@@ -241,7 +245,7 @@ test('columnIds equals brute force distinct display values; counts and truncatio
 
 test('sortKeyColumn orders like the documented comparator (numbers, text, blanks last)', () => {
     const t = randCsv(400, 3),
-        p = new OX.CsvProvider(OX.indexCsv(t, { hasHeaders: true }), { hasHeaders: true });
+        p = new CsvProvider(indexCsv(t, { hasHeaders: true }), { hasHeaders: true });
     p.setCell(5, 1, '42');
     p.setCell(6, 1, 'Edited'); // overlay cells take part
     for (let c = 0; c < 3; c++) {
@@ -256,11 +260,11 @@ test('sortKeyColumn orders like the documented comparator (numbers, text, blanks
 });
 
 test('rangeStats equals a brute-force sum over getCell; whole-column cache is invalidated by edits', () => {
-    for (const fv of ['never', 'always', 'unquoted']) {
+    for (const fv of ['never', 'always', 'unquoted'] as const satisfies readonly FormatValuesMode[]) {
         const t = randCsv(500, 5),
-            p = new OX.CsvProvider(OX.indexCsv(t, { hasHeaders: true }), { hasHeaders: true, formatValues: fv });
-        const brute = (r1, r2, c1, c2) => {
-            const a = { cnt: 0, nums: 0, sum: 0, min: Infinity, max: -Infinity };
+            p = new CsvProvider(indexCsv(t, { hasHeaders: true }), { hasHeaders: true, formatValues: fv });
+        const brute = (r1: number, r2: number, c1: number, c2: number): CsvStatsAcc => {
+            const a: CsvStatsAcc = { cnt: 0, nums: 0, sum: 0, min: Infinity, max: -Infinity };
             for (let r = r1; r <= r2; r++)
                 for (let c = c1; c <= c2; c++) {
                     const cv = p.getCell(r, c);
@@ -276,12 +280,12 @@ test('rangeStats equals a brute-force sum over getCell; whole-column cache is in
                 }
             return a;
         };
-        const check = (rows, r1, r2, c1, c2) => {
-            const a = { cnt: 0, nums: 0, sum: 0, min: Infinity, max: -Infinity };
+        const check = (rows: Int32Array | null, r1: number, r2: number, c1: number, c2: number): void => {
+            const a: CsvStatsAcc = { cnt: 0, nums: 0, sum: 0, min: Infinity, max: -Infinity };
             drain(p.rangeStats(a, rows, r1, r2, c1, c2));
             const w = rows
                 ? (() => {
-                      const b = { cnt: 0, nums: 0, sum: 0, min: Infinity, max: -Infinity };
+                      const b: CsvStatsAcc = { cnt: 0, nums: 0, sum: 0, min: Infinity, max: -Infinity };
                       for (let i = r1; i <= r2; i++) {
                           const x = brute(rows[i], rows[i], c1, c2);
                           b.cnt += x.cnt;
@@ -315,7 +319,7 @@ test('rangeStats equals a brute-force sum over getCell; whole-column cache is in
 test('provider edits keep working on an offset index: random op sequences vs a plain array model', () => {
     for (let it = 0; it < 150; it++) {
         const t = randCsv(2 + rnd(8), 1 + rnd(4)),
-            p = new OX.CsvProvider(OX.indexCsv(t, { hasHeaders: true }), { hasHeaders: true });
+            p = new CsvProvider(indexCsv(t, { hasHeaders: true }), { hasHeaders: true });
         const model = ref(p);
         for (let k = 0; k < 12; k++) {
             const op = rnd(4);
@@ -327,7 +331,7 @@ test('provider edits keep working on an offset index: random op sequences vs a p
                 model[r][c] = v;
             } else if (op === 1) {
                 p.appendRow();
-                model.push(new Array(p.colCount).fill(''));
+                model.push(new Array<string>(p.colCount).fill(''));
             } else if (op === 2 && model.length) {
                 const r = rnd(model.length);
                 p.deleteRows([r + 1]);
@@ -356,9 +360,9 @@ test('big synthetic file: index is compact and fast, rows are exact', () => {
     for (let i = 0; i < rows; i++) parts.push(i + ',n' + (i % 977) + ',' + i * 0.5 + ',"x, y' + (i % 7) + '"\n');
     const text = parts.join(''),
         t0 = performance.now();
-    const ix = OX.indexCsv(text, { hasHeaders: true });
+    const ix = indexCsv(text, { hasHeaders: true });
     const ms = performance.now() - t0;
-    const p = new OX.CsvProvider(ix, { hasHeaders: true });
+    const p = new CsvProvider(ix, { hasHeaders: true });
     assert.strictEqual(p.dataRowCount, rows);
     assert.strictEqual(p.getRaw(12345 + 1, 3), 'x, y' + (12345 % 7));
     assert.strictEqual(p.getRaw(rows, 0), String(rows - 1));
@@ -371,10 +375,10 @@ test('progressive provider: rows appear as the index advances', () => {
     const rows = 5000,
         text = 'a,b\n' + Array.from({ length: rows }, (_, i) => i + ',' + i * 2).join('\n') + '\n';
     const by = new TextEncoder().encode(text),
-        ix = new OX.CsvIndex({ hasHeaders: true });
+        ix = new CsvIndex({ hasHeaders: true });
     ix.setSource(by, 1000, false);
     ix.run(0);
-    const p = new OX.CsvProvider(ix, { hasHeaders: true });
+    const p = new CsvProvider(ix, { hasHeaders: true });
     const first = p.dataRowCount;
     assert.ok(first > 10 && first < rows);
     assert.strictEqual(p.getRaw(first, 1), String((first - 1) * 2));

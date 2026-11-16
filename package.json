@@ -356,7 +356,7 @@
     "fmt-check": "prettier --check .",
     "lint": "eslint . --max-warnings=0",
     "tsc": "tsc --noEmit",
-    "test": "node --test src/test/*.test.js",
+    "test": "node --test src/test/*.test.ts",
     "compile": "webpack --mode none && node scripts/build-styles.js",
     "watch": "node scripts/build-styles.js && webpack --mode none --watch",
     "package": "webpack --mode production && node scripts/build-styles.js",

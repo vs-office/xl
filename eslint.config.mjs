@@ -83,13 +83,30 @@ export default tseslint.config(
     },
 
     {
-        files: ['src/test/**/*.js', 'scripts/**/*.js', 'webpack.config.js'],
+        // Tests fake large external APIs (VS Code, DOM); a double cast through unknown is allowed there, `any` is not.
+        files: ['src/test/**/*.ts'],
+        rules: {
+            'no-console': 'off',
+            'no-restricted-syntax': 'off',
+            // node:test registers tests; the returned promise is reported by the runner itself
+            '@typescript-eslint/no-floating-promises': [
+                'error',
+                {
+                    allowForKnownSafeCalls: [
+                        { from: 'package', package: 'node:test', name: ['test', 'it', 'describe'] }
+                    ]
+                }
+            ]
+        }
+    },
+
+    {
+        files: ['scripts/**/*.js', 'webpack.config.js'],
         languageOptions: {
             ecmaVersion: 2022,
             sourceType: 'commonjs',
             globals: { ...globals.node }
         },
-        // Tests are rewritten in TS in phase 4; until then they keep the pre-migration leniency.
-        rules: { ...jsRules, 'no-console': 'off', 'no-unused-vars': 'off', 'no-useless-escape': 'off', eqeqeq: 'off' }
+        rules: { ...jsRules, 'no-console': 'off' }
     }
 );

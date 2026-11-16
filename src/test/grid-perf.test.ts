@@ -1,34 +1,37 @@
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert');
-const OX = webview('core/grid-core');
-const { budget } = require('./helpers/timing.js');
-const C = OX.GridCore;
+import test from 'node:test';
+import assert from 'node:assert';
+import { GridCore as C } from '../webview/core/grid-core.ts';
+import type { Range } from '../webview/core/grid-core.ts';
+import { budget } from './helpers/timing.ts';
 
-function rng(seed) {
+function rng(seed: number): () => number {
     let s = seed >>> 0;
     return () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
 }
 
 // reference: dense prefix sums over the same sizes
-function refAxis(count, sizes, def, z) {
+function refAxis(count: number, sizes: Map<number, number>, def: number, z: number) {
     const u = Math.round(def * z * 100) / 100,
         pre = [0];
-    for (let i = 0; i < count; i++) pre.push(pre[i] + (sizes.has(i) ? sizes.get(i) * z : u));
-    return { pre, size: i => (sizes.has(i) ? sizes.get(i) * z : u) };
+    const size = (i: number): number => {
+        const o = sizes.get(i);
+        return o === undefined ? u : o * z;
+    };
+    for (let i = 0; i < count; i++) pre.push(pre[i] + size(i));
+    return { pre, size };
 }
 
 test('Axis picks sparse mode for few overrides and agrees with dense reference', () => {
     const count = 5000,
         def = 20,
-        sizes = new Map([
+        sizes = new Map<number, number>([
             [3, 50],
             [4, 0],
             [100, 31],
             [4999, 7],
             [2500, 0]
         ]);
-    const a = new C.Axis().build(count, i => (sizes.has(i) ? sizes.get(i) : def), null, def, 1);
+    const a = new C.Axis().build(count, i => sizes.get(i) ?? def, null, def, 1);
     assert.equal(a.mode, 1);
     for (const z of [1, 1.5, 0.5]) {
         a.setZoom(z);
@@ -79,14 +82,14 @@ test('Axis.buildSparse equals build and setSizes updates incrementally', () => {
     assert.equal(a.mode, 0);
     assert.equal(a.total, count * def);
     // many overrides switch to dense and stay consistent
-    const m = new Map();
+    const m = new Map<number, number>();
     for (let i = 0; i < count; i += 3) m.set(i, 10 + (i % 7));
     a.setSizes(m);
     assert.equal(a.mode, 2);
     let acc = 0;
     for (let i = 0; i < 300; i++) {
         assert.equal(a.offset(i), acc);
-        acc += m.has(i) ? m.get(i) : def;
+        acc += m.get(i) ?? def;
     }
     a.setSizes(new Map([[5, 99]]));
     assert.equal(a.offset(6) - a.offset(5), 99);
@@ -110,7 +113,7 @@ test('Axis.setCount keeps sizes (uniform/sparse) and refuses dense', () => {
 
 test('MergeIndex matches brute force on random non-overlapping merges', () => {
     const rnd = rng(7),
-        merges = [];
+        merges: Range[] = [];
     // grid of disjoint blocks of random sizes
     for (let r = 0; r < 4000; r += 7)
         for (let c = 0; c < 40; c += 9)
@@ -118,7 +121,7 @@ test('MergeIndex matches brute force on random non-overlapping merges', () => {
                 merges.push({ r1: r, c1: c, r2: r + Math.floor(rnd() * 6), c2: c + Math.floor(rnd() * 8) });
     merges.push({ r1: 100000, c1: 0, r2: 900000, c2: 3 }); // tall
     const mi = new C.MergeIndex(merges);
-    const brute = (r, c) => merges.find(m => r >= m.r1 && r <= m.r2 && c >= m.c1 && c <= m.c2) || null;
+    const brute = (r: number, c: number) => merges.find(m => r >= m.r1 && r <= m.r2 && c >= m.c1 && c <= m.c2) || null;
     for (let i = 0; i < 20000; i++) {
         const r = Math.floor(rnd() * 4100),
             c = Math.floor(rnd() * 45);
@@ -133,7 +136,7 @@ test('MergeIndex matches brute force on random non-overlapping merges', () => {
     assert.ok(small.hasInRows(40, 50));
     assert.ok(!small.hasInRows(100, 200));
     // expand equals fixed-point brute force
-    const expandBrute = (r1, c1, r2, c2) => {
+    const expandBrute = (r1: number, c1: number, r2: number, c2: number): Range => {
         for (let ch = true; ch;) {
             ch = false;
             for (const m of merges) {
@@ -169,7 +172,7 @@ test('MergeIndex matches brute force on random non-overlapping merges', () => {
 });
 
 test('MergeIndex with millions of merged cells answers fast', () => {
-    const merges = [];
+    const merges: Range[] = [];
     for (let r = 0; r < 300000; r += 2) merges.push({ r1: r, c1: 0, r2: r + 1, c2: 9 });
     const mi = new C.MergeIndex(merges);
     const t0 = Date.now();
@@ -182,7 +185,7 @@ test('MergeIndex with millions of merged cells answers fast', () => {
 test('WidthCache stays bounded by entries and chars, skips long strings, keeps hot keys', () => {
     const w = new C.WidthCache(100, 500, 20);
     let calls = 0;
-    const f = s => (calls++, s.length);
+    const f = (s: string) => (calls++, s.length);
     for (let i = 0; i < 1000; i++) w.get('f', 'key' + i, f);
     assert.ok(w.n <= 100 && w.chars <= 500 + 10);
     const long = 'x'.repeat(50);
@@ -212,9 +215,9 @@ test('makeMatcher: case, whole cell, regex-special chars', () => {
 
 test('createSlicer: sync first slice, deferred rest, budget passed, cancel', () => {
     let t = 0;
-    const q = [];
-    const defer = f => q.push(f);
-    const seen = [];
+    const q: (() => void)[] = [];
+    const defer = (f: () => void) => void q.push(f);
+    const seen: number[] = [];
     let n = 0;
     const s = C.createSlicer(
         deadline => {
@@ -230,7 +233,7 @@ test('createSlicer: sync first slice, deferred rest, budget passed, cancel', () 
     assert.equal(n, 1);
     assert.equal(q.length, 1);
     assert.equal(seen[0], 8);
-    while (q.length) q.shift()();
+    while (q.length) q.shift()?.();
     assert.equal(n, 4);
     assert.ok(s.finished);
     s2.start(true);
@@ -247,10 +250,10 @@ test('createSlicer: sync first slice, deferred rest, budget passed, cancel', () 
     s3.start(false);
     s3.start(false);
     assert.equal(q.length, 1);
-    q.shift()();
+    q.shift()?.();
     assert.equal(m, 1);
     s3.cancel();
-    q.shift()();
+    q.shift()?.();
     assert.equal(m, 1);
 });
 
@@ -263,8 +266,8 @@ test('FindScan: two-phase order, resumable, deadline, truncation, get2 fallback'
         ['3,3', 'zzz']
     ]);
     const raw = new Map([['4,4', 'hidden foo line2']]);
-    const get = (r, c) => texts.get(r + ',' + c);
-    const get2 = (r, c) => raw.get(r + ',' + c);
+    const get = (r: number, c: number) => texts.get(r + ',' + c);
+    const get2 = (r: number, c: number) => raw.get(r + ',' + c);
     const match = C.makeMatcher('foo', {});
     const s = new C.FindScan({ rowCount: 10, colCount: 5, getText: get, getText2: get2, match, startRow: 4 });
     let t = 0,
@@ -304,7 +307,7 @@ test('FindScan: two-phase order, resumable, deadline, truncation, get2 fallback'
 
 test('FindScan yields every few rows without losing matches', () => {
     const rows = 5000,
-        get = (r, c) => (c === 0 && r % 7 === 0 ? 'hit' + r : undefined);
+        get = (r: number, c: number) => (c === 0 && r % 7 === 0 ? 'hit' + r : undefined);
     const s = new C.FindScan({
         rowCount: rows,
         colCount: 3,
@@ -320,9 +323,9 @@ test('FindScan yields every few rows without losing matches', () => {
 });
 
 test('TsvBuilder equals encodeTSV, resumes across slices, skips rows', () => {
-    const rows = [];
+    const rows: string[][] = [];
     for (let i = 0; i < 9000; i++) rows.push(['a' + i, i % 5 === 0 ? 'x\ty' : '', i % 7 === 0 ? 'say "hi"\nnow' : 'v']);
-    const skip = i => i % 11 === 10;
+    const skip = (i: number) => i % 11 === 10;
     const b = new C.TsvBuilder({
         rowCount: rows.length,
         getRow: i => (skip(i) ? null : rows[i].map(s => (s === '' ? s : C.tsvField(s))).join('\t'))

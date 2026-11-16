@@ -1,20 +1,28 @@
-'use strict';
-const webview = require('./helpers/webview.js');
-const test = require('node:test');
-const assert = require('node:assert');
-const OX = { ...webview('core/csv-parser'), ...webview('core/csv-provider') };
+import test from 'node:test';
+import assert from 'node:assert';
+import { indexCsv, parseCsv, serializeCsvField } from '../webview/core/csv-parser.ts';
+import type { CsvParseOptions } from '../webview/core/csv-parser.ts';
+import { CsvProvider, formatNumberNet } from '../webview/core/csv-provider.ts';
+import type { CsvCell, LineNumbersMode, CsvProviderOptions } from '../webview/core/csv-provider.ts';
 
-const mk = (text, o, po) => {
-    const parsed = OX.indexCsv(text, Object.assign({ separator: ',', quote: '"' }, po));
-    return new OX.CsvProvider(parsed, Object.assign({ hasHeaders: !!(po && po.hasHeaders) }, o));
+const mk = (text: string, o: CsvProviderOptions = {}, po: CsvParseOptions = {}): CsvProvider => {
+    const parsed = indexCsv(text, Object.assign({ separator: ',', quote: '"' }, po));
+    return new CsvProvider(parsed, Object.assign({ hasHeaders: !!(po && po.hasHeaders) }, o));
+};
+
+const cell = (p: CsvProvider, r: number, c: number): CsvCell => {
+    const v = p.getCell(r, c);
+    assert.ok(v);
+    return v;
 };
 
 test('header row frozen and styled', () => {
     const p = mk('Name,age\nbob,5\n', { capitalizeHeaders: true }, { hasHeaders: true });
     assert.strictEqual(p.frozenRows, 1);
     assert.strictEqual(p.rowCount, 2);
-    const h = p.getCell(0, 1);
+    const h = cell(p, 0, 1);
     assert.strictEqual(h.text, 'Age');
+    assert.ok(h.style);
     assert.strictEqual(h.style.b, true);
     assert.ok(h.style.bg);
     assert.strictEqual(p.getRaw(0, 1), 'age');
@@ -26,8 +34,8 @@ test('header row frozen and styled', () => {
 
 test('number detection and formats', () => {
     const p = mk('1,007,1.5,-2e3,.5,abc,12345678901234567890,1.,+3,0x10,-,"9"\n', { formatValues: 'always' });
-    const kinds = [];
-    for (let c = 0; c < 12; c++) kinds.push(p.getCell(0, c).kind);
+    const kinds: string[] = [];
+    for (let c = 0; c < 12; c++) kinds.push(cell(p, 0, c).kind);
     assert.deepStrictEqual(kinds, [
         'number',
         'text',
@@ -43,30 +51,32 @@ test('number detection and formats', () => {
         'number'
     ]);
     const u = mk('1,"2"\n', { formatValues: 'unquoted' });
-    assert.deepStrictEqual([u.getCell(0, 0).kind, u.getCell(0, 1).kind], ['number', 'text']);
+    assert.deepStrictEqual([cell(u, 0, 0).kind, cell(u, 0, 1).kind], ['number', 'text']);
     const n = mk('1\n', { formatValues: 'never' });
-    assert.strictEqual(n.getCell(0, 0).kind, 'text');
+    assert.strictEqual(cell(n, 0, 0).kind, 'text');
     const f = mk('1234.5678\n', { formatValues: 'always', numberFormat: 'n2' });
-    assert.strictEqual(f.getCell(0, 0).text, '1,234.57');
-    assert.strictEqual(OX.formatNumberNet(1234.5678, 'g2'), '1200');
-    assert.strictEqual(OX.formatNumberNet(1.256, 'f1'), '1.3');
-    assert.strictEqual(OX.formatNumberNet(0.256, 'p0'), '26%');
-    assert.strictEqual(OX.formatNumberNet(-1234567.891, 'n1'), '-1,234,567.9');
-    assert.strictEqual(OX.formatNumberNet(5, 'd3'), '005');
-    assert.strictEqual(OX.formatNumberNet(1234.5, 'c'), '$1,234.50');
-    assert.strictEqual(OX.formatNumberNet(255, 'X'), 'FF');
-    assert.strictEqual(OX.formatNumberNet(7, 'zzz'), '7');
+    assert.strictEqual(cell(f, 0, 0).text, '1,234.57');
+    assert.strictEqual(formatNumberNet(1234.5678, 'g2'), '1200');
+    assert.strictEqual(formatNumberNet(1.256, 'f1'), '1.3');
+    assert.strictEqual(formatNumberNet(0.256, 'p0'), '26%');
+    assert.strictEqual(formatNumberNet(-1234567.891, 'n1'), '-1,234,567.9');
+    assert.strictEqual(formatNumberNet(5, 'd3'), '005');
+    assert.strictEqual(formatNumberNet(1234.5, 'c'), '$1,234.50');
+    assert.strictEqual(formatNumberNet(255, 'X'), 'FF');
+    assert.strictEqual(formatNumberNet(7, 'zzz'), '7');
 });
 
 test('multiline display and row height', () => {
     const t = 'a,"l1\nl2\nl3"\n';
     const p = mk(t, {});
-    assert.strictEqual(p.getCell(0, 1).text, 'l1');
+    assert.strictEqual(cell(p, 0, 1).text, 'l1');
     assert.strictEqual(p.rowHeight(0), 24);
     assert.strictEqual(p.getRaw(0, 1), 'l1\nl2\nl3');
     const w = mk(t, { wrapMultiline: true });
-    assert.strictEqual(w.getCell(0, 1).text, 'l1\nl2\nl3');
-    assert.strictEqual(w.getCell(0, 1).style.wrap, true);
+    assert.strictEqual(cell(w, 0, 1).text, 'l1\nl2\nl3');
+    const ws = cell(w, 0, 1).style;
+    assert.ok(ws);
+    assert.strictEqual(ws.wrap, true);
     assert.strictEqual(w.rowHeight(0), 24 + 2 * 16);
     const big = mk('"' + 'x\n'.repeat(20) + '"\n', { wrapMultiline: true });
     assert.strictEqual(big.rowHeight(0), 24 + 5 * 16);
@@ -83,13 +93,14 @@ test('column widths', () => {
     assert.strictEqual(p.colWidth(1), 400);
     p.setColWidth(0, 120);
     assert.strictEqual(p.colWidth(0), 120);
-    const m = mk('abcdefghij\n', { measure: s => s.length * 10 });
+    const m = mk('abcdefghij\n', { measure: (s: string) => s.length * 10 });
     assert.strictEqual(m.colWidth(0), 120);
 });
 
 test('line numbers', () => {
     const t = 'sep=,\nh1,h2\n# c\nx,y\n"m\nn",z\n';
-    const mkp = ln => mk(t, { lineNumbers: ln }, { hasHeaders: true, commentChar: '#', skipComments: true });
+    const mkp = (ln: LineNumbersMode): CsvProvider =>
+        mk(t, { lineNumbers: ln }, { hasHeaders: true, commentChar: '#', skipComments: true });
     const s = mkp('source');
     assert.deepStrictEqual(
         [0, 1, 2].map(r => s.rowName(r)),
@@ -163,19 +174,20 @@ test('serializeRow keeps original quoting', () => {
 
 test('random edit consistency vs reparse', () => {
     let s = 12345;
-    const r = () => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296;
+    const r = (): number => (s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296;
     for (let it = 0; it < 200; it++) {
         const n = 1 + Math.floor(r() * 8);
         const cells = Array.from({ length: n }, () => ['a', 'b\nc', 'd\ne\nf'][Math.floor(r() * 3)]);
         const gaps = Array.from({ length: n }, () => (r() < 0.3 ? '# k\n' : ''));
-        const build = cs => cs.map((c, i) => gaps[i] + OX.serializeCsvField(c, ',', '"') + '\n').join('');
+        const build = (cs: string[]): string =>
+            cs.map((c, i) => gaps[i] + serializeCsvField(c, ',', '"') + '\n').join('');
         const opts = { separator: ',', quote: '"', commentChar: '#', skipComments: true };
-        const p = new OX.CsvProvider(OX.indexCsv(build(cells), opts), {});
+        const p = new CsvProvider(indexCsv(build(cells), opts), {});
         const k = Math.floor(r() * n);
         const val = ['z', 'q\nr', 'u\nv\nw'][Math.floor(r() * 3)];
         p.setCell(k, 0, val);
         cells[k] = val;
-        const ref = OX.parseCsv(build(cells), opts);
+        const ref = parseCsv(build(cells), opts);
         for (let i = 0; i < n; i++) {
             const range = p.getSourceRange(i);
             assert.strictEqual(range.start, ref.rowLine[i]);
@@ -190,7 +202,7 @@ test('single-column empty rows serialize quoted so they survive a reparse', () =
     assert.strictEqual(p.serializeRow(1), '""');
     const r = p.appendRow();
     assert.strictEqual(p.serializeRow(r), '""');
-    const re = OX.parseCsv('a\n""\n2\n', { separator: ',', hasHeaders: true });
+    const re = parseCsv('a\n""\n2\n', { separator: ',', hasHeaders: true });
     assert.deepStrictEqual(re.rows, [[''], ['2']]);
 });
 
