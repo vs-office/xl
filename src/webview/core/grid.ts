@@ -546,6 +546,15 @@ const rankOf = (f: FindSession, key: number): number => {
     return i < f.B.n ? i : f.B.n + C.lowerBound(f.A, key);
 };
 
+interface GridDom {
+    canvas: HTMLCanvasElement;
+    scroller: HTMLDivElement;
+    spacer: HTMLDivElement;
+    live: HTMLDivElement;
+    ctx: CanvasRenderingContext2D;
+    dpr: number;
+}
+
 class Grid {
     static readonly _parseColor = parseColor;
     static readonly _lumOf = lumOf;
@@ -592,51 +601,53 @@ class Grid {
     _clip: ClipState | null;
     _tm: Record<string, Int32Array>;
 
-    // assigned by _buildDom / _readTheme / _layout / _resize / _paint, which the constructor runs
-    canvas!: HTMLCanvasElement;
-    scroller!: HTMLDivElement;
-    spacer!: HTMLDivElement;
-    live!: HTMLDivElement;
-    ctx!: CanvasRenderingContext2D;
-    dpr!: number;
-    theme!: Theme;
-    view!: ViewMap;
-    viewCount!: number;
-    nRows!: number;
-    nCols!: number;
-    fr!: number;
-    fc!: number;
-    hdrH!: number;
-    hdrW!: number;
-    cw!: number;
-    ch!: number;
-    maxX!: number;
-    maxY!: number;
-    mi!: MergeIndex;
-    _defR!: number;
-    _defC!: number;
-    _cssTop!: number;
-    _cssLeft!: number;
-    nfc!: number;
-    nc!: number;
-    nfr!: number;
-    nr!: number;
-    cIdx!: Int32Array;
-    cX!: Int32Array;
-    cW!: Int32Array;
-    rIdx!: Int32Array;
-    rY!: Int32Array;
-    rH!: Int32Array;
-    rS!: Int32Array;
-    cellsDrawn!: number;
-    _fwc!: number;
-    _fhc!: number;
-    _wf!: string;
-    _asDx!: number;
-    _asDy!: number;
-    _menuOff!: (ev: MouseEvent) => void;
-    _menuKey!: (ev: KeyboardEvent) => void;
-    _menuBlur!: () => void;
+    // DOM and theme: built by the constructor's helpers, which return them
+    canvas: HTMLCanvasElement;
+    scroller: HTMLDivElement;
+    spacer: HTMLDivElement;
+    live: HTMLDivElement;
+    ctx: CanvasRenderingContext2D;
+    dpr: number;
+    theme: Theme;
+    // layout / paint state: recomputed by _layout / _computeVisible / _paint (the constructor runs them)
+    view: ViewMap = C.makeViewMap(null, 0);
+    viewCount = 0;
+    nRows = 0;
+    nCols = 0;
+    fr = 0;
+    fc = 0;
+    hdrH = 0;
+    hdrW = 0;
+    cw = 0;
+    ch = 0;
+    maxX = 0;
+    maxY = 0;
+    mi: MergeIndex<Range> = new MergeIndex([]);
+    _defR = 0;
+    _defC = 0;
+    _cssTop = 0;
+    _cssLeft = 0;
+    nfc = 0;
+    nc = 0;
+    nfr = 0;
+    nr = 0;
+    cIdx: Int32Array = new Int32Array(0);
+    cX: Int32Array = new Int32Array(0);
+    cW: Int32Array = new Int32Array(0);
+    rIdx: Int32Array = new Int32Array(0);
+    rY: Int32Array = new Int32Array(0);
+    rH: Int32Array = new Int32Array(0);
+    rS: Int32Array = new Int32Array(0);
+    cellsDrawn = 0;
+    _fwc = 0;
+    _fhc = 0;
+    _wf = '';
+    _asDx = 0;
+    _asDy = 0;
+    // context-menu dismiss handlers, set while a menu is open
+    _menuOff: ((ev: MouseEvent) => void) | null = null;
+    _menuKey: ((ev: KeyboardEvent) => void) | null = null;
+    _menuBlur: (() => void) | null = null;
 
     // set lazily (absent until first use)
     _miSrc?: readonly Range[] | undefined;
@@ -742,8 +753,15 @@ class Grid {
         this._raf = 0;
         this._clip = null;
         this._tm = {};
-        this._buildDom();
-        this._readTheme();
+        const dom = this._buildDom();
+        this.canvas = dom.canvas;
+        this.scroller = dom.scroller;
+        this.spacer = dom.spacer;
+        this.live = dom.live;
+        this.ctx = dom.ctx;
+        this.dpr = dom.dpr;
+        this.theme = this._makeTheme();
+        this.epoch++;
         this._layout();
         this._bind();
         this._resize();
@@ -775,34 +793,37 @@ class Grid {
             }
     }
 
-    _buildDom() {
+    _buildDom(): GridDom {
         const el = this.el,
             d = el.ownerDocument;
         el.classList.add('oxg');
         if (!el.hasAttribute('tabindex')) el.tabIndex = 0;
         el.setAttribute('role', 'grid');
-        this.canvas = d.createElement('canvas');
-        this.canvas.className = 'oxg-canvas';
-        this.scroller = d.createElement('div');
-        this.scroller.className = 'oxg-scroller';
-        this.spacer = d.createElement('div');
-        this.spacer.className = 'oxg-spacer';
-        this.scroller.appendChild(this.spacer);
-        this.live = d.createElement('div');
-        this.live.className = 'oxg-live';
-        this.live.setAttribute('role', 'status');
-        this.live.setAttribute('aria-live', 'polite');
-        el.appendChild(this.canvas);
-        el.appendChild(this.scroller);
-        el.appendChild(this.live);
-        const ctx = this.canvas.getContext('2d', { alpha: false });
+        const canvas = d.createElement('canvas');
+        canvas.className = 'oxg-canvas';
+        const scroller = d.createElement('div');
+        scroller.className = 'oxg-scroller';
+        const spacer = d.createElement('div');
+        spacer.className = 'oxg-spacer';
+        scroller.appendChild(spacer);
+        const live = d.createElement('div');
+        live.className = 'oxg-live';
+        live.setAttribute('role', 'status');
+        live.setAttribute('aria-live', 'polite');
+        el.appendChild(canvas);
+        el.appendChild(scroller);
+        el.appendChild(live);
+        const ctx = canvas.getContext('2d', { alpha: false });
         // the constructor's first paint would throw on a missing context anyway
         if (!ctx) throw new Error('2D canvas context unavailable');
-        this.ctx = ctx;
-        this.dpr = root.devicePixelRatio || 1;
+        return { canvas, scroller, spacer, live, ctx, dpr: root.devicePixelRatio || 1 };
     }
 
     _readTheme() {
+        this.theme = this._makeTheme();
+        this.epoch++;
+    }
+    _makeTheme(): Theme {
         const cs = root.getComputedStyle ? root.getComputedStyle(this.el) : null;
         const v = (n: string): string => (cs ? cs.getPropertyValue(n).trim() : '');
         const bgS = v('--vscode-editor-background') || '#1e1e1e';
@@ -813,7 +834,7 @@ class Grid {
         const side =
             parseColor(v('--vscode-sideBar-background')) || parseColor(v('--vscode-titleBar-activeBackground'));
         const hdrBase = side && Math.abs(lumOf(side) - lumOf(bg)) < 0.2 ? side : null;
-        const T: Theme = (this.theme = {
+        const T: Theme = {
             dark,
             bg: mix(bg, bg, 0),
             fgC: fg,
@@ -836,9 +857,9 @@ class Grid {
             family: v('--vscode-font-family') || 'system-ui, -apple-system, "Segoe UI", sans-serif',
             editorFamily: v('--vscode-editor-font-family') || '',
             cellFamily: ''
-        });
+        };
         T.cellFamily = T.family;
-        this.epoch++;
+        return T;
     }
     themeChanged() {
         this._readTheme();
@@ -1014,7 +1035,7 @@ class Grid {
         const m = p.merges,
             ml = m ? m.length : 0,
             ordered = !!this._order;
-        if (!this.mi || this._miSrc !== m || this._miLen !== ml || this._miOrdered !== ordered || (opts && opts.merges))
+        if (this._miSrc !== m || this._miLen !== ml || this._miOrdered !== ordered || (opts && opts.merges))
             this.mi = ordered ? new MergeIndex([]) : new MergeIndex(m);
         this._miSrc = m;
         this._miLen = ml;
@@ -3965,9 +3986,9 @@ class Grid {
         const doc = this.el.ownerDocument;
         this._menu.remove();
         this._menu = null;
-        doc.removeEventListener('mousedown', this._menuOff, true);
-        doc.removeEventListener('keydown', this._menuKey, true);
-        root.removeEventListener('blur', this._menuBlur);
+        if (this._menuOff) doc.removeEventListener('mousedown', this._menuOff, true);
+        if (this._menuKey) doc.removeEventListener('keydown', this._menuKey, true);
+        if (this._menuBlur) root.removeEventListener('blur', this._menuBlur);
     }
 
     // ---------- wiring ----------

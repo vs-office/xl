@@ -379,7 +379,7 @@ export function makeWebview(text: string, eol?: number, optsOver?: Record<string
     let created: FakeShell | undefined;
     csvPage.handleEvents();
     // the page reads the options through the same JSON round trip the real HTML embeds
-    const pageOptions: CsvPageOptions = view.getOptions() as CsvPageOptions;
+    const pageOptions: CsvPageOptions = view.getOptions();
     csvPage.initPage(pageOptions, false, (_app, o) => {
         created = new FakeShell(o);
         // the page only uses the members FakeShell provides

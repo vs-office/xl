@@ -66,6 +66,11 @@ export default tseslint.config(
                 {
                     selector: 'TSAsExpression > TSAsExpression[typeAnnotation.type="TSUnknownKeyword"]',
                     message: 'Double cast through unknown is banned: fix the types or narrow with a type guard.'
+                },
+                {
+                    selector: 'PropertyDefinition[definite=true]',
+                    message:
+                        'Definite assignment (`field!: T`) tells the compiler a field is set without proof: initialise it in the constructor, give it a default, or make it `T | undefined`.'
                 }
             ],
             eqeqeq: ['error', 'always'],

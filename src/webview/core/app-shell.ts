@@ -431,6 +431,28 @@ const srcRow = (a: GridActiveCell): number => (a.sr !== undefined && a.sr !== nu
 
 const fmtNum = (n: number): string => formatGeneral(Math.round(n * 1e9) / 1e9);
 
+interface ShellDom {
+    bar: HTMLDivElement;
+    nameBox: HTMLInputElement;
+    fx: HTMLSpanElement;
+    formula: HTMLTextAreaElement;
+    fxExpand: HTMLButtonElement;
+    fxBox: HTMLDivElement;
+    btnFind: HTMLButtonElement;
+    btnClear: HTMLButtonElement;
+    gridWrap: HTMLDivElement;
+    gridHost: HTMLDivElement;
+    findBar: FindBar;
+    tabs: HTMLDivElement;
+    status: HTMLDivElement;
+    msg: HTMLSpanElement;
+    stats: HTMLSpanElement;
+    zoomBox: HTMLSpanElement;
+    zOut: HTMLButtonElement;
+    zVal: HTMLSpanElement;
+    zIn: HTMLButtonElement;
+}
+
 class Shell {
     app: HTMLElement;
     o: ShellOptions;
@@ -438,26 +460,26 @@ class Shell {
     view: ShellView;
     loading: boolean;
     grid: Grid;
-    // DOM chrome, created by _build() from the constructor
-    bar!: HTMLDivElement;
-    nameBox!: HTMLInputElement;
-    fx!: HTMLSpanElement;
-    formula!: HTMLTextAreaElement;
-    fxExpand!: HTMLButtonElement;
-    fxBox!: HTMLDivElement;
-    btnFind!: HTMLButtonElement;
-    btnClear!: HTMLButtonElement;
-    gridWrap!: HTMLDivElement;
-    gridHost!: HTMLDivElement;
-    findBar!: FindBar;
-    tabs!: HTMLDivElement;
-    status!: HTMLDivElement;
-    msg!: HTMLSpanElement;
-    stats!: HTMLSpanElement;
-    zoomBox!: HTMLSpanElement;
-    zOut!: HTMLButtonElement;
-    zVal!: HTMLSpanElement;
-    zIn!: HTMLButtonElement;
+    // DOM chrome, created by _build() and assigned in the constructor
+    bar: HTMLDivElement;
+    nameBox: HTMLInputElement;
+    fx: HTMLSpanElement;
+    formula: HTMLTextAreaElement;
+    fxExpand: HTMLButtonElement;
+    fxBox: HTMLDivElement;
+    btnFind: HTMLButtonElement;
+    btnClear: HTMLButtonElement;
+    gridWrap: HTMLDivElement;
+    gridHost: HTMLDivElement;
+    findBar: FindBar;
+    tabs: HTMLDivElement;
+    status: HTMLDivElement;
+    msg: HTMLSpanElement;
+    stats: HTMLSpanElement;
+    zoomBox: HTMLSpanElement;
+    zOut: HTMLButtonElement;
+    zVal: HTMLSpanElement;
+    zIn: HTMLButtonElement;
     /** view row -> source row of the active sort / filter, or null */
     _order: Int32Array | null | undefined;
     _tasks: { [name: string]: Task | undefined };
@@ -479,54 +501,94 @@ class Shell {
         this._tasks = {};
         this._colCache = new Map();
         this._statKey = null;
-        this._build();
+        const dom = this._build();
+        this.bar = dom.bar;
+        this.nameBox = dom.nameBox;
+        this.fx = dom.fx;
+        this.formula = dom.formula;
+        this.fxExpand = dom.fxExpand;
+        this.fxBox = dom.fxBox;
+        this.btnFind = dom.btnFind;
+        this.btnClear = dom.btnClear;
+        this.gridWrap = dom.gridWrap;
+        this.gridHost = dom.gridHost;
+        this.findBar = dom.findBar;
+        this.tabs = dom.tabs;
+        this.status = dom.status;
+        this.msg = dom.msg;
+        this.stats = dom.stats;
+        this.zoomBox = dom.zoomBox;
+        this.zOut = dom.zOut;
+        this.zVal = dom.zVal;
+        this.zIn = dom.zIn;
         this.grid = new Grid(this.gridHost, { provider: null, readOnly: !!this.o.readOnly });
         this._wire();
     }
 
-    _build(): void {
+    _build(): ShellDom {
         const a = this.app;
         a.classList.add('ox-app');
-        this.bar = h('div', 'ox-bar');
-        this.nameBox = h('input', 'ox-name');
-        this.nameBox.spellcheck = false;
-        this.nameBox.setAttribute('aria-label', 'Name box');
-        this.fx = h('span', 'ox-fx', 'fx');
-        this.formula = h('textarea', 'ox-formula');
-        this.formula.rows = 1;
-        this.formula.wrap = 'off';
-        this.formula.spellcheck = false;
-        this.formula.setAttribute('aria-label', 'Formula bar');
-        this.fxExpand = h('button', 'ox-btn ox-fxexp', '\u22EF');
-        this.fxExpand.title = 'Multi-line value: click to expand';
-        this.fxExpand.style.display = 'none';
-        this.fxBox = h('div', 'ox-fxbox');
-        this.fxBox.append(this.formula, this.fxExpand);
-        this.btnFind = h('button', 'ox-btn');
-        this.btnFind.title = 'Find (Ctrl+F)';
-        this.btnFind.appendChild(icon('M7 12A5 5 0 1 0 7 2a5 5 0 0 0 0 10zM11 11l3.5 3.5'));
-        this.btnClear = h('button', 'ox-btn ox-clear', 'Clear sort & filter');
-        this.btnClear.style.display = 'none';
-        this.bar.append(this.nameBox, this.fx, this.fxBox, this.btnClear, this.btnFind);
+        const bar = h('div', 'ox-bar');
+        const nameBox = h('input', 'ox-name');
+        nameBox.spellcheck = false;
+        nameBox.setAttribute('aria-label', 'Name box');
+        const fx = h('span', 'ox-fx', 'fx');
+        const formula = h('textarea', 'ox-formula');
+        formula.rows = 1;
+        formula.wrap = 'off';
+        formula.spellcheck = false;
+        formula.setAttribute('aria-label', 'Formula bar');
+        const fxExpand = h('button', 'ox-btn ox-fxexp', '\u22EF');
+        fxExpand.title = 'Multi-line value: click to expand';
+        fxExpand.style.display = 'none';
+        const fxBox = h('div', 'ox-fxbox');
+        fxBox.append(formula, fxExpand);
+        const btnFind = h('button', 'ox-btn');
+        btnFind.title = 'Find (Ctrl+F)';
+        btnFind.appendChild(icon('M7 12A5 5 0 1 0 7 2a5 5 0 0 0 0 10zM11 11l3.5 3.5'));
+        const btnClear = h('button', 'ox-btn ox-clear', 'Clear sort & filter');
+        btnClear.style.display = 'none';
+        bar.append(nameBox, fx, fxBox, btnClear, btnFind);
 
-        this.gridWrap = h('div', 'ox-grid');
-        this.gridHost = h('div');
-        this.gridWrap.appendChild(this.gridHost);
-        this.findBar = this._buildFind();
-        this.gridWrap.appendChild(this.findBar.el);
+        const gridWrap = h('div', 'ox-grid');
+        const gridHost = h('div');
+        gridWrap.appendChild(gridHost);
+        const findBar = this._buildFind();
+        gridWrap.appendChild(findBar.el);
 
-        this.tabs = h('div', 'ox-tabs');
-        if (!this.o.tabs) this.tabs.style.display = 'none';
-        this.status = h('div', 'ox-status');
-        this.msg = h('span', 'ox-msg', 'Ready');
-        this.stats = h('span', 'ox-stats');
-        this.zoomBox = h('span', 'ox-zoom');
-        this.zOut = h('button', 'ox-btn ox-z', '-');
-        this.zVal = h('span', 'ox-zval', '100%');
-        this.zIn = h('button', 'ox-btn ox-z', '+');
-        this.zoomBox.append(this.zOut, this.zVal, this.zIn);
-        this.status.append(this.msg, this.stats, this.zoomBox);
-        a.append(this.bar, this.gridWrap, this.tabs, this.status);
+        const tabs = h('div', 'ox-tabs');
+        if (!this.o.tabs) tabs.style.display = 'none';
+        const status = h('div', 'ox-status');
+        const msg = h('span', 'ox-msg', 'Ready');
+        const stats = h('span', 'ox-stats');
+        const zoomBox = h('span', 'ox-zoom');
+        const zOut = h('button', 'ox-btn ox-z', '-');
+        const zVal = h('span', 'ox-zval', '100%');
+        const zIn = h('button', 'ox-btn ox-z', '+');
+        zoomBox.append(zOut, zVal, zIn);
+        status.append(msg, stats, zoomBox);
+        a.append(bar, gridWrap, tabs, status);
+        return {
+            bar,
+            nameBox,
+            fx,
+            formula,
+            fxExpand,
+            fxBox,
+            btnFind,
+            btnClear,
+            gridWrap,
+            gridHost,
+            findBar,
+            tabs,
+            status,
+            msg,
+            stats,
+            zoomBox,
+            zOut,
+            zVal,
+            zIn
+        };
     }
 
     _buildFind(): FindBar {

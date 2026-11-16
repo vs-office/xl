@@ -25,11 +25,11 @@ export interface CsvOptions {
     quoteMark: string;
     hasHeaders: boolean;
     capitalizeHeaders: boolean;
-    resizeColumns: string;
-    lineNumbers: string;
+    resizeColumns: 'all' | 'first' | 'none';
+    lineNumbers: 'none' | 'ordinal' | 'source';
     commentCharacter: string;
     skipComments: boolean;
-    formatValues: string;
+    formatValues: 'always' | 'never' | 'unquoted';
     numberFormat: string;
     customEditor: boolean;
     uri: string;

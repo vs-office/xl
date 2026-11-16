@@ -34,6 +34,6 @@ export function cleanString(v: unknown, fallback: string, maxLen: number, minLen
     return typeof v === 'string' && v.length >= minLen && v.length <= maxLen ? v : fallback;
 }
 
-export function cleanEnum(v: unknown, allowed: readonly string[], fallback: string): string {
-    return typeof v === 'string' && allowed.indexOf(v) >= 0 ? v : fallback;
+export function cleanEnum<T extends string>(v: unknown, allowed: readonly T[], fallback: T): T {
+    return allowed.find(a => a === v) ?? fallback;
 }
