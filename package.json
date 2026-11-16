@@ -1,6 +1,6 @@
 {
   "name": "xlv",
-  "displayName": "xl",
+  "displayName": "xlv",
   "description": "View and edit CSV, TSV and XLSX files in VS Code.",
   "version": "2026.1.0",
   "publisher": "vs-office",
