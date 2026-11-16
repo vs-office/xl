@@ -3,12 +3,8 @@
   "displayName": "xl",
   "description": "View and edit CSV, TSV and XLSX files in VS Code.",
   "version": "2026.2.0",
-  "publisher": "ilypopv",
+  "publisher": "vs-office",
   "icon": "img/icon.png",
-  "author": {
-    "name": "Ilya Popov",
-    "url": "https://github.com/ilypopv"
-  },
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
     "type": "git",
